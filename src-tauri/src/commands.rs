@@ -1764,10 +1764,22 @@ pub fn save_cookies(
     cookies: Vec<ytdlp_core::cookies::CookieEntry>,
 ) -> CmdResult<()> {
     let state = app.state::<AppState>();
+    let normalized = normalize_cookie_host(&host);
     let store = CookieStore::new(state.paths.cookies_dir());
-    store.save_host(&host, cookies).map_err(err_string)?;
-    let _ = app.emit("cookies:changed", host);
+    store.save_host(&normalized, cookies).map_err(err_string)?;
+    let _ = app.emit("cookies:changed", normalized);
     Ok(())
+}
+
+/// 规范化 cookie 存储 host：YouTube 相关域名统一存 www.youtube.com.txt
+fn normalize_cookie_host(host: &str) -> String {
+    match host.to_lowercase().as_str() {
+        "youtube.com" | "youtu.be" | "m.youtube.com" | "www.youtube.com" => "www.youtube.com".into(),
+        "bilibili.com" | "www.bilibili.com" | "m.bilibili.com" => "www.bilibili.com".into(),
+        "x.com" | "www.x.com" | "twitter.com" | "www.twitter.com" => "www.x.com".into(),
+        "douyin.com" | "www.douyin.com" | "m.douyin.com" => "www.douyin.com".into(),
+        h => h.to_string(),
+    }
 }
 
 #[tauri::command]
