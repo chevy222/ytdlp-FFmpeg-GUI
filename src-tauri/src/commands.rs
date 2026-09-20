@@ -479,6 +479,7 @@ fn run_probe(app: AppHandle, id: String) {
                     it.push_log(format!("可用格式：{} 项（高度：{}）", it.meta.download_formats.len(), heights.join(", ")));
                 }
             });
+            state.persist();
             // 封面缩略图（异步生成，不阻塞就绪）
             {
                 let app2 = app.clone();
@@ -548,6 +549,7 @@ fn run_probe(app: AppHandle, id: String) {
                     }
                 }
             });
+            state.persist();
         }
     }
     // 解析阶段临时目录清理（cookie 文件现在持久存在 config/cookies/ 下，不删）
@@ -746,6 +748,7 @@ fn run_download_task(app: AppHandle, id: String, format_id: Option<String>, audi
                 update_item(&app, &id, |it| {
                     it.meta = meta;
                 });
+                state.persist();
             }
             Err(e) => {
                 finish_download(&app, &id, Err(e), &params);
