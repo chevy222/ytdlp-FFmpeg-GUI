@@ -103,14 +103,18 @@ impl ToolResolver {
             Tool::Deno => self.deno.clone(),
         };
         if let Some(p) = configured {
-            if p.is_file() {
+            // 空字符串视为未配置（用户清空了输入框），继续回退
+            if p.as_os_str().is_empty() {
+                // fall through
+            } else if p.is_file() {
                 return Ok((p, ToolSource::Configured));
+            } else {
+                // 显式指定却不存在：明确报错（用户需要知道自己填错了），不回退
+                return Err(CoreError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("{} 指定路径不存在：{}", tool.name(), p.display()),
+                )));
             }
-            // 显式指定却不存在：明确报错（用户需要知道自己填错了），不回退
-            return Err(CoreError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("{} 指定路径不存在：{}", tool.name(), p.display()),
-            )));
         }
         // 托管目录可能不存在、也可能只托管了部分工具（依赖页按需下载），
         // 因此这里只作候选：文件不在就继续回退 PATH，绝不让空目录把 PATH 遮死。
