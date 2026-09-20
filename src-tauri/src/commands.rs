@@ -514,6 +514,7 @@ fn run_probe(app: AppHandle, id: String) {
                         update_item(&app2, &id2, |it| {
                             it.thumb = Some(dest.to_string_lossy().into_owned());
                         });
+                        app2.state::<AppState>().persist();
                     }
                 });
             }
@@ -840,6 +841,7 @@ fn finish_download(
                         update_item(&app2, &id2, |it| {
                             it.thumb = Some(dest.to_string_lossy().into_owned());
                         });
+                        app2.state::<AppState>().persist();
                     }
                 });
             }
@@ -1178,6 +1180,7 @@ fn finish_merge(
                         it.thumb = Some(dest.to_string_lossy().into_owned());
                     });
                 }
+                app2.state::<AppState>().persist();
             });
         }
         let _ = app.emit("item:ready", serde_json::json!({ "id": prod.id }));
@@ -1522,6 +1525,7 @@ fn finish_transcode(app: &AppHandle, id: &str, result: Result<std::path::PathBuf
                         it.thumb = Some(dest.to_string_lossy().into_owned());
                     });
                 }
+                app2.state::<AppState>().persist();
             });
         }
         let _ = app.emit("item:ready", serde_json::json!({ "id": prod.id }));
