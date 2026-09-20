@@ -1796,12 +1796,6 @@ pub fn delete_cookie(app: AppHandle, host: String) -> CmdResult<()> {
 #[tauri::command]
 pub fn probe_dependencies(state: State<'_, AppState>) -> CmdResult<Vec<ToolStatus>> {
     let resolver = state.resolver();
-    let root = state.paths.root().to_string_lossy().into_owned();
-    let tools = state.paths.tools_dir().to_string_lossy().into_owned();
-    let _ = std::fs::write(
-        state.paths.root().join("debug.log"),
-        format!("exe root: {}\ntools dir: {}\n", root, tools),
-    );
     let mut out = Vec::new();
     for tool in [
         ytdlp_core::exec::Tool::YtDlp,
@@ -1810,15 +1804,6 @@ pub fn probe_dependencies(state: State<'_, AppState>) -> CmdResult<Vec<ToolStatu
         ytdlp_core::exec::Tool::Deno,
     ] {
         let resolved = resolver.resolve(tool);
-        let line = format!("{:?} -> {:?}\n", tool.name(), resolved);
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(state.paths.root().join("debug.log"))
-            .and_then(|mut f| {
-                use std::io::Write;
-                f.write_all(line.as_bytes())
-            });
         let (path, version, ok) = match &resolved {
             Ok(p) => {
                 let v = ytdlp_core::exec::tool_version(&resolver, tool);
