@@ -440,6 +440,7 @@ fn run_probe(app: AppHandle, id: String) {
             netscape.as_deref(),
             &network,
             playlist_on,
+            &state.paths.temp_dir(),
             |l| log_item(&app, &id, l),
         )
     } else {
@@ -682,6 +683,7 @@ fn run_download_task(app: AppHandle, id: String, format_id: Option<String>, audi
         &url,
         &params,
         &cfg,
+        &state.paths.temp_dir(),
         &cancel,
         move |p| {
             update_item(&app2, &id2, |it| {

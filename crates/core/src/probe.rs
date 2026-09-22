@@ -179,6 +179,7 @@ pub fn probe_url(
     cookies_file: Option<&Path>,
     network: &NetworkConfig,
     playlist: bool,
+    temp_dir: &Path,
     mut on_log: impl FnMut(String),
 ) -> std::result::Result<UrlProbe, ProbeFailure> {
     let extra: &[&str] = if playlist {
@@ -196,7 +197,9 @@ pub fn probe_url(
     // stdout/stderr 重定向到临时文件（不用管道）：
     // GUI 子进程管道缓冲区有限（Windows 默认 64KB），yt-dlp 输出大量 JSON 元数据时
     // 会阻塞在 write(stdout)，导致无法及时读取网络数据而超时。手动 CMD 输出直接到终端不会阻塞。
-    let tmp_dir = std::env::temp_dir();
+    // 临时文件必须落在 exe 同级 temp 目录（需求：所有产生的文件都存 exe 同级），
+    // 禁止用 std::env::temp_dir()（会写到 AppData\Local\Temp）。
+    let tmp_dir = temp_dir;
     // 进程 ID + 原子递增 slot：同进程并发解析不冲突，多实例也不冲突
     let slot = PROBE_SLOT.fetch_add(1, Ordering::Relaxed);
     let stdout_file = tmp_dir.join(format!(

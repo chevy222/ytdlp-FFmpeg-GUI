@@ -446,11 +446,14 @@ pub struct DownloadOutcome {
 
 /// 执行下载（阻塞；逐行回调进度；取消置位后杀进程树）。
 /// `on_log`：接收实际执行的完整 yt-dlp 命令行（条目日志展示用）。
+/// `temp_dir`：exe 同级 temp 目录（所有运行时文件必须落在这里，禁止用系统 temp）。
+#[allow(clippy::too_many_arguments)]
 pub fn run_download(
     resolver: &ToolResolver,
     url: &str,
     p: &DownloadParams,
     cfg: &DownloadConfig,
+    temp_dir: &Path,
     cancel: &Arc<AtomicBool>,
     mut on_progress: impl FnMut(Progress),
     mut on_log: impl FnMut(String),
@@ -460,7 +463,9 @@ pub fn run_download(
     // --print-to-file after_move：yt-dlp 把最终产物路径写入此文件（UTF-8 无 BOM）。
     // 与解析输出行互为兜底：某些站点（如仅音频提取）不产生 Destination/Merger 行时，
     // 此文件是最可靠的产物定位来源。参考 download_video.bat 的 LASTFILE 机制。
-    let print_file = std::env::temp_dir().join(format!(
+    // 临时文件必须落在 exe 同级 temp 目录（需求：所有产生的文件都存 exe 同级），
+    // 禁止用 std::env::temp_dir()（会写到 AppData\Local\Temp）。
+    let print_file = temp_dir.join(format!(
         "ytdlp-print-{}-{}.txt",
         std::process::id(),
         started.elapsed().unwrap_or_default().as_millis()
