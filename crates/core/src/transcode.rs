@@ -11,11 +11,32 @@ use std::io::BufRead;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::exec::{decode_text, ChildGuard, Tool, ToolResolver};
 use crate::model::{MediaMeta, RotAngle};
 use crate::{CoreError, Result};
+
+/// 全局锁定的转码层级（参考 convert_h265.bat 的 MODE 锁定思想）。
+///
+/// 第一个文件成功编码后锁定层级，后续文件直接从该层级开始，
+/// 避免每个文件都先尝试 QSV（在不支持的机器上每次浪费数秒）。
+/// `force_encoder_mode != "auto"` 时不锁定（用户显式指定了编码器）。
+static LOCKED_TIER: OnceLock<Mutex<Option<TranscodeTier>>> = OnceLock::new();
+
+fn locked_tier() -> Option<TranscodeTier> {
+    LOCKED_TIER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|g| *g)
+}
+
+fn set_locked_tier(tier: TranscodeTier) {
+    if let Ok(mut g) = LOCKED_TIER.get_or_init(|| Mutex::new(None)).lock() {
+        *g = Some(tier);
+    }
+}
 
 /// 转码参数（来自 设置-转码/通用/下载 + 条目 rot_angle，TC-05）。
 #[derive(Debug, Clone)]
@@ -663,7 +684,9 @@ pub fn run_transcode(
 ) -> Result<PathBuf> {
     let explicit = matches!(params.encoder_mode.as_str(), "libx265" | "nvenc" | "amf");
     let auto_qsv = !explicit && qsv_available(resolver).unwrap_or(false);
-    let tiers: &[TranscodeTier] = if explicit || !auto_qsv {
+    // 层级序列：auto 模式且 QSV 可用时三级回落，否则纯软件。
+    // 参考 convert_h265.bat：full GPU QSV → hybrid → software libx265。
+    let all_tiers: &[TranscodeTier] = if explicit || !auto_qsv {
         &[TranscodeTier::Software]
     } else {
         &[
@@ -672,7 +695,19 @@ pub fn run_transcode(
             TranscodeTier::Software,
         ]
     };
-    for (i, tier) in tiers.iter().enumerate() {
+    // 层级锁定（参考 bat 的 MODE 锁定）：第一个文件成功后记录层级，
+    // 后续文件从锁定层级开始，避免在不支持 QSV 的机器上每个文件都先试 QSV。
+    // explicit 模式不锁定（用户显式指定了编码器）。
+    let start_idx = if !explicit && auto_qsv {
+        if let Some(locked) = locked_tier() {
+            all_tiers.iter().position(|t| *t == locked).unwrap_or(0)
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    for (i, tier) in all_tiers[start_idx..].iter().enumerate() {
         let r = run_transcode_once(
             resolver,
             params,
@@ -683,10 +718,15 @@ pub fn run_transcode(
             &mut on_log,
         );
         match r {
-            Ok(p) => return Ok(p),
+            Ok(p) => {
+                if !explicit && auto_qsv && locked_tier().is_none() {
+                    set_locked_tier(*tier);
+                }
+                return Ok(p);
+            }
             Err(CoreError::Cancelled) => return Err(CoreError::Cancelled),
             Err(e) => {
-                if i + 1 < tiers.len() {
+                if i + 1 < all_tiers[start_idx..].len() {
                     on_log(format!("{} 失败（{e}），自动回落下一层级…", tier.label()));
                 } else {
                     return Err(e);

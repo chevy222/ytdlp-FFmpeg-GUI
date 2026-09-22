@@ -7,12 +7,18 @@
 
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::Value;
 
 use crate::config::NetworkConfig;
 use crate::exec::{decode_text, ChildGuard, Tool, ToolResolver};
 use crate::model::{AudioVolume, DownloadFormat, MediaMeta};
+
+/// 解析临时文件 slot 计数器（参考 convert_h265.bat / download_video.bat 的
+/// mkdir slot 原子性声明思想）。同进程并发解析时，每个任务获取唯一 slot，
+/// 避免临时文件互相覆盖（旧实现只用进程 ID，并发解析会冲突）。
+static PROBE_SLOT: AtomicU64 = AtomicU64::new(0);
 use crate::Result;
 
 /// 解析失败分类（MD-05）。
@@ -191,8 +197,18 @@ pub fn probe_url(
     // GUI 子进程管道缓冲区有限（Windows 默认 64KB），yt-dlp 输出大量 JSON 元数据时
     // 会阻塞在 write(stdout)，导致无法及时读取网络数据而超时。手动 CMD 输出直接到终端不会阻塞。
     let tmp_dir = std::env::temp_dir();
-    let stdout_file = tmp_dir.join(format!("ytdlp-probe-out-{}.json", std::process::id()));
-    let stderr_file = tmp_dir.join(format!("ytdlp-probe-err-{}.log", std::process::id()));
+    // 进程 ID + 原子递增 slot：同进程并发解析不冲突，多实例也不冲突
+    let slot = PROBE_SLOT.fetch_add(1, Ordering::Relaxed);
+    let stdout_file = tmp_dir.join(format!(
+        "ytdlp-probe-out-{}-{}.json",
+        std::process::id(),
+        slot
+    ));
+    let stderr_file = tmp_dir.join(format!(
+        "ytdlp-probe-err-{}-{}.log",
+        std::process::id(),
+        slot
+    ));
     let out_f = std::fs::File::create(&stdout_file).map_err(|e| ProbeFailure {
         kind: ProbeErrorKind::Failed,
         message: format!("创建临时输出文件失败：{e}"),

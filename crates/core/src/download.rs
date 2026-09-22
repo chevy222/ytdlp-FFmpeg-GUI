@@ -59,9 +59,35 @@ pub fn output_template(tmpl: &str, playlist: bool) -> &'static str {
     }
 }
 
-/// 默认格式串（DL-03 四级回落 + 画质上限 MAX_H，短边）。
-pub fn default_format(max_h: u32) -> String {
-    format!("bv*[height<={}]+ba/b[height<={}]/bv*+ba/b", max_h, max_h)
+/// 长边上限（短边 max_h 的 16:9 对应长边，向上取整）。
+///
+/// yt-dlp 格式过滤器只能分别测试 width 和 height，用长边上限同时限制
+/// 两个维度，可以兼容竖屏源（1080×1920 的 height=1920 不会被 `height<=1080`
+/// 误排除）。与 download_video.bat 的 MAX_LONG 同语义。
+fn long_side_cap(short_side: u32) -> u32 {
+    ((short_side as u64) * 16).div_ceil(9) as u32
+}
+
+/// 默认格式串（7 级回落 + 画质上限，短边语义，兼容竖屏；参考 download_video.bat）。
+///
+/// 回落链：
+/// 1. H.264+AAC（直拷进 MP4）→ 2. H.264+best audio → 3. any codec+best audio
+/// 4. 单文件 ≤上限 → 5. 下载上限内 best video+best audio（触发后处理降分辨率）
+/// 6. 无上限 best video+best audio → 7. 无上限 best single
+///
+/// 关键：用 `[height<=MAX_LONG][width<=MAX_LONG]` 同时限制两维，竖屏 1080×1920
+/// 也算 1080p（旧实现只用 `height<=max_h` 会把竖屏源排除到 480p）。
+pub fn default_format(max_h: u32, max_dl_h: u32) -> String {
+    let ml = long_side_cap(max_h);
+    let mdl = long_side_cap(max_dl_h);
+    format!(
+        "bv*[height<={ml}][width<={ml}][vcodec*=avc]+ba[acodec*=mp4a]/\
+         bv*[height<={ml}][width<={ml}][vcodec*=avc]+ba/\
+         bv*[height<={ml}][width<={ml}]+ba/\
+         b[height<={ml}][width<={ml}]/\
+         bv*[height<={mdl}][width<={mdl}]+ba/\
+         bv*+ba/b"
+    )
 }
 
 /// 排序串（DL-03）。
@@ -83,7 +109,7 @@ pub fn build_args(url: &str, p: &DownloadParams, cfg: &DownloadConfig) -> Vec<St
             if p.audio_only {
                 "bestaudio/best".to_string()
             } else {
-                default_format(cfg.max_h)
+                default_format(cfg.max_h, cfg.max_dl_h)
             }
         }
     };
@@ -393,13 +419,24 @@ pub fn run_download(
     mut on_progress: impl FnMut(Progress),
     mut on_log: impl FnMut(String),
 ) -> Result<DownloadOutcome> {
-    let args = build_args(url, p, cfg);
+    let started = std::time::SystemTime::now();
+    let mut args = build_args(url, p, cfg);
+    // --print-to-file after_move：yt-dlp 把最终产物路径写入此文件（UTF-8 无 BOM）。
+    // 与解析输出行互为兜底：某些站点（如仅音频提取）不产生 Destination/Merger 行时，
+    // 此文件是最可靠的产物定位来源。参考 download_video.bat 的 LASTFILE 机制。
+    let print_file = std::env::temp_dir().join(format!(
+        "ytdlp-print-{}-{}.txt",
+        std::process::id(),
+        started.elapsed().unwrap_or_default().as_millis()
+    ));
+    args.push("--print-to-file".into());
+    args.push("after_move:%(filepath)s".into());
+    args.push(print_file.to_string_lossy().into_owned());
     on_log(crate::exec::display_command("yt-dlp", &args));
     let mut cmd = resolver.command(Tool::YtDlp)?;
     cmd.args(&args);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    let started = std::time::SystemTime::now();
     let mut guard = ChildGuard::spawn(&mut cmd)?;
     let stdout = guard
         .stdout()
@@ -478,6 +515,22 @@ pub fn run_download(
         push_unique(&mut output_paths, path.clone());
     }
     output_paths.retain(|path| path.is_file());
+    // --print-to-file 兜底：某些站点不产生 Destination/Merger 行时，
+    // yt-dlp 仍会把最终路径写入此文件。优先级高于目录扫描（更精确）。
+    if output_paths.is_empty() {
+        if let Ok(content) = std::fs::read_to_string(&print_file) {
+            for line in content.lines() {
+                let line = line.trim();
+                if !line.is_empty() {
+                    let pb = PathBuf::from(line);
+                    if pb.is_file() {
+                        push_unique(&mut output_paths, pb);
+                    }
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&print_file);
     if output_paths.is_empty() {
         if let Some(found) = newest_media_since(&p.out_dir, started) {
             output_paths.push(found);
@@ -799,10 +852,15 @@ mod tests {
 
     #[test]
     fn default_format_includes_max_h() {
-        let f = default_format(1080);
-        assert!(f.contains("height<=1080"));
-        let f = default_format(720);
-        assert!(f.contains("height<=720"));
+        let f = default_format(1080, 2160);
+        // 长边上限 = 1080*16/9 ≈ 1920，同时限制 height 和 width（兼容竖屏）
+        assert!(f.contains("height<=1920"), "{}", f);
+        assert!(f.contains("width<=1920"), "{}", f);
+        // 7 级回落链的关键标记
+        assert!(f.contains("[vcodec*=avc]+ba[acodec*=mp4a]"), "{}", f);
+        assert!(f.contains("bv*+ba/b"), "{}", f);
+        let f = default_format(720, 2160);
+        assert!(f.contains("height<=1280"), "{}", f); // 720*16/9=1280
     }
 
     #[test]
@@ -814,7 +872,10 @@ mod tests {
         );
         let joined = args.join(" ");
         assert!(joined.contains("--format"));
-        assert!(joined.contains("bv*[height<=1080]+ba"));
+        // 7 级格式链：H.264+AAC 直拷优先，长边上限 1920 同时限制 width/height
+        assert!(joined.contains("[vcodec*=avc]+ba[acodec*=mp4a]"), "{}", joined);
+        assert!(joined.contains("height<=1920"), "{}", joined);
+        assert!(joined.contains("width<=1920"), "{}", joined);
         assert!(joined.contains("--merge-output-format mp4"));
         assert!(joined.contains("--no-overwrites"));
         assert!(joined.contains("-N 4"));
