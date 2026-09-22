@@ -343,12 +343,22 @@ fn file_newness(path: &Path) -> Option<std::time::SystemTime> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
-        if let Ok(md) = std::fs::metadata(path) {
-            let ft = md.creation_time(); // FILETIME：1601-01-01 起 100ns 间隔
-            let secs = (ft / 10_000_000).saturating_sub(11_644_473_600);
-            return Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs));
+
+        // FILETIME：1601-01-01 起 100ns 间隔；与 UNIX 纪元差 11644473600 秒
+        const WINDOWS_TO_UNIX_EPOCH_100NS: u64 = 116_444_736_000_000_000;
+
+        let md = std::fs::metadata(path).ok()?;
+        let filetime = md.creation_time();
+        if filetime < WINDOWS_TO_UNIX_EPOCH_100NS {
+            return None;
         }
-        return None;
+        let unix_100ns = filetime - WINDOWS_TO_UNIX_EPOCH_100NS;
+        let seconds = unix_100ns / 10_000_000;
+        let nanos = (unix_100ns % 10_000_000) * 100;
+        Some(
+            std::time::UNIX_EPOCH
+                + std::time::Duration::new(seconds, nanos as u32),
+        )
     }
     #[cfg(not(windows))]
     {
@@ -981,16 +991,18 @@ mod tests {
         let old = dir.path().join("old.mp4");
         std::fs::write(&old, b"x").unwrap();
         std::fs::write(dir.path().join("note.txt"), b"x").unwrap();
+        // 保证 new 的写入时间确实晚于 old（sleep 拉开先后；since 锚定在
+        // old 的实际时间戳上，不依赖 sleep 的亚秒精度）
         std::thread::sleep(std::time::Duration::from_millis(20));
-        let since = std::time::SystemTime::now();
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        let since = file_newness(&old).unwrap()
+            + std::time::Duration::from_millis(1);
         let new = dir.path().join("new.mp4");
         std::fs::write(&new, b"x").unwrap();
         // 只返回本次之后新增的最新视频，绝不返回 old.mp4
-        assert_eq!(newest_media_since(dir.path(), since), Some(new));
+        assert_eq!(newest_media_since(dir.path(), since), Some(new.clone()));
         // 没有任何新文件时返回 None（调用方据此判失败，而不是去动既有文件）
-        let since2 = std::time::SystemTime::now();
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        let since2 = file_newness(&new).unwrap()
+            + std::time::Duration::from_millis(1);
         assert_eq!(newest_media_since(dir.path(), since2), None);
     }
 
