@@ -466,6 +466,7 @@ fn run_probe(app: AppHandle, id: String) {
             update_item(&app, &id, |it| {
                 it.meta = p.meta;
                 it.site = p.site.clone();
+                it.thumbnail_url = p.thumbnail_url.clone();
                 if p.host.is_some() {
                     it.host = p.host.clone();
                 }
@@ -819,12 +820,17 @@ fn finish_download(
     // 用最终产物抽帧补一张；已有封面（远程图）则保留，不做无谓抽帧
     if final_status == Status::Done {
         if let Some(out_path) = final_path {
-            let (need_thumb, cover_idx) = {
+            let (need_thumb, cover_idx, thumb_url) = {
                 let hist = state.history.lock().unwrap();
                 match hist.get(id) {
-                    // 产物已有缩略图则不动；否则优先内嵌封面（元数据）
-                    Some(it) => (it.thumb.clone().is_none(), it.meta.cover_stream_index),
-                    None => (false, None),
+                    // 产物已有缩略图则不动；否则优先取 yt-dlp 的 webp 封面
+                    // （thumbnail_url），避免再跑一次 ffmpeg 抽帧；ffmpeg 仅作兜底
+                    Some(it) => (
+                        it.thumb.clone().is_none(),
+                        it.meta.cover_stream_index,
+                        it.thumbnail_url.clone(),
+                    ),
+                    None => (false, None, None),
                 }
             };
             if need_thumb {
@@ -832,17 +838,32 @@ fn finish_download(
                 let id2 = id.to_string();
                 let cache_dir = state.paths.cache_dir();
                 let resolver2 = state.resolver();
+                let proxy2 = state.config.lock().unwrap().network.proxy_url.clone();
                 tauri::async_runtime::spawn(async move {
                     let dest = ytdlp_core::thumbs::thumb_path(&cache_dir, &id2);
-                    if ytdlp_core::thumbs::ensure_thumb(
-                        &resolver2,
-                        std::path::Path::new(&out_path),
-                        &dest,
-                        cover_idx.map(|i| i as usize),
-                        &mut |l| log_item(&app2, &id2, l),
-                    )
-                    .is_ok()
-                    {
+                    // 优先取远程 webp 封面（yt-dlp 下载时已经拉过同一个文件，
+                    // 这里直接用 thumbnail_url 再拉一次，比 ffmpeg 抽帧快得多）
+                    let ok = if let Some(u) = thumb_url.filter(|u| !u.is_empty()) {
+                        ytdlp_core::thumbs::save_remote_thumb(
+                            &u,
+                            &dest,
+                            Some(proxy2.as_str()),
+                        )
+                        .is_ok()
+                    } else {
+                        false
+                    };
+                    // 兜底：ffmpeg 从产物抽内嵌封面流，再不行抽首帧
+                    let ok = ok
+                        || ytdlp_core::thumbs::ensure_thumb(
+                            &resolver2,
+                            std::path::Path::new(&out_path),
+                            &dest,
+                            cover_idx.map(|i| i as usize),
+                            &mut |l| log_item(&app2, &id2, l),
+                        )
+                        .is_ok();
+                    if ok {
                         update_item(&app2, &id2, |it| {
                             it.thumb = Some(dest.to_string_lossy().into_owned());
                         });

@@ -317,6 +317,10 @@ pub struct MediaItem {
     /// 封面缩略图本地路径（config/cache/thumbs/<id>.jpg）
     #[serde(default)]
     pub thumb: Option<String>,
+    /// 远程封面 URL（yt-dlp 解析的 thumbnail，下载完成后优先取此 webp 做缩略图，
+    /// 避免再跑一次 ffmpeg 抽帧；ffmpeg 仅作兜底）
+    #[serde(default)]
+    pub thumbnail_url: Option<String>,
     pub rot_angle: RotAngle,
     /// 下载任务专属：选中格式
     #[serde(default)]
@@ -350,6 +354,7 @@ impl MediaItem {
             log: VecDeque::new(),
             meta: MediaMeta::default(),
             thumb: None,
+            thumbnail_url: None,
             rot_angle: RotAngle::ZERO,
             format_id: None,
             audio_only: false,
