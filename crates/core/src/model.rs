@@ -251,6 +251,25 @@ impl MediaMeta {
             None => Some(h),
         }
     }
+
+    /// 是否需要音量增益：normalize 开启 + 峰值有效（-100~-0.5dB）+ **单音轨**。
+    /// 多音轨跳过增益：volumedetect 峰值只测了第一轨，一个增益应用到所有轨
+    /// 可能削波或不足（download_video.bat PROBE_AUDIO 同款保护）。
+    pub fn needs_audio_gain(&self, normalize: bool) -> bool {
+        normalize
+            && self.audio_tracks.unwrap_or(1) <= 1
+            && self
+                .audio_volume
+                .max_volume_db
+                .map(|v| v < -0.5 && v > -100.0)
+                .unwrap_or(false)
+    }
+
+    /// 音频重编码码率 kbps：跟随源，clamp 64-192（convert_h265.bat 同款：
+    /// 低码率源不膨胀、高码率源不浪费），源不可探测时 128k 兜底。
+    pub fn audio_bitrate_kbps(&self) -> u32 {
+        self.abitrate_kbps.unwrap_or(128).clamp(64, 192)
+    }
 }
 
 /// 人类可读大小（KB/MB/GB）。
@@ -634,6 +653,43 @@ mod tests {
         m.width = None;
         m.rotate_tag = Some(90);
         assert_eq!(m.short_edge(), Some(1920));
+    }
+
+    #[test]
+    fn needs_audio_gain_skips_multitrack() {
+        // 单音轨 + 音量有效 → 增益
+        let mut m = MediaMeta {
+            audio_tracks: Some(1),
+            audio_volume: AudioVolume {
+                max_volume_db: Some(-8.2),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(m.needs_audio_gain(true));
+        // 多音轨 → 跳过（峰值只测了第一轨，bat PROBE_AUDIO 同款）
+        m.audio_tracks = Some(2);
+        assert!(!m.needs_audio_gain(true));
+        // normalize 关 → 不增益
+        m.audio_tracks = Some(1);
+        assert!(!m.needs_audio_gain(false));
+        // 接近满度/无音量 → 不增益
+        m.audio_volume.max_volume_db = Some(-0.2);
+        assert!(!m.needs_audio_gain(true));
+        m.audio_volume.max_volume_db = None;
+        assert!(!m.needs_audio_gain(true));
+    }
+
+    #[test]
+    fn audio_bitrate_clamped_64_192() {
+        let mut m = MediaMeta::default();
+        assert_eq!(m.audio_bitrate_kbps(), 128); // 不可探测兜底 128
+        m.abitrate_kbps = Some(48);
+        assert_eq!(m.audio_bitrate_kbps(), 64); // 下限 64
+        m.abitrate_kbps = Some(320);
+        assert_eq!(m.audio_bitrate_kbps(), 192); // 上限 192
+        m.abitrate_kbps = Some(96);
+        assert_eq!(m.audio_bitrate_kbps(), 96); // 区间内跟随源
     }
 
     #[test]

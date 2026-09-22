@@ -135,6 +135,12 @@ pub fn build_args(url: &str, p: &DownloadParams, cfg: &DownloadConfig) -> Vec<St
     args.push(cfg.retries.to_string());
     args.push("--retry-sleep".into());
     args.push("3".into());
+    // 分片/文件访问重试（download_video.bat 同款：DASH/HLS 分片断流是高频失败点，
+    // 只靠总重试会浪费整个任务的重试配额）
+    args.push("--fragment-retries".into());
+    args.push(cfg.retries.to_string());
+    args.push("--file-access-retries".into());
+    args.push(cfg.retries.to_string());
     // 封面/元数据
     if p.embed_cover {
         args.push("--embed-thumbnail".into());
@@ -329,6 +335,27 @@ fn push_unique(v: &mut Vec<PathBuf>, p: PathBuf) {
 /// 与旧实现的关键差别：只接受 `since` 之后出现的文件，且只返回一个 ——
 /// 绝不返回目录里用户原有的视频（旧实现返回目录内全部视频并取最旧的那个，
 /// 后处理会把它重编码后原地覆盖）。宁可误报"未找到产物"，也不误伤既有文件。
+/// 文件"新近度"时间：优先**创建时间**，非 Windows / 拿不到时回退 mtime。
+///
+/// yt-dlp 会把输出文件的 mtime 设成服务器 Last-modified 头，回退找"最新产物"时
+/// 按 mtime 可能拿错文件（download_video.bat 的 `dir /o-d /t:c` 同款原因）。
+fn file_newness(path: &Path) -> Option<std::time::SystemTime> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if let Ok(md) = std::fs::metadata(path) {
+            let ft = md.creation_time(); // FILETIME：1601-01-01 起 100ns 间隔
+            let secs = (ft / 10_000_000).saturating_sub(11_644_473_600);
+            return Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs));
+        }
+        return None;
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::metadata(path).and_then(|m| m.modified()).ok()
+    }
+}
+
 pub fn newest_media_since(dir: &Path, since: std::time::SystemTime) -> Option<PathBuf> {
     let mut files: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(dir) {
@@ -337,7 +364,7 @@ pub fn newest_media_since(dir: &Path, since: std::time::SystemTime) -> Option<Pa
             if !path.is_file() || !is_media_file(&path) {
                 continue;
             }
-            if let Ok(t) = std::fs::metadata(&path).and_then(|m| m.modified()) {
+            if let Some(t) = file_newness(&path) {
                 if t >= since {
                     files.push((t, path));
                 }
@@ -363,8 +390,7 @@ fn cleanup_cancelled_outputs(
     started: std::time::SystemTime,
 ) {
     let is_new = |p: &Path| -> bool {
-        std::fs::metadata(p)
-            .and_then(|m| m.modified())
+        file_newness(p)
             .map(|t| t >= started)
             .unwrap_or(false)
     };
@@ -591,12 +617,9 @@ pub fn post_process(
         .short_edge()
         .map(|s| s > cfg.max_h && cfg.max_h > 0)
         .unwrap_or(false);
-    let need_gain = general.normalize_audio
-        && meta
-            .audio_volume
-            .max_volume_db
-            .map(|v| v < -0.5 && v > -100.0)
-            .unwrap_or(false);
+    // 多音轨跳过增益：volumedetect 峰值只测了第一轨（MediaMeta::needs_audio_gain，
+    // download_video.bat PROBE_AUDIO 同款保护）。
+    let need_gain = meta.needs_audio_gain(general.normalize_audio);
 
     if !need_downscale && !need_gain {
         return Ok((input.to_path_buf(), meta.clone()));
@@ -697,6 +720,10 @@ pub fn post_process(
     args.push("-c:a".into());
     if need_gain {
         args.push("aac".into());
+        // 音频码率跟随源，clamp 64-192k（MediaMeta::audio_bitrate_kbps，bat 同款）
+        let abr = meta.audio_bitrate_kbps();
+        args.push("-b:a".into());
+        args.push(format!("{}k", abr));
     } else {
         args.push("copy".into());
     }
@@ -879,6 +906,10 @@ mod tests {
         assert!(joined.contains("--merge-output-format mp4"));
         assert!(joined.contains("--no-overwrites"));
         assert!(joined.contains("-N 4"));
+        // 重试三件套（download_video.bat 同款：分片/文件访问单独配额）
+        assert!(joined.contains("--retries 3"));
+        assert!(joined.contains("--fragment-retries 3"));
+        assert!(joined.contains("--file-access-retries 3"));
         assert!(joined.contains("--embed-thumbnail"));
         assert!(joined.contains("--no-playlist"));
         assert!(joined.contains("--proxy socks5://127.0.0.1:10808"));

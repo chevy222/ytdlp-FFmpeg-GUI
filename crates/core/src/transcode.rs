@@ -344,13 +344,9 @@ pub fn build_args_for_tier(
         enc_args.push("hvc1".into());
     }
 
-    // —— 音频增益（normalize_audio + 解析音量；接近满度/无音量不处理）——
-    let need_gain = params.normalize_audio
-        && meta
-            .audio_volume
-            .max_volume_db
-            .map(|v| v < -0.5 && v > -100.0)
-            .unwrap_or(false);
+    // —— 音频增益（normalize_audio + 解析音量；接近满度/无音量/多音轨不处理）——
+    // 多音轨跳过：volumedetect 峰值只测了第一轨（MediaMeta::needs_audio_gain）。
+    let need_gain = meta.needs_audio_gain(params.normalize_audio);
     let gain = if need_gain {
         let max_v = meta.audio_volume.max_volume_db.unwrap_or(0.0);
         Some((-max_v).clamp(0.0, params.max_gain_db))
@@ -602,6 +598,11 @@ pub fn build_args_for_tier(
             args.push("-af".into());
             args.push(format!("volume={:.2}dB", g));
         }
+        // 音频码率跟随源，clamp 64-192k（MediaMeta::audio_bitrate_kbps，
+        // convert_h265.bat 同款：低码率源不膨胀，高码率源不浪费）
+        let abr = meta.audio_bitrate_kbps();
+        args.push("-b:a".into());
+        args.push(format!("{}k", abr));
     }
     if map_attachments {
         args.push("-c:t".into());
@@ -858,11 +859,17 @@ fn run_transcode_once(
             stderr: err,
         });
     }
-    if !out.exists() {
+    // 产物校验：文件必须存在且 ≥1024 字节（convert_h265.bat 同款：ffmpeg 可能
+    // exit 0 却只写出空/截断文件，报"成功"但产物不可用）
+    let out_ok = std::fs::metadata(&out)
+        .map(|m| m.len() >= 1024)
+        .unwrap_or(false);
+    if !out_ok {
+        let _ = std::fs::remove_file(&out);
         return Err(CoreError::ProcessFailed {
             program: "ffmpeg".into(),
             code: None,
-            stderr: "转码结束但未找到输出文件".into(),
+            stderr: "转码结束但输出文件缺失或过小（<1024 字节，已删除半成品保留原文件）".into(),
         });
     }
     on_log(format!("转码完成：{}", out.display()));
