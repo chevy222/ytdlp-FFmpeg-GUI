@@ -145,6 +145,9 @@ pub fn build_args(url: &str, p: &DownloadParams, cfg: &DownloadConfig) -> Vec<St
     if p.embed_cover {
         args.push("--embed-thumbnail".into());
         args.push("--embed-metadata".into());
+        // --write-thumbnail 把封面（webp/jpg）同时写到输出目录，下载完成后
+        // 直接取这个文件做列表缩略图，避免再跑 ffmpeg 抽帧（thumbs::collect_written_thumbnail）
+        args.push("--write-thumbnail".into());
     }
     // 音频仅提取
     if p.audio_only {

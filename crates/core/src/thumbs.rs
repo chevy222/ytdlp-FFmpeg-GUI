@@ -4,6 +4,25 @@
 use crate::exec::{ChildGuard, Tool, ToolResolver};
 use std::path::{Path, PathBuf};
 
+/// 从输出目录收集 yt-dlp `--write-thumbnail` 写出的封面文件。
+///
+/// yt-dlp 下载时已经拉过封面（用于 --embed-thumbnail），加 --write-thumbnail
+/// 后会把它同时写到输出目录（与视频同名，扩展名 .webp/.jpg/.jpeg/.png）。
+/// 下载完成后直接取这个文件做列表缩略图，比重新从网络拉或 ffmpeg 抽帧都快。
+///
+/// 返回找到的封面路径；调用方负责复制到 thumbs 目录并删除原文件。
+pub fn collect_written_thumbnail(output_path: &Path) -> Option<PathBuf> {
+    let parent = output_path.parent()?;
+    let stem = output_path.file_stem()?;
+    for ext in ["webp", "jpg", "jpeg", "png"] {
+        let candidate = parent.join(format!("{}.{}", stem.to_string_lossy(), ext));
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 /// 从远程缩略图 URL 下载到 dest（如 yt-dlp 的 thumbnail）。
 ///
 /// 先直连尝试；失败且调用方给了代理时带 `--proxy` 重试一次——
