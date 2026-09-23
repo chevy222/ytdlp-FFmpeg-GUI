@@ -33,6 +33,9 @@ impl From<ytdlp_core::cli::CliArgs> for CliOverrides {
     }
 }
 
+/// 解析队列容量：满时调用方退化为一次性线程，绝不静默丢任务。
+const PROBE_QUEUE_CAP: usize = 512;
+
 pub struct AppState {
     pub paths: Paths,
     pub history: Mutex<History>,
@@ -44,6 +47,11 @@ pub struct AppState {
     pub merge_jobs: Mutex<HashMap<String, crate::commands::MergeJob>>,
     /// CLI 本次调用级覆盖（--dir/--cookies/--yt-dlp-path/--deno-path）
     pub cli: Mutex<CliOverrides>,
+    /// 解析任务投递口（固定线程池消费）
+    pub probe_tx: std::sync::mpsc::SyncSender<String>,
+    probe_rx: Arc<Mutex<std::sync::mpsc::Receiver<String>>>,
+    /// 串行化"快照 → 写盘"全程
+    persist_lock: Mutex<()>,
 }
 
 impl AppState {
@@ -63,6 +71,7 @@ impl AppState {
             History::default()
         });
         let concurrency = config.general.concurrency as usize;
+        let (probe_tx, probe_rx) = std::sync::mpsc::sync_channel::<String>(PROBE_QUEUE_CAP);
         Self {
             paths,
             history: Mutex::new(history),
@@ -71,7 +80,25 @@ impl AppState {
             cancels: Mutex::new(HashMap::new()),
             merge_jobs: Mutex::new(HashMap::new()),
             cli: Mutex::new(CliOverrides::default()),
+            probe_tx,
+            probe_rx: Arc::new(Mutex::new(probe_rx)),
+            persist_lock: Mutex::new(()),
         }
+    }
+
+    /// 解析队列接收端（供 lib.rs 启动固定数量的解析线程）。
+    pub fn probe_receiver(&self) -> Arc<Mutex<std::sync::mpsc::Receiver<String>>> {
+        self.probe_rx.clone()
+    }
+
+    /// 投递一个解析任务。返回 Err 表示队列已满，调用方需自行退化处理。
+    pub fn submit_probe(&self, id: &str) -> Result<(), String> {
+        self.probe_tx
+            .try_send(id.to_string())
+            .map_err(|e| match e {
+                std::sync::mpsc::TrySendError::Full(_) => "解析队列已满".to_string(),
+                std::sync::mpsc::TrySendError::Disconnected(_) => "解析池已关闭".to_string(),
+            })
     }
 
     /// 当前工具解析器（按 config 依赖段构造；CLI 覆盖优先）。
@@ -112,6 +139,10 @@ impl AppState {
     pub fn persist(&self) {
         // §11.15 锁纪律：锁内只取快照，序列化 + 写盘在锁外——
         // 持锁写盘（满载 100 条 × 300 行日志时毫秒到百毫秒级）会阻塞所有 update_item
+        //
+        // 但"快照"也必须在这把锁之内取：只串行化写盘的话，A 先快照、B 后快照，
+        // B 先落盘、A 后落盘，磁盘上留下的仍是**较旧**的那份（丢更新）。
+        let _w = self.persist_lock.lock();
         let snapshot = self.history.lock().clone();
         if let Err(e) = snapshot.save(&self.paths.history_file()) {
             eprintln!("history 持久化失败（保持内存态）：{}", e);

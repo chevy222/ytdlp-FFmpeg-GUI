@@ -5,8 +5,14 @@
 //! - 进程执行：Command 参数化（不拼接 shell，防注入）；取消时终止进程树（Windows taskkill /T）。
 //! - 平台：Linux 上编译/测试，Windows 上生产运行；取消用条件编译。
 
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use parking_lot::Mutex;
 
 use crate::config::DependenciesConfig;
 use crate::CoreError;
@@ -179,6 +185,9 @@ impl ChildGuard {
                 format!("启动进程失败：{}", e),
             ))
         })?;
+        // 出生即入 Job：本进程退出时内核负责收掉整棵进程树（见 assign_to_job）
+        #[cfg(windows)]
+        assign_to_job(&child);
         Ok(Self {
             child: Some(child),
             cancelled: false,
@@ -260,14 +269,249 @@ fn kill_tree_of(child: &mut Child) {
     {
         let pid = child.id();
         // taskkill 需先不 kill 掉主进程句柄，直接用 PID 命令
-        let mut tk = Command::new("taskkill");
+        let mut tk = Command::new(system_tool("taskkill.exe"));
         hide_console(&mut tk);
         let _ = tk.args(["/PID", &pid.to_string(), "/T", "/F"]).status();
+        // taskkill 可能失败（不存在 / 被拦 / PID 竞态）且无从知晓：
+        // 再对直句柄补一刀（TerminateProcess 不依赖外部程序），否则调用方
+        // 紧接着的 wait() 会替一个没死成的进程无限等下去。
+        let _ = child.kill();
     }
     #[cfg(not(windows))]
     {
         let _ = child.kill();
     }
+}
+
+/// 把子进程挂进一个"本进程退出即全部终止"的 Job Object（Windows）。
+///
+/// 关窗时 Windows **不会**随父进程杀掉子进程：正在写桌面的 ffmpeg 会变成孤儿，
+/// 继续占网络/CPU 并持有输出文件句柄 —— 用户看到的"文件被占用删不掉"就是这个。
+/// `taskkill /T` 靠快照枚举，进程正在创建子进程时会漏；入 Job 后 yt-dlp 自己
+/// spawn 的 ffmpeg/deno 也自动继承同一 Job，由内核保证一起死。
+///
+/// 任何一步失败都静默忽略：Job 是兜底，原有 taskkill 链路仍然保留。
+/// Job 句柄**故意不关**——关闭即触发 KILL_ON_JOB_CLOSE，必须留到进程退出。
+#[cfg(windows)]
+fn assign_to_job(child: &Child) {
+    use std::os::windows::process::ChildExt;
+    use windows::Win32::Foundation::{HANDLE, PCWSTR};
+    use windows::Win32::System::Threading::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_BASIC_LIMIT_INFORMATION,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    static JOB: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
+    let hjob = *JOB.get_or_init(|| match unsafe { CreateJobObjectW(None, PCWSTR::null()) } {
+        Ok(handle) => {
+            let info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+                BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION {
+                    LimitFlags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let ok = unsafe {
+                SetInformationJobObject(
+                    handle,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const core::ffi::c_void,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            };
+            if ok.as_bool() {
+                handle.0
+            } else {
+                0
+            }
+        }
+        Err(_) => 0,
+    });
+    if hjob == 0 {
+        return;
+    }
+    let hproc = HANDLE(child.process().as_raw_handle() as isize);
+    let _ = unsafe { AssignProcessToJobObject(HANDLE(hjob), hproc) };
+}
+
+/// 一次受监控执行的结局。
+pub struct Completed {
+    pub status: std::process::ExitStatus,
+    /// 子进程 stderr（已按 UTF-8→GBK 口径解码；超上限时只保留尾部）
+    pub stderr: String,
+}
+
+/// stderr 尾部保留上限：真错误总在末尾，超出从头部丢弃，防无界增长。
+const STDERR_TAIL_CAP: usize = 256 * 1024;
+
+/// 长任务子进程的统一入口：**两条输出管道都在独立线程上持续排空**。
+///
+/// 为什么必须是这一个入口：匿名管道缓冲有限，ffmpeg/yt-dlp 往 stderr 写得足够多
+/// 而无人读取时会阻塞在 write()，于是 stdout 不再产出，父线程的 read 与子进程的
+/// write 互等成**永久死锁**；更糟的是"取消"通常检查在"收到下一行之后"，
+/// 连取消都会失效。手写这个循环必然出错，所以把排空做成不可遗忘的内建行为。
+pub struct Monitored {
+    guard: ChildGuard,
+    /// stdout 逐行（后台读线程投递）
+    lines: std::sync::mpsc::Receiver<String>,
+    /// stderr 原始字节尾部（后台读线程追加）
+    err_tail: Arc<Mutex<Vec<u8>>>,
+    /// stderr 读线程结束信号（用它给"读完"一个有界等待，而非无限 join）
+    err_done: std::sync::mpsc::Receiver<()>,
+}
+
+impl Monitored {
+    /// 启动子进程并接管两条管道（stdin 一律置空：ffmpeg 会读 stdin，
+    /// 继承来的句柄可能让它与父进程互相等）。
+    pub fn spawn(cmd: &mut Command) -> crate::Result<Self> {
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        let mut guard = ChildGuard::spawn(cmd)?;
+        let stdout = guard
+            .stdout()
+            .ok_or_else(|| CoreError::Io(std::io::Error::other("无法读取子进程 stdout")))?;
+        let stderr = guard
+            .stderr()
+            .ok_or_else(|| CoreError::Io(std::io::Error::other("无法读取子进程 stderr")))?;
+
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines() {
+                match line {
+                    // 接收端已丢弃：pump 已退出，没必要再读
+                    Ok(l) => {
+                        if tx.send(l).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let err_tail = Arc::new(Mutex::new(Vec::new()));
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        {
+            let tail = err_tail.clone();
+            std::thread::spawn(move || {
+                use std::io::Read;
+                let mut buf = [0u8; 8 * 1024];
+                let mut reader = std::io::BufReader::new(stderr);
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            let mut g = tail.lock();
+                            g.extend_from_slice(&buf[..n]);
+                            if g.len() > STDERR_TAIL_CAP {
+                                let cut = g.len() - STDERR_TAIL_CAP;
+                                g.drain(..cut);
+                            }
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    }
+                }
+                let _ = done_tx.send(());
+            });
+        }
+
+        Ok(Self {
+            guard,
+            lines: rx,
+            err_tail,
+            err_done: done_rx,
+        })
+    }
+
+    /// 逐行消费 stdout，期间持续检查取消标志；取消则杀进程树并返回 `Err(Cancelled)`。
+    ///
+    /// 用带超时的接收而不是 `for line in lines()`：子进程沉默时（慢 seek、GPU 驱动卡住、
+    /// 或干脆已经死锁）这里**照样会醒**，取消按钮始终有效。
+    pub fn pump(
+        &mut self,
+        cancel: &AtomicBool,
+        mut on_line: impl FnMut(&str),
+    ) -> crate::Result<Completed> {
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                self.guard.kill_tree();
+                return Err(CoreError::Cancelled);
+            }
+            match self.lines.recv_timeout(Duration::from_millis(250)) {
+                Ok(line) => on_line(&line),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                // stdout 已关闭：子进程退出，或读线程因句柄错误结束
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        let status = self.reap()?;
+        // 有界等待 stderr 读完（正常退出时立刻到）；子孙进程占着管道句柄时
+        // 宁可拿到略短的 stderr，也不无限等下去。
+        let _ = self.err_done.recv_timeout(Duration::from_millis(500));
+        let tail = self.err_tail.lock();
+        Ok(Completed {
+            status,
+            stderr: decode_text(&tail),
+        })
+    }
+
+    /// 等子进程退出。读取线程已结束而进程仍在（管道被打满之类）时，
+    /// 宽限 2 秒后强杀再回收——绝不无限等待。
+    fn reap(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        for _ in 0..40 {
+            if let Some(status) = self.guard.try_wait()? {
+                return Ok(status);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        self.guard.kill_tree();
+        self.guard.wait()
+    }
+
+    /// 非阻塞推进一次（保留给需要自己控制节奏的调用方）。
+    pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.guard.try_wait()
+    }
+}
+
+/// ffmpeg `-progress` 模式的标准尾巴：机器可读进度走 stdout，
+/// stderr 只剩真错误（不加 `-nostats -loglevel error` 时 ffmpeg 每 0.5s
+/// 往 stderr 写一条统计，足以打满管道缓冲）。
+pub fn progress_tail() -> [&'static str; 5] {
+    [
+        "-progress",
+        "pipe:1",
+        "-nostats",
+        "-loglevel",
+        "error",
+    ]
+}
+
+/// 只接受 http(s)。把外部可控字符串当 URL 交给 yt-dlp 之前必须过这一关：
+/// 播放列表条目地址来自站点 JSON，`-` 开头会被解析成 `--exec` 等选项。
+pub fn is_http_url(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
+}
+
+/// 追加待处理 URL，并用 `--` 终结选项解析（optparse 识别）。
+///
+/// `--` 之后的内容永远是位置参数，恶意/畸形地址（如 `--exec=calc.exe`）
+/// 就只能是一条下不去的链接，而不是一条命令。
+pub fn push_url_arg(args: &mut Vec<String>, url: &str) {
+    args.push("--".to_string());
+    args.push(url.to_string());
+}
+
+/// 把选项插在 `--`（由 [`push_url_arg`] 追加）之前，保证 URL 仍是唯一的尾部位置参数。
+pub fn insert_before_url(args: &mut Vec<String>, opts: impl IntoIterator<Item = String>) {
+    let at = args
+        .iter()
+        .rposition(|a| a == "--")
+        .unwrap_or_else(|| args.len());
+    args.splice(at..at, opts);
 }
 
 /// 等待非零退出的子进程完成（输出缓冲，供版本查询等短命令）。
@@ -366,19 +610,146 @@ pub fn tool_version(resolver: &ToolResolver, tool: Tool) -> Option<String> {
     tool_version_at(tool, &resolver.resolve(tool).ok()?)
 }
 
-/// 把程序名与参数拼成一条可读、可复制、可直接粘贴执行的单行命令。
+/// 抹掉参数里 URL 的 userinfo（`user:pass@`），保留协议/主机/端口便于排障。
+///
+/// 命令行会经 `on_log` 进条目日志、落盘 history.json、并能在 UI 里一键复制；
+/// `--proxy http://user:pass@host:7890` 原样写进去等于把代理凭据存成明文并展示。
+fn redact_arg(a: &str) -> String {
+    let Some(scheme_end) = a.find("://") else {
+        return a.to_string();
+    };
+    let rest = &a[scheme_end + 3..];
+    // userinfo 只可能出现在下一个 `/`、`?`、`#` 之前
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let Some(at) = authority.rfind('@') else {
+        return a.to_string();
+    };
+    let mut out = String::with_capacity(a.len() + 8);
+    out.push_str(&a[..scheme_end + 3]);
+    out.push_str("***:***@");
+    out.push_str(&rest[at + 1..]);
+    out
+}
+
+/// 把程序名与参数拼成一条可读、可复制、可直接粘贴执行的单行命令（凭据已脱敏）。
 /// 含空白/引号/空串的参数加双引号并转义内部引号，其余原样。
 pub fn display_command(program: &str, args: &[String]) -> String {
     let mut s = program.to_string();
     for a in args {
+        let a = redact_arg(a);
         if a.is_empty() || a.chars().any(|c| c.is_whitespace() || c == '"') {
             s.push_str(&format!(" \"{}\"", a.replace('"', "\\\"")));
         } else {
             s.push(' ');
-            s.push_str(a);
+            s.push_str(&a);
         }
     }
     s
+}
+
+/// 删除文件并短暂重试。
+///
+/// Windows 上刚被 kill 的子进程，其文件对象可能还要占几毫秒；杀软也会抢先打开
+/// 新出现的大视频。一次 `remove_file` 返回 SharingViolation 是常态而不是例外，
+/// 旧代码用 `let _ =` 吞掉它，于是日志写着"已清理残留"、桌上留着几 GB 半成品。
+pub fn remove_with_retry(path: &Path) -> std::io::Result<()> {
+    let mut last = None;
+    for _ in 0..20 {
+        match std::fs::remove_file(path) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                last = Some(e);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        std::io::Error::other(format!("删除失败：{}", path.display()))
+    }))
+}
+
+/// 删除目录树并短暂重试（合并任务的私有临时目录）。
+pub fn remove_dir_with_retry(path: &Path) -> std::io::Result<()> {
+    let mut last = None;
+    for _ in 0..20 {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                last = Some(e);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        std::io::Error::other(format!("删除目录失败：{}", path.display()))
+    }))
+}
+
+/// 是否为 Win32 保留设备名（CON/PRN/AUX/NUL 与 COM1-9/LPT1-9，与扩展名无关）。
+///
+/// 必须精确到"COM+单个非零数字"：按"以 COM 开头"粗判会把 `COM-1.mp4`、
+/// `COMPUTER.mp4` 这类正常名字一起误伤。
+fn is_reserved_device(stem_upper: &str) -> bool {
+    if matches!(stem_upper, "CON" | "PRN" | "AUX" | "NUL") {
+        return true;
+    }
+    let tail = stem_upper
+        .strip_prefix("COM")
+        .or_else(|| stem_upper.strip_prefix("LPT"));
+    match tail {
+        Some(d) => d.len() == 1 && {
+            let b = d.as_bytes()[0];
+            b.is_ascii_digit() && b != b'0'
+        },
+        None => false,
+    }
+}
+
+/// 长任务开工前的廉价校验：保留设备名与过长路径。
+///
+/// 两类都必须早报：`NUL.mp4` 会让 ffmpeg 落进设备命名空间、>260 字符的路径
+/// 只有 std::fs 能过（ffmpeg 不加 `\\?\` 会报 no such file），而这两种报错都
+/// 发生在一整轮编码之后，用户完全看不出真实原因。
+pub fn check_output_path(path: &Path) -> crate::Result<()> {
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    if is_reserved_device(&stem) {
+        return Err(CoreError::InvalidInput(format!(
+            "输出名是 Windows 保留设备名：{}",
+            path.display()
+        )));
+    }
+    if path.as_os_str().len() > 240 {
+        return Err(CoreError::InvalidInput(format!(
+            "输出路径过长（{} 字符），请换更浅的输出目录：{}",
+            path.as_os_str().len(),
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// 系统工具的绝对路径（`curl.exe` / `taskkill.exe` / `explorer.exe`）。
+///
+/// `Command::new("curl")` 走 PATH 搜索：绿色便携版可能放在任何目录，PATH 里
+/// 被人抢先放一个同名 curl.exe，就等于把"下载可执行文件"这件事交给了攻击者。
+pub fn system_tool(name: &str) -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(root) = std::env::var_os("SystemRoot").or_else(|| std::env::var_os("WINDIR")) {
+            let p = PathBuf::from(root).join("System32").join(name);
+            if p.is_file() {
+                return p;
+            }
+        }
+    }
+    PathBuf::from(name)
 }
 
 /// Windows 下隐藏子进程控制台窗口（CREATE_NO_WINDOW），避免 GUI 程序
@@ -616,5 +987,118 @@ mod tests {
             }
             other => panic!("意外错误：{:?}", other),
         }
+    }
+
+    /// 管道死锁回归：子进程先往 stderr 灌 100KB（远超管道缓冲）**才**写 stdout。
+    /// 不后台排空 stderr 的实现会永远卡在 read(stdout) 上，本测试会挂死而不是失败。
+    #[test]
+    fn monitored_drains_stderr_so_a_chatty_child_cannot_deadlock() {
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            "i=0; while [ $i -lt 2000 ]; do echo 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' >&2; i=$((i+1)); done; echo done",
+        ]);
+        let cancel = AtomicBool::new(false);
+        let mut m = Monitored::spawn(&mut cmd).unwrap();
+        let mut last = None;
+        let done = m
+            .pump(&cancel, |l| last = Some(l.to_string()))
+            .unwrap();
+        assert!(done.status.success(), "子进程应正常退出");
+        assert_eq!(last.as_deref(), Some("done"), "stdout 行必须逐行送达");
+        assert!(
+            done.stderr.len() >= 100_000,
+            "stderr 必须被完整排空，实际只拿到 {} 字节",
+            done.stderr.len()
+        );
+    }
+
+    #[test]
+    fn stderr_tail_is_capped_at_the_end() {
+        // 真错误总在末尾：上限之外从头部丢弃，且不得超过上限太多
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            "i=0; while [ $i -lt 9000 ]; do echo 'yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy' >&2; i=$((i+1)); done",
+        ]);
+        let cancel = AtomicBool::new(false);
+        let mut m = Monitored::spawn(&mut cmd).unwrap();
+        let done = m.pump(&cancel, |_| {}).unwrap();
+        assert!(
+            done.stderr.len() <= STDERR_TAIL_CAP + 128,
+            "stderr 未按上限截断：{}",
+            done.stderr.len()
+        );
+        assert!(done.stderr.contains('y'));
+    }
+
+    #[test]
+    fn url_argument_is_isolated_by_the_options_terminator() {
+        let mut args = vec!["-o".to_string(), "x".to_string()];
+        push_url_arg(&mut args, "https://example.com/v");
+        assert_eq!(args.join(" "), "-o x -- https://example.com/v");
+        // 后补的选项必须落在 `--` 之前，否则会被当成第二条 URL 而不是选项
+        insert_before_url(&mut args, vec!["--newline".to_string(), "2".to_string()]);
+        assert_eq!(args.join(" "), "-o x --newline 2 -- https://example.com/v");
+        assert!(is_http_url("http://a.test"));
+        assert!(is_http_url("https://a.test"));
+        // 站点 JSON 里回来的字符串不能直接当 URL 用
+        assert!(!is_http_url("--exec=calc.exe"));
+        assert!(!is_http_url("file:///C:/Windows/win.ini"));
+    }
+
+    #[test]
+    fn progress_tail_sends_machine_progress_to_stdout() {
+        assert_eq!(
+            progress_tail().join(" "),
+            "-progress pipe:1 -nostats -loglevel error"
+        );
+    }
+
+    #[test]
+    fn display_command_redacts_proxy_credentials() {
+        let args = vec![
+            "--proxy".to_string(),
+            "http://user:pass@127.0.0.1:7890".to_string(),
+            "--cookies".to_string(),
+            "C:\\config\\cookies\\www.youtube.com.txt".to_string(),
+            "https://example.com/watch?v=1".to_string(),
+        ];
+        let shown = display_command("yt-dlp", &args);
+        assert!(!shown.contains("user:pass"), "凭据泄漏到日志：{shown}");
+        assert!(shown.contains("***:***@127.0.0.1:7890"), "{shown}");
+        // 主机与端口要留着便于排障；无凭据的参数一律原样
+        assert!(shown.contains("www.youtube.com.txt"), "{shown}");
+        assert!(shown.contains("https://example.com/watch?v=1"), "{shown}");
+    }
+
+    #[test]
+    fn check_output_path_rejects_reserved_and_long() {
+        let root = tempdir().unwrap();
+        for bad in ["NUL", "con", "COM1", "com9", "LPT3", "PRN"] {
+            let p = root.path().join(format!("{bad}.mp4"));
+            assert!(
+                check_output_path(&p).is_err(),
+                "保留设备名未被拦下：{}",
+                p.display()
+            );
+        }
+        // 正常中文名与 NULL/COM-1/COMPUTER/COM0 这类名字不能误伤
+        for ok in ["标题 [abc]", "NULL", "1080p", "COM-1", "COMPUTER", "COM0", "LPTA"] {
+            let p = root.path().join(format!("{ok}.mp4"));
+            assert!(check_output_path(&p).is_ok(), "误伤正常文件名：{ok}");
+        }
+        let long = root.path().join(format!("{}.mp4", "a".repeat(300)));
+        assert!(check_output_path(&long).is_err());
+    }
+
+    #[test]
+    fn remove_with_retry_treats_missing_as_success() {
+        let root = tempdir().unwrap();
+        let gone = root.path().join("not-there.mp4");
+        assert!(remove_with_retry(&gone).is_ok());
+        std::fs::write(&gone, b"x").unwrap();
+        assert!(remove_with_retry(&gone).is_ok());
+        assert!(!gone.exists());
     }
 }

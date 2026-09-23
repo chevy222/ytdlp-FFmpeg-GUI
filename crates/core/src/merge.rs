@@ -9,10 +9,10 @@
 //! 输出：MP4（默认）/MKV，`+faststart`；任务私有临时目录，结束清理（稳定性需求）。
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use crate::exec::{ChildGuard, Tool, ToolResolver};
+use crate::exec::{progress_tail, Monitored, Tool, ToolResolver};
 use crate::model::MediaMeta;
 use crate::{CoreError, Result};
 
@@ -23,6 +23,11 @@ pub struct MergeParams {
     pub out_dir: PathBuf,
     /// 任务私有临时目录根（`<exe 同级>\temp\`，§3.7）——中间产物不得落在输出目录
     pub temp_dir: PathBuf,
+    /// 本次作业的 id（= 锚点条目 id）：临时目录一律 `temp/<task_id>/`，
+    /// 与下载/转码同一方言，`clear_temp` 才能认出"这是进行中任务的目录"。
+    /// 旧实现自造 `temp/merge_<uuid>`，清理按钮按条目 id 比对活跃目录，认不出它，
+    /// 合并进行中点"清理临时文件"会把正在用的 list.txt 与段文件一起删掉。
+    pub task_id: String,
     /// 输出文件名（可编辑，默认 合并_<时间戳>）
     pub filename: String,
     /// 容器：mp4 | mkv
@@ -58,10 +63,22 @@ fn same_parameters(metas: &[MediaMeta]) -> bool {
             m.vcodec.clone(),
             m.height,
             m.fps.map(|f| (f * 100.0).round() as i64),
+            // pix_fmt：8bit 段与 10bit 段直拼进同一容器时标签由第一段决定，
+            // 后面几段会整体偏色，必须纳入硬判据
+            m.pix_fmt.clone(),
             m.extradata.clone(),
         )
     };
-    let a = |m: &MediaMeta| (m.acodec.clone(), m.sample_rate);
+    // 声道数与音频流条数也要比：concat demuxer 对"声道布局不同/流数不同"的输入
+    // 不报错，只会让后面的段音频错位
+    let a = |m: &MediaMeta| {
+        (
+            m.acodec.clone(),
+            m.sample_rate,
+            m.audio_channels,
+            m.audio_tracks,
+        )
+    };
     let ref_v = v(first);
     let ref_a = a(first);
     metas
@@ -109,6 +126,12 @@ fn concat_copy(
         "0".into(),
         "-i".into(),
         list_file.to_string_lossy().into_owned(),
+        // 显式映射：不给 -map 时由 ffmpeg 逐文件做"默认流选择"，
+        // 多音轨/含封面流的输入会让各段选到不同流
+        "-map".into(),
+        "0:v:0".into(),
+        "-map".into(),
+        "0:a:0?".into(),
         "-c".into(),
         "copy".into(),
         "-map_metadata".into(),
@@ -119,11 +142,7 @@ fn concat_copy(
         args.push("+faststart".into());
     }
     args.push("-y".into());
-    args.push("-progress".into());
-    args.push("pipe:1".into());
-    args.push("-nostats".into());
-    args.push("-loglevel".into());
-    args.push("error".into());
+    args.extend(progress_tail().iter().map(|s| s.to_string()));
     args.push(out.to_string_lossy().into_owned());
 
     on_log("参数一致，直拼（零重编码）…".into());
@@ -147,6 +166,7 @@ fn transcode_segment(
     main_idx: Option<u32>,
     encoder_mode: &str,
     target_h: u32,
+    duration: f64,
     cancel: &Arc<AtomicBool>,
     on_progress: &mut dyn FnMut(f32),
     on_log: &mut dyn FnMut(String),
@@ -198,15 +218,11 @@ fn transcode_segment(
     args.push("-movflags".into());
     args.push("+faststart".into());
     args.push("-y".into());
-    args.push("-progress".into());
-    args.push("pipe:1".into());
-    args.push("-nostats".into());
-    args.push("-loglevel".into());
-    args.push("error".into());
+    args.extend(progress_tail().iter().map(|s| s.to_string()));
     args.push(out.to_string_lossy().into_owned());
 
     on_log(format!("统一参数转码：{}", input.display()));
-    run_piped_progress(resolver, args, cancel, 0.0, on_progress, on_log)?;
+    run_piped_progress(resolver, args, cancel, duration, on_progress, on_log)?;
     if !out.exists() {
         return Err(CoreError::ProcessFailed {
             program: "ffmpeg".into(),
@@ -225,43 +241,28 @@ fn run_piped_progress(
     on_progress: &mut dyn FnMut(f32),
     on_log: &mut dyn FnMut(String),
 ) -> Result<()> {
-    use std::io::BufRead;
-    use std::process::Stdio;
     // 合并链路的所有 ffmpeg 执行（段转码/拼接/归一化）都走这里：命令行统一入日志
     on_log(crate::exec::display_command("ffmpeg", &args));
     let mut cmd = resolver.command(Tool::Ffmpeg)?;
     cmd.args(&args);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut guard = ChildGuard::spawn(&mut cmd)?;
-    let stdout = guard
-        .stdout()
-        .ok_or_else(|| CoreError::Io(std::io::Error::other("无法读取 ffmpeg 输出")))?;
-    let mut stderr = guard
-        .stderr()
-        .ok_or_else(|| CoreError::Io(std::io::Error::other("无法读取 ffmpeg 错误输出")))?;
-    let reader = std::io::BufReader::new(stdout);
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
-        };
-        if cancel.load(Ordering::Relaxed) {
-            guard.kill_tree();
-            break;
-        }
+    // 两条管道都由 Monitored 的后台线程排空。旧实现只读 stdout、等进程退出后才读
+    // stderr：ffmpeg 的 stderr 写满管道缓冲后阻塞在 write()，父线程又在等 stdout
+    // 的下一行，两边互等成永久死锁；而取消检查写在"收到下一行之后"，所以
+    // 连取消都点不动。整条合并链（直拼/分段/归一化）都经此处，一处修好即全好。
+    let mut monitored = Monitored::spawn(&mut cmd)?;
+    // 显式 reborrow 到可变绑定后再交给闭包，避免直接捕获 `&mut dyn FnMut` 形参
+    let mut prog = &mut *on_progress;
+    let done = monitored.pump(cancel, |line| {
         if duration > 0.0 {
-            if let Some(us) = crate::transcode::parse_out_time_us(&line) {
+            if let Some(us) = crate::transcode::parse_out_time_us(line) {
                 let pct = ((us as f64 / 1e6) / duration * 100.0).clamp(0.0, 99.0) as f32;
-                on_progress(pct);
+                prog(pct);
             }
         }
-    }
-    let status = guard.wait()?;
-    if cancel.load(Ordering::Relaxed) {
-        return Err(CoreError::Cancelled);
-    }
-    if !status.success() {
-        let buf = crate::exec::drain_stderr(&mut stderr);
+    })?;
+    drop(prog);
+    if !done.status.success() {
+        let buf = done.stderr;
         let err = if buf.trim().is_empty() {
             "（无错误输出）".to_string()
         } else {
@@ -270,7 +271,7 @@ fn run_piped_progress(
         on_log(format!("ffmpeg 失败：{}", err));
         return Err(CoreError::ProcessFailed {
             program: "ffmpeg".into(),
-            code: status.code(),
+            code: done.status.code(),
             stderr: err,
         });
     }
@@ -305,13 +306,19 @@ pub fn run_merge(
         on_log("输入参数不一致（编码/分辨率/帧率/音频/采样率），按统一模式处理".into());
     }
 
-    // 2) 任务私有临时目录（§3.7：中间产物一律在 <exe 同级>\temp\，不污染输出目录）
-    let task_id = uuid::Uuid::new_v4().to_string();
-    let tmp = params.temp_dir.join(format!("merge_{}", task_id));
+    // 2) 任务私有临时目录（§3.7：中间产物一律在 <exe 同级>\temp\<任务 id>\）
+    let tmp = params.temp_dir.join(&params.task_id);
     std::fs::create_dir_all(&tmp)?;
     let cleanup = |t: &Path, out: &Path| {
-        let _ = std::fs::remove_dir_all(t);
-        let _ = std::fs::remove_file(out);
+        // 刚 kill 完句柄可能还占着，重试并如实上报（旧实现 `let _ =` 吞掉一切）
+        if let Err(e) = crate::exec::remove_dir_with_retry(t) {
+            on_log(format!("临时目录清理失败（可稍后手动删除）：{e}"));
+        }
+        if out.exists() {
+            if let Err(e) = crate::exec::remove_with_retry(out) {
+                on_log(format!("半成品清理失败（可稍后手动删除）：{e}"));
+            }
+        }
     };
     let result = (|| -> Result<PathBuf> {
         if params.normalize_audio {
@@ -368,6 +375,8 @@ pub fn run_merge(
                     metas[i].video_stream_index,
                     &params.encoder_mode,
                     target_h,
+                    // 把本段时长传进去：原来固定传 0.0，模式B 的段进度恒 0%
+                    d,
                     cancel,
                     &mut prog,
                     &mut on_log,
@@ -395,14 +404,18 @@ pub fn run_merge(
 
     match result {
         Ok(mut o) => {
-            let _ = std::fs::remove_dir_all(&tmp);
+            if let Err(e) = crate::exec::remove_dir_with_retry(&tmp) {
+                on_log(format!("临时目录清理失败：{e}"));
+            }
             if params.normalize_audio {
                 match post_normalize(
                     resolver,
                     &o,
                     params.max_gain_db,
                     &params.container,
-                    &params.temp_dir,
+                    // 传任务私有目录而不是 temp 根目录：norm_*.mp4 落在根上，
+                    // 既不在 cleanup 的覆盖范围、也不是"按条目 id 认活跃"的目录
+                    &tmp,
                     cancel,
                     &mut on_log,
                 ) {
@@ -478,6 +491,11 @@ fn post_normalize(
         args.push("+faststart".into());
     }
     args.push("-y".into());
+    // 这一组是这里最要命的四行：不加 -progress/-nostats/-loglevel 时 ffmpeg 不写
+    // stdout、只往 stderr 灌 banner + 每 0.5s 一条统计，而 run_piped_progress 旧写法
+    // 等进程退出后才读 stderr —— 归一化必然卡死且无法取消（音量归一化默认取自全局设置，
+    // 多数用户都会走到这条路）。
+    args.extend(progress_tail().iter().map(|s| s.to_string()));
     args.push(tmp.to_string_lossy().into_owned());
     on_log(format!("音量归一化：+{:.1}dB", gain));
     run_piped_progress(resolver, args, cancel, 0.0, &mut |_| {}, on_log)?;
@@ -488,14 +506,26 @@ fn post_normalize(
             stderr: "音量归一化未生成输出".into(),
         });
     }
-    // 原子替换：rename 直接覆盖（Windows MOVEFILE_REPLACE_EXISTING），
-    // 不再"先删后改名"（中途失败会连合并产物一起丢）
+    // 替换：rename 直接覆盖（Windows MOVEFILE_REPLACE_EXISTING），不"先删后改名"
+    // （中途失败会连合并产物一起丢）。但 std::fs::rename **跨卷必失败**
+    // （程序装 C:、产物在 D: 时返回 ERROR_NOT_SAME_DEVICE），而且是在整段重混
+    // 之后才发现 —— 回退方案：先复制到目标目录旁的临时名，再同卷 rename，
+    // 替换仍然近似原子且不受卷边界限制。
     if let Err(e) = std::fs::rename(&tmp, input) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(CoreError::Io(std::io::Error::other(format!(
-            "音量归一化产物替换失败：{e}"
-        ))));
+        let staged = input.with_extension("norm-tmp");
+        let staged_ok = (|| -> std::io::Result<()> {
+            std::fs::copy(&tmp, &staged)?;
+            std::fs::rename(&staged, input)
+        })();
+        if let Err(e2) = staged_ok {
+            let _ = std::fs::remove_file(&staged);
+            let _ = crate::exec::remove_with_retry(&tmp);
+            return Err(CoreError::Io(std::io::Error::other(format!(
+                "音量归一化产物替换失败：{e}；跨卷回退也失败：{e2}"
+            ))));
+        }
     }
+    let _ = crate::exec::remove_with_retry(&tmp);
     Ok(input.to_path_buf())
 }
 

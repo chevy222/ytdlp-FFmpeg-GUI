@@ -40,8 +40,12 @@ pub enum CoreError {
     NotFound(String),
     #[error("配置损坏: {0}")]
     ConfigCorrupt(String),
+    #[error("输入不合法: {0}")]
+    InvalidInput(String),
     #[error("任务已取消")]
     Cancelled,
+    #[error("输出已存在，按策略跳过: {0}")]
+    AlreadyExists(String),
     #[error("进程执行失败 ({program}): code={code:?} stderr={stderr}")]
     ProcessFailed {
         program: String,

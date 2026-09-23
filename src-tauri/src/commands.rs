@@ -45,6 +45,11 @@ pub struct ToolInstallResult {
     pub version: Option<String>,
     /// 给用户看的一句话结论
     pub message: String,
+    /// 本次真正安装产物是否与官方 SHA-256 比对通过。
+    /// 取不到校验值时下载直接中止，所以"下载成功但未校验"只在工具没有配置
+    /// 校验源时出现 —— 那种情况必须在 message 里如实写明，不能当成已校验。
+    /// 未发生安装（已存在/已是最新）时为 false，前端只在 updated 时参考它。
+    pub verified: bool,
 }
 
 /// 「下载 / 更新」的执行计划。
@@ -184,11 +189,18 @@ async fn run_tool_install(
     } else {
         "已安装到"
     };
+    // 未校验不能静默当成已校验：把结论写进同一句话里
+    let caveat = if done.verified {
+        String::new()
+    } else {
+        "（未取得官方校验值，未经校验）".to_string()
+    };
     Ok(ToolInstallResult {
         updated: true,
+        verified: done.verified,
         path: done.path.to_string_lossy().into_owned(),
         version,
-        message: format!("{name}{vs}{verb} {}", done.path.display()),
+        message: format!("{name}{vs}{verb} {path}{caveat}", path = done.path.display()),
     })
 }
 
@@ -210,6 +222,7 @@ fn plan_tool_install(
                 .unwrap_or_default();
             return Ok(InstallPlan::Done(ToolInstallResult {
                 updated: false,
+                verified: false,
                 path: dest.to_string_lossy().into_owned(),
                 version,
                 message: format!("{name}{vs}已在 tools\\ 中；如需检查新版本请点\"更新\""),
@@ -247,6 +260,7 @@ fn plan_tool_install(
             .unwrap_or_default();
         return Ok(InstallPlan::Done(ToolInstallResult {
             updated: false,
+            verified: false,
             path: target.to_string_lossy().into_owned(),
             version: local,
             message: format!("{name}{vs}已是最新，无需更新"),
@@ -371,81 +385,150 @@ fn persist(app: &AppHandle) {
     app.state::<AppState>().persist();
 }
 
+/// 任务线程的资源账本：正常返回、提前 `?`、还是 panic unwind，都必须结账。
+///
+/// 旧写法把 `cancels.remove` + `release_slot` 写在 run_*_task 尾部的 finish_* 里，
+/// 线程一旦 panic（进度解析越界、meta 字段 unwrap…）就直接蒸发：条目永远停在
+/// "下载中"，而那个并发额度**永久**不再归还 —— 默认 3 的池泄漏 3 次之后，
+/// 所有任务永远排队，只能重启进程。`thread::spawn` 的 JoinHandle 被丢弃，
+/// panic 也完全无人知晓。
+struct RunningTask {
+    app: AppHandle,
+    id: String,
+}
+
+impl Drop for RunningTask {
+    fn drop(&mut self) {
+        let state = self.app.state::<AppState>();
+        state.cancels.lock().remove(&self.id);
+        // 状态还停在"处理中"说明 finish_* 没跑完 = panic 或提前返回
+        let stuck = {
+            let hist = state.history.lock();
+            hist.get(&self.id).map(|i| i.status.is_processing()).unwrap_or(false)
+        };
+        if stuck {
+            update_item(&self.app, &self.id, |it| {
+                it.status = Status::Failed;
+                it.error = Some("任务线程异常退出（内部错误）".into());
+                it.push_log("任务线程异常退出，已释放并发额度（详情见日志文件）".to_string());
+            });
+        }
+        release_slot(&self.app, &self.id);
+        persist(&self.app);
+    }
+}
+
 // ---------- 添加与解析 ----------
+
+/// 把解析任务投进固定解析池。
+///
+/// 旧实现对**每个** URL/文件 `std::thread::spawn` 一个线程（还在持有 history 锁的
+/// 循环里），"添加文件夹"选一个大目录就是几千个线程 + 几千个并发 ffprobe/yt-dlp，
+/// 打满资源并撞站点风控。解析确实不该占业务并发额度，但不占额度不等于不限流。
+/// 队列满时退化为一次性线程 —— 宁可多开几个也不能把任务静默丢掉。
+fn queue_probes(app: &AppHandle, ids: Vec<String>) {
+    for id in ids {
+        let queued = app.state::<AppState>().submit_probe(&id);
+        if queued.is_err() {
+            let app2 = app.clone();
+            std::thread::spawn(move || run_probe(app2, id));
+        }
+    }
+}
 
 #[tauri::command]
 pub fn add_url(app: AppHandle, urls: Vec<String>) -> CmdResult<()> {
     let state = app.state::<AppState>();
-    let mut hist = state.history.lock();
-    for raw in urls {
-        let url = clean_url(&raw);
-        if url.is_empty() {
-            continue;
+    let mut spawned: Vec<String> = Vec::new();
+    {
+        let mut hist = state.history.lock();
+        for raw in urls {
+            let url = clean_url(&raw);
+            if url.is_empty() {
+                continue;
+            }
+            // DL-01：只接受 http(s):// —— UI 与 CLI 两条入口在此共用同一校验，
+            // 否则 CLI 裸参数会把本地文件名当 URL 入列
+            if !ytdlp_core::exec::is_http_url(&url) {
+                continue;
+            }
+            let item = MediaItem::from_url(url);
+            let id = item.id.clone();
+            hist.upsert(item);
+            spawned.push(id);
         }
-        // DL-01：只接受 http(s):// —— UI 与 CLI 两条入口在此共用同一校验，
-        // 否则 CLI 裸参数会把本地文件名当 URL 入列
-        if !url.starts_with("http://") && !url.starts_with("https://") {
-            continue;
-        }
-        let item = MediaItem::from_url(url);
-        let id = item.id.clone();
-        hist.upsert(item);
-        // 解析线程不占并发 slot
-        let app2 = app.clone();
-        std::thread::spawn(move || {
-            run_probe(app2, id);
-        });
     }
-    drop(hist);
     persist(&app);
     let _ = app.emit("list:changed", ());
+    queue_probes(&app, spawned);
     Ok(())
 }
 
 #[tauri::command]
-pub fn add_local(app: AppHandle, paths: Vec<String>, recursive: bool) -> CmdResult<()> {
-    let mut files: Vec<PathBuf> = Vec::new();
-    for p in paths {
-        let pb = PathBuf::from(&p);
-        if pb.is_dir() {
-            scan_dir(&pb, recursive, &mut files);
-        } else if pb.is_file() {
-            files.push(pb);
+pub async fn add_local(app: AppHandle, paths: Vec<String>, recursive: bool) -> CmdResult<()> {
+    // 递归扫描整个目录树是文件系统密集操作，而 Tauri 的非 async 命令跑在**主线程**
+    // —— 选一个大仓库当目录添加，窗口会直接"(无响应)"。
+    let files = tauri::async_runtime::spawn_blocking(move || {
+        let mut files: Vec<PathBuf> = Vec::new();
+        for p in paths {
+            let pb = PathBuf::from(&p);
+            if pb.is_dir() {
+                scan_dir(&pb, recursive, &mut files);
+            } else if pb.is_file() {
+                files.push(pb);
+            }
         }
-    }
+        files
+    })
+    .await
+    .map_err(|e| format!("扫描目录失败：{e}"))?;
     if files.is_empty() {
         return Err("没有找到可添加的文件".into());
     }
     let state = app.state::<AppState>();
-    let mut hist = state.history.lock();
-    for f in files {
-        let item = MediaItem::from_path(f.to_string_lossy().into_owned());
-        let id = item.id.clone();
-        hist.upsert(item);
-        let app2 = app.clone();
-        std::thread::spawn(move || {
-            run_probe(app2, id);
-        });
+    let mut spawned: Vec<String> = Vec::new();
+    {
+        let mut hist = state.history.lock();
+        for f in files {
+            let item = MediaItem::from_path(f.to_string_lossy().into_owned());
+            let id = item.id.clone();
+            hist.upsert(item);
+            spawned.push(id);
+        }
     }
-    drop(hist);
     persist(&app);
     let _ = app.emit("list:changed", ());
+    queue_probes(&app, spawned);
     Ok(())
 }
 
+/// 目录扫描：显式栈 + 深度上限 + 文件数上限，且**不跟随**符号链接/junction。
+///
+/// 旧实现是递归函数 + `p.is_dir()`（Path::is_dir 会跟随链接）。Windows 上
+/// `C:\Users\x\AppData\Local\Application Data` 这类自指 junction 真实存在，
+/// 于是无限递归直到栈溢出 —— 那是直接崩进程，连 panic 捕获都救不回来。
+/// `DirEntry::file_type()` 取的是 FindNextFile 的元数据，既不跟随 reparse point
+/// 也省掉一次 GetFileAttributesExW。
 fn scan_dir(dir: &Path, recursive: bool, out: &mut Vec<PathBuf>) {
-    let rd = match std::fs::read_dir(dir) {
-        Ok(rd) => rd,
-        Err(_) => return,
-    };
-    for e in rd.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            if recursive {
-                scan_dir(&p, true, out);
+    const MAX_FILES: usize = 2000;
+    const MAX_DEPTH: usize = 12;
+    let mut stack: Vec<(PathBuf, usize)> = vec![(dir.to_path_buf(), 0)];
+    while let Some((current, depth)) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            if out.len() >= MAX_FILES {
+                return;
             }
-        } else if download::is_media_file(&p) {
-            out.push(p);
+            let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            if is_dir {
+                if recursive && depth < MAX_DEPTH {
+                    stack.push((e.path(), depth + 1));
+                }
+            } else if download::is_media_file(&e.path()) {
+                out.push(e.path());
+            }
         }
     }
 }
@@ -473,7 +556,7 @@ fn run_probe(app: AppHandle, id: String) {
 
     let resolver = state.resolver();
     let network = state.config.lock().network.clone();
-    let netscape = resolve_cookies(&state, &item);
+    let netscape = resolve_cookies(&state, &item, &state.paths.task_temp_dir(&id));
 
     let playlist_on = state.config.lock().download.playlist;
     let result = if item.url.is_some() {
@@ -597,7 +680,8 @@ fn run_probe(app: AppHandle, id: String) {
             state.persist();
         }
     }
-    // 解析阶段临时目录清理（cookie 文件现在持久存在 config/cookies/ 下，不删）
+    // 解析阶段临时目录清理：里面只有本次导出的 cookie 副本（config/cookies/ 是存储，
+    // 只读不写，见 CookieStore::export_merged）
     let _ = std::fs::remove_dir_all(state.paths.task_temp_dir(&id));
     persist(&app);
 }
@@ -658,6 +742,8 @@ pub fn start_download(
 
 fn run_download_task(app: AppHandle, id: String, format_id: Option<String>, audio_only: bool) {
     let state = app.state::<AppState>();
+    // 资源账本：panic / 提前返回也要归还并发额度并清取消标志（见 RunningTask）
+    let _task = RunningTask { app: app.clone(), id: id.clone() };
     let cancel = state.register_cancel(&id);
 
     let (url, cfg, general, resolver, out_dir, template, proxy, netscape, sections, js_runtime) = {
@@ -681,7 +767,7 @@ fn run_download_task(app: AppHandle, id: String, format_id: Option<String>, audi
         let out_dir = default_output_dir(&state);
         let template = cfg.filename_template.clone();
         let proxy = state.config.lock().network.resolve_proxy(&url);
-        let netscape = resolve_cookies(&state, &item);
+        let netscape = resolve_cookies(&state, &item, &state.paths.task_temp_dir(&id));
         let sections = item.sections.clone();
         // JS 运行时（§3.6 依赖）：托管/配置的 deno 必须显式传给 yt-dlp，
         // 否则 YouTube 组件会因"没有 JS 运行时"失败（依赖自检却是通过的）
@@ -927,14 +1013,12 @@ fn finish_download(
             }
         }
     }
-    // 任务结束：只清理本任务私有临时目录（cookie 文件持久存在 config/cookies/ 下，不删）
-    let _ = std::fs::remove_dir_all(state.paths.task_temp_dir(id));
-    // 清理取消标志注册表条目（否则随任务数无限累积；也让后续 cancel_item
-    // 的 cancel_flag 查询能正确区分"运行中"与"已结束"）
-    state.cancels.lock().remove(id);
-    // 释放并发 slot，启动下一个等待任务（下载/转码/合并共用）
-    release_slot(app, id);
-    persist(app);
+    // 任务结束：清理本任务私有临时目录（含本次导出的 cookie 副本；
+    // config/cookies/ 下的存储全程只读）。
+    // 取消标志与并发额度改由 RunningTask::drop 统一结账 —— panic 路径也不会漏。
+    if let Err(e) = ytdlp_core::exec::remove_dir_with_retry(&state.paths.task_temp_dir(id)) {
+        log_item(app, id, format!("临时目录清理失败：{e}"));
+    }
 }
 
 fn default_output_dir(state: &AppState) -> PathBuf {
@@ -960,8 +1044,10 @@ fn default_output_dir(state: &AppState) -> PathBuf {
         .unwrap_or_else(|| state.paths.root().join("output"))
 }
 
-/// Cookie 文件解析：CLI `--cookies` 优先；否则从 Cookie 库按站点导出 Netscape 临时文件。
-fn resolve_cookies(state: &AppState, item: &MediaItem) -> Option<PathBuf> {
+/// Cookie 文件解析：CLI `--cookies` 优先；否则从 Cookie 库把匹配站点的 cookie
+/// 导出到**任务私有临时目录**（`temp/<条目 id>/`），任务结束随目录一起清理。
+/// 导出不回写 `config/cookies/` 存储（见 `CookieStore::export_merged` 的说明）。
+fn resolve_cookies(state: &AppState, item: &MediaItem, task_temp_dir: &Path) -> Option<PathBuf> {
     if let Some(p) = &state.cli.lock().cookies {
         let pb = PathBuf::from(p);
         if pb.is_file() {
@@ -974,7 +1060,7 @@ fn resolve_cookies(state: &AppState, item: &MediaItem) -> Option<PathBuf> {
             .and_then(ytdlp_core::cookies::host_from_url)
     })?;
     let store = CookieStore::new(state.paths.cookies_dir());
-    store.cookies_file(&host).ok().flatten()
+    store.export_merged(&host, task_temp_dir).ok().flatten()
 }
 
 /// 释放并发 slot 并启动下一个等待任务（下载/转码/合并共用）。
@@ -1105,6 +1191,7 @@ fn today_stamp() -> String {
 /// 合并任务线程（提交队列后执行；进度经 `item:update` 回推）。
 fn run_merge_task(app: AppHandle, id: String) {
     let state = app.state::<AppState>();
+    let _task = RunningTask { app: app.clone(), id: id.clone() };
     let cancel = state.register_cancel(&id);
     let job = state.merge_jobs.lock().get(&id).cloned();
     let Some(job) = job else {
@@ -1138,8 +1225,9 @@ fn run_merge_task(app: AppHandle, id: String) {
         let p = MergeParams {
             inputs,
             out_dir: default_output_dir(&state),
-            // 中间产物一律落在 <exe 同级>\temp\（§3.7），不写进用户输出目录
+            // 中间产物一律落在 <exe 同级>\temp\<锚点 id>\（§3.7），不写进用户输出目录
             temp_dir: state.paths.temp_dir(),
+            task_id: id.clone(),
             filename: job.filename.clone(),
             container: job.container.clone(),
             encoder_mode: job.encoder_mode.clone(),
@@ -1278,15 +1366,14 @@ fn finish_merge(
             jobs.remove(jid);
         }
     }
-    // 合并的取消标志注册在每个参与条目上（run_merge_task），一并清理
+    // 合并的取消标志注册在每个参与条目上（run_merge_task），一并清理；
+    // 锚点自己的额度与标志由 RunningTask::drop 结账
     {
         let mut cancels = state.cancels.lock();
         for jid in ids {
             cancels.remove(jid);
         }
     }
-    release_slot(app, id);
-    persist(app);
 }
 
 /// 设置时间范围下载（DL-12）：起止 "HH:MM:SS"；空串清除。
@@ -1447,6 +1534,7 @@ fn expand_playlist(
 /// 转码任务线程（提交队列后执行；进度经 `item:update` 回推）。
 fn run_transcode_task(app: AppHandle, id: String) {
     let state = app.state::<AppState>();
+    let _task = RunningTask { app: app.clone(), id: id.clone() };
     let cancel = state.register_cancel(&id);
     // 锁纪律（§11.15）：history 锁内只 clone 条目，config/cli/default_output_dir
     // 一律出锁后再取（P1-3：持 history 锁期间嵌套取 config/cli 锁会让 update_item 卡顿）
@@ -1624,10 +1712,7 @@ fn finish_transcode(app: &AppHandle, id: &str, result: Result<std::path::PathBuf
         let _ = app.emit("item:ready", serde_json::json!({ "id": prod.id }));
         let _ = app.emit("list:changed", ());
     }
-    // 清理取消标志 + 释放并发 slot，启动下一个等待任务
-    state.cancels.lock().remove(id);
-    release_slot(app, id);
-    persist(app);
+    // 取消标志与并发额度由 RunningTask::drop 统一结账
 }
 
 /// 转码结束后原条目恢复状态：本地文件 → 已就绪；下载产物/转码产物 → 已完成（可再转码）。
@@ -1687,6 +1772,28 @@ pub fn cancel_item(app: AppHandle, id: String) -> CmdResult<()> {
         q.cancel_waiting(&id)
     };
     if removed {
+        // 排队中的**合并**：整批参与条目都要恢复原状态。只处理锚点的话，
+        // 其余条目永远停在"合并中"（既不能删也不能再合并，直到重启被判"任务中断"），
+        // 且 merge_jobs 里的条目永久残留。
+        let job = state.merge_jobs.lock().get(&id).cloned();
+        if let Some(job) = job {
+            {
+                let mut jobs = state.merge_jobs.lock();
+                for jid in &job.ids {
+                    jobs.remove(jid);
+                }
+            }
+            for jid in &job.ids {
+                let orig = restore_status(&app, jid);
+                update_item(&app, jid, |it| {
+                    transition_in(it, orig);
+                    it.percent = 0.0;
+                    it.push_log("已取消（队列中移除本批合并作业）".to_string());
+                });
+            }
+            persist(&app);
+            return Ok(());
+        }
         update_item(&app, &id, |it| {
             transition_in(it, Status::Canceled);
             it.push_log("已取消（队列中移除）".to_string());
@@ -1708,24 +1815,57 @@ pub fn cancel_item(app: AppHandle, id: String) -> CmdResult<()> {
     }
 }
 
+/// 删除条目对应的缩略图缓存。
+///
+/// `config/cache/<id>.*` 由条目 id 命名，条目从列表消失后再无人引用它们 ——
+/// 不清就是一个只增不减的磁盘泄漏（每条目一张图，列表用几个月就是几百个孤儿）。
+fn purge_thumbs(app: &AppHandle, ids: &[String]) {
+    if ids.is_empty() {
+        return;
+    }
+    let state = app.state::<AppState>();
+    let Ok(rd) = std::fs::read_dir(state.paths.cache_dir()) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        // 缩略图文件名是 `<条目 id>.<扩展>`，id 是 UUID（不含点），按第一个点切
+        let stem = name.split('.').next().unwrap_or("").to_string();
+        if ids.iter().any(|id| *id == stem) {
+            let _ = ytdlp_core::exec::remove_with_retry(&e.path());
+        }
+    }
+}
+
 #[tauri::command]
 pub fn remove_item(app: AppHandle, id: String) -> CmdResult<()> {
     let state = app.state::<AppState>();
-    let mut hist = state.history.lock();
-    if hist.remove(&id) {
-        drop(hist);
-        persist(&app);
-        let _ = app.emit("item:removed", id);
-        Ok(())
-    } else {
-        Err("条目不存在".into())
+    // 正在跑的任务不能"删掉了事"：线程还在跑、并发额度还占着、产物还会落地，
+    // 而条目已经没了 —— 之后所有 update_item 全部静默失效，用户看到一个不动的幽灵进度
+    if state.cancel_flag(&id).is_some() {
+        return Err("任务正在运行，请先取消再删除".into());
     }
+    let removed = {
+        let mut hist = state.history.lock();
+        hist.remove(&id)
+    };
+    if removed.is_empty() {
+        return Err("条目不存在".into());
+    }
+    purge_thumbs(&app, &removed);
+    persist(&app);
+    let _ = app.emit("item:removed", id);
+    Ok(())
 }
 
 #[tauri::command]
 pub fn clear_done(app: AppHandle) -> CmdResult<()> {
     let state = app.state::<AppState>();
-    state.history.lock().clear_terminal();
+    let removed = {
+        let mut hist = state.history.lock();
+        hist.clear_terminal()
+    };
+    purge_thumbs(&app, &removed);
     persist(&app);
     let _ = app.emit("list:changed", ());
     Ok(())

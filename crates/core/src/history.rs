@@ -76,22 +76,54 @@ impl History {
         }
     }
 
-    /// 删除条目（仅终态可删，调用方保证）。
-    pub fn remove(&mut self, id: &str) -> bool {
+    /// 删除条目（仅终态可删，调用方保证）。返回**被删掉的条目 id**，
+    /// 调用方据此清理它们在 config/cache 里的缩略图，否则缓存只增不减。
+    pub fn remove(&mut self, id: &str) -> Vec<String> {
         let before = self.items.len();
+        let removed: Vec<String> = self
+            .items
+            .iter()
+            .filter(|i| i.id == id)
+            .map(|i| i.id.clone())
+            .collect();
         self.items.retain(|i| i.id != id);
-        self.items.len() != before
+        if self.items.len() == before {
+            Vec::new()
+        } else {
+            removed
+        }
     }
 
-    /// 清除全部终态条目（Done/Failed/Canceled）。
-    pub fn clear_terminal(&mut self) {
+    /// 清除全部终态条目（Done/Failed/Canceled）。返回被删掉的 id（同上）。
+    pub fn clear_terminal(&mut self) -> Vec<String> {
+        let removed: Vec<String> = self
+            .items
+            .iter()
+            .filter(|i| i.status.is_terminal())
+            .map(|i| i.id.clone())
+            .collect();
         self.items.retain(|i| !i.status.is_terminal());
+        removed
     }
 
     /// 加载；文件缺失返回空历史；JSON 损坏备份为 `<原名>.corrupt-<ts>.json`。
+    ///
+    /// **逐条救回**：旧实现整份 `from_str::<History>`，只要有一条条目字段缺失
+    /// 或是新版本写入的未知状态，整份 history.json 就判为损坏 → 上层回退空列表
+    /// → 第一次 persist 就把用户的整个列表覆盖掉。坏一条只丢一条。
     pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
+        }
+        const MAX_HISTORY_BYTES: u64 = 32 * 1024 * 1024;
+        if let Ok(md) = std::fs::metadata(path) {
+            if md.len() > MAX_HISTORY_BYTES {
+                return Err(CoreError::ConfigCorrupt(format!(
+                    "history.json 异常过大（{} 字节），拒绝读取：{}",
+                    md.len(),
+                    path.display()
+                )));
+            }
         }
         let text = std::fs::read_to_string(path)?;
         // 剥 UTF-8 BOM：与 config 同一防御（记事本编辑后 serde 会误判损坏）
@@ -99,18 +131,38 @@ impl History {
             .strip_prefix('\u{feff}')
             .map(str::to_string)
             .unwrap_or(text);
-        match serde_json::from_str::<History>(&text) {
-            Ok(h) => Ok(h),
+        let doc: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
             Err(e) => {
                 let backup = crate::paths::corrupt_backup_path(path);
                 let _ = std::fs::copy(path, &backup);
-                Err(CoreError::ConfigCorrupt(format!(
+                return Err(CoreError::ConfigCorrupt(format!(
                     "history.json 损坏（已备份到 {}）：{}",
                     backup.display(),
                     e
-                )))
+                )));
+            }
+        };
+        let limit = doc
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(100)
+            .clamp(1, crate::config::GeneralConfig::HISTORY_LIMIT_MAX);
+        let empty = Vec::new();
+        let raw_items = doc.get("items").and_then(|v| v.as_array()).unwrap_or(&empty);
+        let mut items = Vec::with_capacity(raw_items.len());
+        let mut dropped = 0usize;
+        for v in raw_items {
+            match serde_json::from_value::<MediaItem>(v.clone()) {
+                Ok(item) => items.push(item),
+                Err(_) => dropped += 1,
             }
         }
+        if dropped > 0 {
+            eprintln!("history.json 有 {dropped} 条无法解析的条目已跳过（其余 {}/{} 条已保留）", items.len(), raw_items.len());
+        }
+        Ok(Self { items, limit })
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -186,14 +238,50 @@ mod tests {
     }
 
     #[test]
-    fn remove_returns_bool() {
+    fn remove_returns_removed_ids_for_cache_cleanup() {
         let mut h = History::new(10);
         let it = item(1);
         let id = it.id.clone();
         h.upsert(it);
-        assert!(h.remove(&id));
-        assert!(!h.remove(&id));
+        assert_eq!(h.remove(&id), vec![id.clone()], "调用方要靠这个 id 删缩略图缓存");
+        assert!(h.remove(&id).is_empty());
         assert!(h.is_empty());
+    }
+
+    #[test]
+    fn load_salvages_good_items_when_one_is_broken() {
+        // 一条坏数据不能毁掉整份列表：旧实现整档 from_str 失败 → 上层回退空列表
+        // → 第一次 persist 就把用户全部历史覆盖掉
+        let root = tempdir().unwrap();
+        let p = root.path().join("history.json");
+        let mut h = History::new(100);
+        let a = item(1);
+        let b = item(2);
+        let (id_a, id_b) = (a.id.clone(), b.id.clone());
+        h.upsert(a);
+        h.upsert(b);
+        let mut doc: serde_json::Value = serde_json::to_value(&h).unwrap();
+        // 中间塞一条新版本才有的状态 / 缺字段的条目
+        doc["items"][0]["status"] = serde_json::json!("SomeFutureState");
+        doc["items"].as_array_mut().unwrap().push(serde_json::json!({"id": "no-title"}));
+        std::fs::write(&p, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+
+        let back = History::load(&p).unwrap();
+        assert_eq!(back.len(), 1, "坏一条只丢一条");
+        assert!(back.get(&id_a).is_some() ^ back.get(&id_b).is_some());
+    }
+
+    #[test]
+    fn load_clamps_absurd_limit() {
+        let root = tempdir().unwrap();
+        let p = root.path().join("history.json");
+        std::fs::write(
+            &p,
+            r#"{"items": [], "limit": 4294967295}"#,
+        )
+        .unwrap();
+        let h = History::load(&p).unwrap();
+        assert_eq!(h.limit, crate::config::GeneralConfig::HISTORY_LIMIT_MAX);
     }
 
     #[test]

@@ -61,7 +61,7 @@ pub fn datetime_str(secs: u64, offset_secs: i64) -> String {
     format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, mo, d, h, mi, s)
 }
 
-/// 本地时区偏移秒（东八区 = 28800）。首次调用探测一次并缓存。
+/// 本地时区偏移秒（东八区 = 28800）。**按小时重探**，不冻结在首次调用。
 ///
 /// - Windows：注册表 `ActiveTimeBias`（当前生效偏差，含夏令时；
 ///   bias = UTC − 本地，单位分钟）。经 `reg query` 读取——core 层保持
@@ -69,14 +69,30 @@ pub fn datetime_str(secs: u64, offset_secs: i64) -> String {
 /// - 其余平台：返回 0（UTC）。本项目生产环境为 Windows，测试按 UTC 断言。
 ///
 /// 探测失败（无 reg / 解析不出）一律回退 0，不阻塞调用方。
+///
+/// 为什么不能 OnceLock 缓存一次：偏移值会喂给 `updated_at`、`日期-标题`
+/// 文件名模板和 `合并_<YYYYMMDD>`。跨夏令时（或出差换时区）之后一直用旧偏移，
+/// 列表时间戳与文件名日期就永久偏一小时/一天，直到重启进程才恢复。
 pub fn local_offset_secs() -> i64 {
-    static CACHE: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(detect_offset)
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static OFFSET: AtomicI64 = AtomicI64::new(i64::MIN);
+    static HOUR: AtomicI64 = AtomicI64::new(-1);
+    let hour = (now_secs() / 3600) as i64;
+    let cached = OFFSET.load(Ordering::Relaxed);
+    if cached != i64::MIN && HOUR.load(Ordering::Relaxed) == hour {
+        return cached;
+    }
+    let fresh = detect_offset();
+    OFFSET.store(fresh, Ordering::Relaxed);
+    HOUR.store(hour, Ordering::Relaxed);
+    fresh
 }
 
 #[cfg(windows)]
 fn detect_offset() -> i64 {
-    let mut cmd = std::process::Command::new("reg");
+    // 绝对路径：绿色便携版可能被放在任何目录，PATH 里被抢先放一个 reg.exe
+    // 就能把"读时区"变成"执行任意程序"
+    let mut cmd = std::process::Command::new(crate::exec::system_tool("reg.exe"));
     cmd.args([
         "query",
         r"HKLM\SYSTEM\CurrentControlSet\Control\TimeZoneInformation",

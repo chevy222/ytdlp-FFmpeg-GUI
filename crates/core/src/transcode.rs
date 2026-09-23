@@ -7,14 +7,12 @@
 //!
 //! 进度：`ffmpeg -progress pipe:1 -nostats`，按 `out_time_us` 相对探测时长换算百分比。
 
-use std::io::BufRead;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use parking_lot::Mutex;
 
-use crate::exec::{decode_text, ChildGuard, Tool, ToolResolver};
+use crate::exec::{decode_text, progress_tail, Monitored, Tool, ToolResolver};
 use crate::model::{MediaMeta, RotAngle};
 use crate::{CoreError, Result};
 
@@ -29,8 +27,47 @@ fn locked_tier() -> Option<TranscodeTier> {
     *LOCKED_TIER.get_or_init(|| Mutex::new(None)).lock()
 }
 
-fn set_locked_tier(tier: TranscodeTier) {
-    *LOCKED_TIER.get_or_init(|| Mutex::new(None)).lock() = Some(tier);
+/// 只在"尚未锁定"时写入并返回 true（判定与写入在同一把锁内完成）。
+///
+/// 旧的 `if locked_tier().is_none() { set_locked_tier(..) }` 是先查后写，
+/// 两个并发任务可以同时看到 None 再先后写入。
+fn lock_tier_if_unset(tier: TranscodeTier) -> bool {
+    let slot = LOCKED_TIER.get_or_init(|| Mutex::new(None));
+    let mut g = slot.lock();
+    if g.is_none() {
+        *g = Some(tier);
+        true
+    } else {
+        false
+    }
+}
+
+/// 这次失败值不值得换一层级重来。
+///
+/// 旧实现对**任何**错误都整片重编码：输入不存在、磁盘满、滤镜语法错、
+/// `-display_rotation` 未知选项、QSV 在 40 分钟 GPU 编码跑到 95% 时驱动崩 ——
+/// 统统被当成"编码器不可用"再烧一遍，日志还写着"自动回落"。
+/// 只有"编码器/输出初始化类错误 + 本次一点进度都没产生"才可能是层级不支持。
+fn tier_fallback_worthwhile(err: &CoreError, produced_progress: bool) -> bool {
+    let CoreError::ProcessFailed { stderr, .. } = err else {
+        return false;
+    };
+    if produced_progress {
+        return false;
+    }
+    let s = stderr.to_ascii_lowercase();
+    [
+        "unknown encoder",
+        "not found",
+        "hwaccel",
+        "qsv",
+        "unsupported codec",
+        "error initializing output",
+        "cannot open codec",
+        "invalid output file specification",
+    ]
+    .iter()
+    .any(|k| s.contains(k))
 }
 
 /// 转码参数（来自 设置-转码/通用/下载 + 条目 rot_angle，TC-05）。
@@ -345,7 +382,10 @@ pub fn build_args_for_tier(
     let need_gain = meta.needs_audio_gain(params.normalize_audio);
     let gain = if need_gain {
         let max_v = meta.audio_volume.max_volume_db.unwrap_or(0.0);
-        Some((-max_v).clamp(0.0, params.max_gain_db))
+        // 增益不足 0.1dB 时视为"不需要处理"：否则 `max_gain_db = 0`（合法设置）
+        // 会让 gain 归 0、不加 -af，却仍然走 `-c:a aac -b:a …` 分支，
+        // 等于对音频做一次毫无收益的有损重编码
+        Some((-max_v).clamp(0.0, params.max_gain_db)).filter(|g| *g > 0.1)
     } else {
         None
     };
@@ -417,9 +457,10 @@ pub fn build_args_for_tier(
     }
     args.push("-i".into());
     args.push(params.input.to_string_lossy().into_owned());
-    // 旋转 + 保留封面（hw 层）：QSV 帧无法进 CPU 滤镜，封面改由第二个软件解码
-    // 输入取出并旋转（与 bat 的 DIN 第二输入同思路）
-    let cover_reencode = rotated && cover_idx.is_some();
+    // 旋转 + 保留封面（**仅 hw 层**）：QSV 帧无法进 CPU 滤镜，封面改由第二个软件
+    // 解码输入取出并旋转（与 bat 的 DIN 第二输入同思路）。软件层引用的是 `0:{ci}`，
+    // 多开这一个输入只会白开一遍几 GB 的源文件。
+    let cover_reencode = hw && rotated && cover_idx.is_some();
     if cover_reencode {
         args.push("-i".into());
         args.push(params.input.to_string_lossy().into_owned());
@@ -624,11 +665,7 @@ pub fn build_args_for_tier(
         args.push("mp4".into());
     }
     args.push("-y".into());
-    args.push("-progress".into());
-    args.push("pipe:1".into());
-    args.push("-nostats".into());
-    args.push("-loglevel".into());
-    args.push("error".into());
+    args.extend(progress_tail().iter().map(|s| s.to_string()));
     Ok(args)
 }
 
@@ -641,16 +678,22 @@ pub fn build_args(
     build_args_for_tier(resolver, params, meta, TranscodeTier::Software)
 }
 
-/// 解析 `-progress` 输出中的 `out_time_us=`（微秒）。
+/// 解析 `-progress` 输出中的进度时间为微秒。
+///
+/// **`out_time_ms` 不是毫秒**：ffmpeg 在同一个进度块里输出 `out_time_us` 与
+/// `out_time_ms` 两个键，填的是同一个微秒值（历史遗留误名，早已成为事实 ABI）。
+/// 旧实现按毫秒 ×1000 换算，于是每一块都会再产生一个放大 1000 倍的进度，
+/// 被 `clamp(0.0, 100.0)` 削成 100% —— 表现为"刚开始就 100%"或在真值与 100%
+/// 之间抖动（合并侧 clamp 到 99% 则一直钉在 99%）。两个键都按微秒处理即可。
 pub(crate) fn parse_out_time_us(line: &str) -> Option<u64> {
     let line = line.trim();
-    if let Some(v) = line.strip_prefix("out_time_us=") {
-        return v.trim().parse().ok();
+    if let Some(v) = line
+        .strip_prefix("out_time_us=")
+        .or_else(|| line.strip_prefix("out_time_ms="))
+    {
+        return v.trim().parse::<u64>().ok();
     }
-    if let Some(v) = line.strip_prefix("out_time_ms=") {
-        return v.trim().parse::<u64>().ok().map(|ms| ms * 1000);
-    }
-    // 新版 ffmpeg 输出 out_time=HH:MM:SS.xx 格式
+    // 无 *_us/*_ms 键时退回人读格式 out_time=HH:MM:SS.xx
     if let Some(v) = line.strip_prefix("out_time=") {
         let v = v.trim();
         let parts: Vec<&str> = v.split(':').collect();
@@ -705,27 +748,38 @@ pub fn run_transcode(
         0
     };
     for (i, tier) in all_tiers[start_idx..].iter().enumerate() {
-        let r = run_transcode_once(
-            resolver,
-            params,
-            meta,
-            cancel,
-            *tier,
-            &mut on_progress,
-            &mut on_log,
-        );
+        // 本次尝试有没有真正推进过进度：用来区分"编码器起不来"与"跑到一半出错"
+        let saw_progress = std::cell::Cell::new(false);
+        let r = {
+            let flag = &saw_progress;
+            let mut prog = |pct: f32| {
+                if pct > 0.0 {
+                    flag.set(true);
+                }
+                on_progress(pct);
+            };
+            run_transcode_once(resolver, params, meta, cancel, *tier, &mut prog, &mut on_log)
+        };
         match r {
             Ok(p) => {
-                if !explicit && auto_qsv && locked_tier().is_none() {
-                    set_locked_tier(*tier);
+                if !explicit && auto_qsv && lock_tier_if_unset(*tier) {
+                    on_log(format!("本机后续任务锁定编码层级：{}", tier.label()));
                 }
                 return Ok(p);
             }
             Err(CoreError::Cancelled) => return Err(CoreError::Cancelled),
             Err(e) => {
-                if i + 1 < all_tiers[start_idx..].len() {
+                let more = i + 1 < all_tiers[start_idx..].len();
+                if more && tier_fallback_worthwhile(&e, saw_progress.get()) {
                     on_log(format!("{} 失败（{e}），自动回落下一层级…", tier.label()));
                 } else {
+                    if more {
+                        // 不再整片重编码：已经跑起来过的失败，换层级也是白烧一遍
+                        on_log(format!(
+                            "{} 失败，错误不像编码器不可用（或已产生进度），不再自动重编码整片：{e}",
+                            tier.label()
+                        ));
+                    }
                     return Err(e);
                 }
             }
@@ -766,33 +820,6 @@ fn run_transcode_once(
     let mut cmd = resolver.command(Tool::Ffmpeg)?;
     cmd.args(&args);
     cmd.arg(&out);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-
-    let mut guard = ChildGuard::spawn(&mut cmd)?;
-    let stdout = guard
-        .stdout()
-        .ok_or_else(|| CoreError::Io(std::io::Error::other("无法读取 ffmpeg 输出")))?;
-    let stderr = guard
-        .stderr()
-        .ok_or_else(|| CoreError::Io(std::io::Error::other("无法读取 ffmpeg 错误输出")))?;
-
-    // stderr 必须持续读取：管道缓冲区只有 64KB，ffmpeg 转码中往 stderr
-    // 输出 warning/info 时若无人读取会写满阻塞，导致 stdout 进度行不再产出。
-    let err_buf = Arc::new(Mutex::new(String::new()));
-    {
-        let err_buf = err_buf.clone();
-        std::thread::spawn(move || {
-            let mut reader = std::io::BufReader::new(stderr);
-            let mut chunk = Vec::new();
-            while reader.read_until(b'\n', &mut chunk).is_ok() {
-                if chunk.is_empty() {
-                    break;
-                }
-                err_buf.lock().push_str(&String::from_utf8_lossy(&chunk));
-                chunk.clear();
-            }
-        });
-    }
 
     let duration = meta.duration_secs.unwrap_or(0.0);
     if duration <= 0.0 {
@@ -800,41 +827,46 @@ fn run_transcode_once(
         // （等待结束时无条件 on_progress(100)）。记录一条日志帮助定位 meta 缺时长
         on_log("源时长未知，无法换算百分比进度".to_string());
     }
-    let reader = std::io::BufReader::new(stdout);
-    let mut debug_lines = 0u8;
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
-        };
-        if debug_lines < 5 && !line.trim().is_empty() {
-            on_log(format!("[progress] {}", line.trim()));
-            debug_lines += 1;
-        }
-        if cancel.load(Ordering::Relaxed) {
-            guard.kill_tree();
-            break;
+
+    // 两条管道都交给 Monitored 的后台线程排空，取代手写的"stderr 读线程 + 从不 join"：
+    // 旧写法失败分支上取到的可能是**半截** stderr（进程已退出但线程还没读完结尾），
+    // 且用 from_utf8_lossy 绕过了本项目的 decode_text（中文 Windows 上 ffmpeg 是
+    // cp936，报错会变成乱码）。stderr 另有 256KB 尾部上限，不会无界增长。
+    let mut monitored = Monitored::spawn(&mut cmd)?;
+    // 显式 reborrow 到可变绑定后再交给闭包；`on_log` 不进闭包（成功/失败分支后面
+    // 还要用），改为收下前 5 条进度样本、pump 结束后统一入日志
+    let mut prog = &mut *on_progress;
+    let mut sample: Vec<String> = Vec::new();
+    let done = monitored.pump(cancel, |line| {
+        if sample.len() < 5 && !line.trim().is_empty() {
+            sample.push(line.trim().to_string());
         }
         if line.trim() == "progress=end" {
-            on_progress(100.0);
-            continue;
+            // ffmpeg 只在正常收尾时发 progress=end，在这里报满才是对的
+            // （旧写法在 wait 之后无条件 on_progress(100)，失败/取消也会先看到 100%）
+            prog(100.0);
+            return;
         }
-        if let Some(us) = parse_out_time_us(&line) {
+        if let Some(us) = parse_out_time_us(line) {
             if duration > 0.0 {
                 let pct = ((us as f64 / 1e6) / duration * 100.0).clamp(0.0, 100.0) as f32;
-                on_progress(pct);
+                prog(pct);
             }
         }
+    })?;
+    drop(prog);
+    for line in &sample {
+        on_log(format!("[progress] {}", line));
     }
 
-    let status = guard.wait()?;
-    on_progress(100.0);
+    // 最后一条进度行之后才按下取消：进程已正常退出也要按取消处理、删掉半成品
     if cancel.load(Ordering::Relaxed) {
         let _ = std::fs::remove_file(&out);
         return Err(CoreError::Cancelled);
     }
-    if !status.success() {
-        let err = err_buf.lock().clone();
+    if !done.status.success() {
+        let code = done.status.code();
+        let err = done.stderr;
         // 多行 stderr 拆成逐条日志：单条塞进一个 entry 时 UI 侧易被截断观感，
         // 逐行落日志才能完整回看 ffmpeg 的报错原因
         let mut lines = err.lines();
@@ -849,7 +881,7 @@ fn run_transcode_once(
         let _ = std::fs::remove_file(&out);
         return Err(CoreError::ProcessFailed {
             program: "ffmpeg".into(),
-            code: status.code(),
+            code,
             stderr: err,
         });
     }
@@ -866,6 +898,9 @@ fn run_transcode_once(
             stderr: "转码结束但输出文件缺失或过小（<1024 字节，已删除半成品保留原文件）".into(),
         });
     }
+    // 走到这里才是真成功：报满进度（progress=end 那一次是提前量，个别构建不发也能兜住）。
+    // 旧写法把 on_progress(100) 放在 wait 之后无条件执行，失败/取消也会先看到"100% + 失败"
+    on_progress(100.0);
     on_log(format!("转码完成：{}", out.display()));
     Ok(out)
 }
@@ -1089,7 +1124,16 @@ mod tests {
     #[test]
     fn parse_us() {
         assert_eq!(parse_out_time_us("out_time_us=1234567"), Some(1234567));
-        assert_eq!(parse_out_time_us("out_time_ms=999"), Some(999000));
+        // out_time_ms 是 ffmpeg 的历史误名，值同样是微秒 —— 绝不能再 ×1000，
+        // 否则每个进度块都会算出一个放大 1000 倍的百分比（被 clamp 成 100%）
+        assert_eq!(parse_out_time_us("out_time_ms=999"), Some(999));
+        // 同一进度块里两个键必须换算出同一个值
+        assert_eq!(
+            parse_out_time_us("out_time_us=42000000"),
+            parse_out_time_us("out_time_ms=42000000")
+        );
+        // 人读格式兜底
+        assert_eq!(parse_out_time_us("out_time=00:01:00.00"), Some(60_000_000));
         assert_eq!(parse_out_time_us("progress=end"), None);
     }
 

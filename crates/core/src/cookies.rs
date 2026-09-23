@@ -3,7 +3,7 @@
 //! - 存储：`config/cookies/<host>.txt`（Netscape 格式，yt-dlp 直接可用）。
 //! - 匹配：精确 HOST → 站点级回退（父域/常见子域）→ X↔twitter 姊妹域名互退。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +31,32 @@ pub struct CookieStore {
 
 /// 导出到 Netscape 格式时的大小上限（防畸形 cookie 撑爆文件）。
 const MAX_COOKIE_VALUE_LEN: usize = 4096;
+/// 单站点 cookie 条数上限（畸形/攻击性输入下的兜底，正常站点远低于此）
+const MAX_COOKIE_ENTRIES: usize = 512;
+
+/// 同目录内唯一临时名 + rename。固定名（`.txt.tmp`）在并发写同一站点时会被
+/// 互相截断（`File::create` 清空对方刚写的内容，rename 再搬走半份文件）。
+fn atomic_write(path: &Path, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "cookies.txt".to_string());
+    let tmp = path.with_file_name(format!(
+        ".{}.{}.{}.tmp",
+        name,
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::write(&tmp, bytes)?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
 
 impl CookieStore {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
@@ -45,9 +71,7 @@ impl CookieStore {
     pub fn save_host(&self, host: &str, cookies: Vec<CookieEntry>) -> Result<()> {
         std::fs::create_dir_all(&self.dir)?;
         let f = self.host_file(host);
-        let tmp = f.with_extension("txt.tmp");
-        std::fs::write(&tmp, netscape_format(&cookies))?;
-        std::fs::rename(&tmp, &f)?;
+        atomic_write(&f, netscape_format(&cookies))?;
         Ok(())
     }
 
@@ -87,9 +111,15 @@ impl CookieStore {
         Ok(())
     }
 
-    /// 获取匹配站点的 cookie 文件路径（供 yt-dlp --cookies）。
+    /// 导出匹配站点的 cookie 到**调用方给定的目录**（供 yt-dlp `--cookies`）。
     /// 合并所有匹配候选的 cookie；无任何 cookie 返回 None。
-    pub fn cookies_file(&self, host: &str) -> Result<Option<PathBuf>> {
+    ///
+    /// `dest_dir` 传任务私有临时目录（`temp/<条目 id>/`），任务结束随之清理。
+    /// 这里绝不回写 `config/cookies/` 里的存储文件：旧实现把"父域 + www 变体"
+    /// 的合并结果 `fs::write` 回第一个站点文件，既非原子（与并发任务、save_host
+    /// 的 rename 互踩），又会把 twitter.com 的 cookie 混进 www.x.com.txt ——
+    /// 用户删掉 twitter.com 之后凭据仍躺在别的文件里被继续发送。
+    pub fn export_merged(&self, host: &str, dest_dir: &Path) -> Result<Option<PathBuf>> {
         let mut entries: Vec<CookieEntry> = Vec::new();
         for h in cookie_candidates(host) {
             if let Ok(list) = self.load_host(&h) {
@@ -106,38 +136,50 @@ impl CookieStore {
         if entries.is_empty() {
             return Ok(None);
         }
-        // 用实际有 cookie 的 host 作为文件名
-        let actual_host = cookie_candidates(host)
-            .into_iter()
-            .find(|h| self.host_file(h).exists())
-            .unwrap_or_else(|| host.to_string());
-        let f = self.host_file(&actual_host);
-        std::fs::write(&f, netscape_format(&entries))?;
+        std::fs::create_dir_all(dest_dir)?;
+        let f = dest_dir.join(format!("cookies-{}.txt", sanitize_host(host)));
+        atomic_write(&f, netscape_format(&entries))?;
         Ok(Some(f))
     }
 }
 
-/// 把 cookie 列表格式化成 Netscape 文本。
+/// Netscape 格式以 `\t` 分隔字段、`\n` 分隔记录：**任何**字段里的这两个字符都会
+/// 改写文件结构。cookie 的 name/path/domain 来自站点任意种下的值（或手工导入），
+/// 一个名叫 `x\tFALSE\t/\tFALSE\t\tSID\tSTOLEN` 的 cookie 就能在本域的文件里
+/// 多出一行伪造的会话 cookie，或用一个 `\n` 让 yt-dlp 解析整个文件失败。
+fn field(s: &str) -> String {
+    s.chars()
+        .map(|c| if matches!(c, '\t' | '\n' | '\r') { ' ' } else { c })
+        .collect()
+}
+
+/// 把 cookie 列表格式化成 Netscape 文本（所有字段一律转义）。
 fn netscape_format(cookies: &[CookieEntry]) -> String {
     let mut out = String::from("# Netscape HTTP Cookie File\n");
-    for c in cookies {
-        if c.value.len() > MAX_COOKIE_VALUE_LEN {
+    for c in cookies.iter().take(MAX_COOKIE_ENTRIES) {
+        if c.value.len() > MAX_COOKIE_VALUE_LEN || c.name.is_empty() {
             continue;
         }
-        let (domain, include_sub) = if c.domain.starts_with('.') {
-            (c.domain.as_str(), "TRUE")
+        let domain = field(&c.domain);
+        let include_sub = if domain.starts_with('.') {
+            "TRUE"
         } else {
-            (c.domain.as_str(), "FALSE")
+            "FALSE"
         };
         let secure = if c.secure { "TRUE" } else { "FALSE" };
         let expires = match c.expires {
-            Some(e) => format!("{}", e as i64),
-            None => String::new(),
+            Some(e) if e > 0.0 => format!("{}", e as i64),
+            _ => String::new(),
         };
-        let value = c.value.replace(['\t', '\n'], " ");
         out.push_str(&format!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-            domain, include_sub, c.path, secure, expires, c.name, value
+            domain,
+            include_sub,
+            field(&c.path),
+            secure,
+            expires,
+            field(&c.name),
+            field(&c.value)
         ));
     }
     out
@@ -331,13 +373,68 @@ mod tests {
         store
             .save_host("www.youtube.com", vec![ck("VISITOR", "v2", "youtube.com")])
             .unwrap();
-        let out = store.cookies_file("www.youtube.com").unwrap();
+        let out = store
+            .export_merged("www.youtube.com", root.path())
+            .unwrap();
         assert!(out.is_some());
         let text = std::fs::read_to_string(out.unwrap()).unwrap();
         // 带点 domain 保留前导点 + TRUE（跨子域）
         assert!(text.contains(".youtube.com\tTRUE\t/\tTRUE\t\tSID\tv1"));
         // 无点 domain + FALSE（host-only）
         assert!(text.contains("youtube.com\tFALSE\t/\tTRUE\t\tVISITOR\tv2"));
+    }
+
+    #[test]
+    fn export_does_not_rewrite_the_store() {
+        // 旧实现把合并结果回写进第一个站点文件，导致 twitter.com 的 cookie
+        // 混进 www.x.com.txt：用户删掉 twitter.com 之后凭据仍被继续发送
+        let root = tempdir().unwrap();
+        let store = CookieStore::new(root.path().join("cookies"));
+        store
+            .save_host("x.com", vec![ck("SID", "vx", ".x.com")])
+            .unwrap();
+        store
+            .save_host("twitter.com", vec![ck("tw", "vt", ".twitter.com")])
+            .unwrap();
+        let out = store
+            .export_merged("x.com", &root.path().join("task"))
+            .unwrap()
+            .unwrap();
+        // 导出副本是合并的
+        let merged = std::fs::read_to_string(&out).unwrap();
+        assert!(merged.contains(".twitter.com"));
+        // 存储文件一个字没动
+        let stored = std::fs::read_to_string(store.host_file("x.com")).unwrap();
+        assert!(!stored.contains(".twitter.com"), "{stored}");
+        assert!(stored.contains(".x.com"));
+    }
+
+    #[test]
+    fn netscape_export_escapes_every_field() {
+        let root = tempdir().unwrap();
+        let store = CookieStore::new(root.path().join("cookies"));
+        // 站点种一个"名字里带制表符"的 cookie：不得因此多出一行伪造会话
+        let evil = CookieEntry {
+            name: "x\tFALSE\t/\tFALSE\t\tSID\tSTOLEN".into(),
+            value: "v".into(),
+            domain: ".youtube.com".into(),
+            path: "/".into(),
+            expires: None,
+            http_only: false,
+            secure: false,
+            same_site: String::new(),
+        };
+        store.save_host("youtube.com", vec![evil]).unwrap();
+        let f = store
+            .export_merged("youtube.com", &root.path().join("task"))
+            .unwrap()
+            .unwrap();
+        let text = std::fs::read_to_string(&f).unwrap();
+        let lines: Vec<&str> = text.lines().filter(|l| !l.starts_with('#')).collect();
+        assert_eq!(lines.len(), 1, "注入出了额外记录：{text}");
+        let fields: Vec<&str> = lines[0].split('\t').collect();
+        assert_eq!(fields.len(), 7, "列结构被注入改变：{:?}", fields);
+        assert_eq!(fields[5], "x FALSE / FALSE  SID STOLEN");
     }
 
     #[test]
@@ -348,7 +445,7 @@ mod tests {
         store
             .save_host("example.com", vec![ck("SESS", "v", ".example.com")])
             .unwrap();
-        let out = store.cookies_file("example.com").unwrap();
+        let out = store.export_merged("example.com", root.path()).unwrap();
         let text = std::fs::read_to_string(out.unwrap()).unwrap();
         assert!(text.contains("\tTRUE\t/\tTRUE\t\tSESS\tv"), "got: {text}");
         assert!(!text.contains("TRUE\t0\tSESS"));
@@ -358,6 +455,9 @@ mod tests {
     fn export_netscape_none_when_empty() {
         let root = tempdir().unwrap();
         let store = CookieStore::new(root.path().join("cookies"));
-        assert!(store.cookies_file("nope.com").unwrap().is_none());
+        assert!(store
+            .export_merged("nope.com", root.path())
+            .unwrap()
+            .is_none());
     }
 }

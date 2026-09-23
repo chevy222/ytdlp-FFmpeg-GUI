@@ -12,7 +12,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde_json::Value;
 
 use crate::config::NetworkConfig;
-use crate::exec::{decode_text, ChildGuard, Tool, ToolResolver};
+use crate::exec::{
+    decode_text, is_http_url, push_url_arg, ChildGuard, Tool, ToolResolver,
+};
 use crate::model::{AudioVolume, DownloadFormat, MediaMeta};
 
 /// 解析临时文件 slot 计数器（参考 convert_h265.bat / download_video.bat 的
@@ -88,7 +90,9 @@ fn ytdlp_args(
         args.push("--proxy".into());
         args.push(p);
     }
-    args.push(url.to_string());
+    // URL 用 `--` 终结选项解析：地址以 `-` 开头时（播放列表 JSON 里的恶意条目）
+    // 只能是一条下不动的链接，不能变成 `--exec` 这样的选项
+    push_url_arg(&mut args, url);
     args
 }
 
@@ -101,6 +105,14 @@ pub fn list_playlist_entries(
     network: &NetworkConfig,
     mut on_log: impl FnMut(String),
 ) -> std::result::Result<Vec<PlaylistEntry>, ProbeFailure> {
+    // 只接受 http(s)：这一层的输入是用户粘贴的链接，产物又会被平铺成条目
+    // 再送进 probe_url / run_download（见那里同样的闸口）
+    if !is_http_url(url) {
+        return Err(ProbeFailure {
+            kind: ProbeErrorKind::InvalidLink,
+            message: format!("只支持 http(s) 链接：{url}"),
+        });
+    }
     let args = ytdlp_args(
         resolver,
         url,
@@ -140,6 +152,7 @@ pub fn list_playlist_entries(
         }
     };
     let mut out = Vec::new();
+    let mut rejected = 0usize;
     if let Some(entries) = v["entries"].as_array() {
         for e in entries {
             let u = e["url"]
@@ -147,12 +160,21 @@ pub fn list_playlist_entries(
                 .or_else(|| e["webpage_url"].as_str())
                 .unwrap_or_default()
                 .to_string();
-            if u.is_empty() {
+            // 条目地址由站点 JSON 决定，属于不可信输入：非 http(s) 一律丢弃。
+            // 它会被平铺成条目、再作为下一条 URL 参数送给 yt-dlp，`--exec=…`
+            // 这类字符串在这里被挡下就再也进不去。
+            if !is_http_url(&u) {
+                if !u.is_empty() {
+                    rejected += 1;
+                }
                 continue;
             }
             let title = e["title"].as_str().unwrap_or("").to_string();
             out.push(PlaylistEntry { url: u, title });
         }
+    }
+    if rejected > 0 {
+        on_log(format!("已忽略 {rejected} 条非 http(s) 播放列表条目"));
     }
     Ok(out)
 }
@@ -182,6 +204,14 @@ pub fn probe_url(
     temp_dir: &Path,
     mut on_log: impl FnMut(String),
 ) -> std::result::Result<UrlProbe, ProbeFailure> {
+    // 只接受 http(s)。调用方有两处：UI 添加（已校验）与播放列表平铺
+    // （URL 来自站点 JSON）—— 校验必须落在这里，离 yt-dlp 最近的一层
+    if !is_http_url(url) {
+        return Err(ProbeFailure {
+            kind: ProbeErrorKind::InvalidLink,
+            message: format!("只支持 http(s) 链接：{url}"),
+        });
+    }
     let extra: &[&str] = if playlist {
         &["-J", "--no-warnings", "--yes-playlist", "--socket-timeout", "60"]
     } else {
@@ -231,10 +261,18 @@ pub fn probe_url(
         kind: ProbeErrorKind::Failed,
         message: format!("yt-dlp 退出异常：{e}"),
     })?;
-    let stdout_bytes = std::fs::read(&stdout_file).unwrap_or_default();
-    let stderr_bytes = std::fs::read(&stderr_file).unwrap_or_default();
+    // 读不回内容 ≠ yt-dlp 没输出：杀软占用/共享违规同样会让 read 失败。
+    // 旧写法 unwrap_or_default 把这种情况变成"yt-dlp 返回无法解析的数据"，
+    // 用户和排查者都会被引向完全错误的方向。
+    let stdout_res = std::fs::read(&stdout_file);
+    let stderr_res = std::fs::read(&stderr_file);
     let _ = std::fs::remove_file(&stdout_file);
     let _ = std::fs::remove_file(&stderr_file);
+    let stdout_bytes = stdout_res.map_err(|e| ProbeFailure {
+        kind: ProbeErrorKind::Failed,
+        message: format!("读取 yt-dlp 探测输出失败（文件被占用？）：{e}"),
+    })?;
+    let stderr_bytes = stderr_res.unwrap_or_default();
     if !status.success() {
         let stderr = decode_text(&stderr_bytes);
         return Err(classify_ytdlp_error(stderr.trim()));
@@ -269,6 +307,10 @@ pub fn probe_local(
         // -show_data 才会输出流级 `extradata`（否则只有 extradata_size）：
         // 合并直拼判据 MG-02 需要真实 SPS/PPS 十六进制对比
         "-show_data",
+        // 输入必须挂在 `-i` 的值位上：裸位置参数遇到以 `-` 开头的文件名
+        // （拖入 `-foo.mp4`）会被 ffprobe 当选项解析，症状是"探测失败"或
+        // 拿到一份完全错误的元数据
+        "-i",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -302,8 +344,10 @@ pub fn probe_local(
 
     // 2) volumedetect（有音频流时）
     if meta.acodec.is_some() {
-        if let Ok(vol) = probe_volume(resolver, path, &mut on_log) {
-            meta.audio_volume = vol;
+        match probe_volume(resolver, path, &mut on_log) {
+            Ok(vol) => meta.audio_volume = vol,
+            // 失败要说出来：静默吞掉等于告诉用户"这个文件不需要归一化"
+            Err(e) => on_log(format!("音量探测失败，本次跳过归一化：{e}")),
         }
     }
     Ok(LocalProbe { meta })
@@ -331,8 +375,17 @@ pub fn probe_volume(
     cmd.stdout(Stdio::null()).stderr(Stdio::piped());
     let guard = ChildGuard::spawn(&mut cmd)?;
     let out = guard.wait_with_output()?;
-    let stderr = decode_text(&out.stderr);
-    Ok(parse_volumedetect(&stderr))
+    // 不检查退出码：ffmpeg 报 "Unknown encoder"/"Invalid data" 时 stderr 里
+    // 根本没有 volumedetect 统计，parse_volumedetect 会返回全 None，
+    // 于是"探测失败"被静默解释成"这文件没声音/已经很响"，归一化悄悄跳过
+    if !out.status.success() {
+        return Err(CoreError::ProcessFailed {
+            program: "ffmpeg".into(),
+            code: out.status.code(),
+            stderr: decode_text(&out.stderr).trim().to_string(),
+        });
+    }
+    Ok(parse_volumedetect(&decode_text(&out.stderr)))
 }
 
 /// 解析 yt-dlp `-J` JSON → UrlProbe（纯函数）。
@@ -477,6 +530,8 @@ pub fn parse_ffprobe_json(text: &str) -> MediaMeta {
                     meta.height = s["height"].as_u64().map(|h| h as u32);
                     // 宽度采集（MD-02）：竖屏源 short_edge()/画质列/后处理短边判据都依赖它
                     meta.width = s["width"].as_u64().map(|w| w as u32);
+                    // 像素格式：合并直拼判据（MG-02）要拿它比 8bit/10bit 源
+                    meta.pix_fmt = s["pix_fmt"].as_str().map(str::to_string);
                     meta.vcodec = s["codec_name"].as_str().map(str::to_string);
                     meta.fps = s["avg_frame_rate"].as_str().and_then(|r| {
                         let mut it = r.split('/');
@@ -596,15 +651,33 @@ fn classify_ytdlp_error(stderr: &str) -> ProbeFailure {
         || lower.contains("invalid url")
     {
         ProbeErrorKind::InvalidLink
-    } else if lower.contains("video unavailable") || lower.contains("unavailable") {
+    } else if lower.contains("private")
+        || lower.contains("members only")
+        || lower.contains("sign in")
+        || lower.contains("log in")
+        || lower.contains("cookies are required")
+        || (lower.contains("account") && lower.contains("unavailable"))
+    {
+        // 只有真正带"要看登录态"信号的才判 NeedLogin。
+        // 裸 "unavailable" 绝大多数是**视频被删/地区限制**——判成 NeedLogin 会给
+        // 用户一个"去登录"按钮，他登录完再试还是失败，白白绕一圈。
         ProbeErrorKind::NeedLogin
+    } else if lower.contains("video unavailable") || lower.contains("unavailable") {
+        ProbeErrorKind::InvalidLink
     } else {
         ProbeErrorKind::Failed
     };
-    ProbeFailure {
-        kind,
-        message: stderr.lines().last().unwrap_or("未知错误").to_string(),
-    }
+    // 取最后一条含 ERROR 的行：yt-dlp 的结尾行常是 traceback 尾巴或空行，
+    // 直接 lines().last() 会把"未知错误"送给用户
+    let message = stderr
+        .lines()
+        .rev()
+        .find(|l| l.contains("ERROR"))
+        .or_else(|| stderr.lines().rev().find(|l| !l.trim().is_empty()))
+        .unwrap_or("未知错误")
+        .trim()
+        .to_string();
+    ProbeFailure { kind, message }
 }
 
 #[cfg(test)]
@@ -777,6 +850,20 @@ mod tests {
             "ERROR: [Douyin] 7686436507753794843: Fresh cookies (not necessarily logged in) are needed",
         );
         assert_eq!(e.kind, ProbeErrorKind::NeedLogin);
+    }
+
+    #[test]
+    fn bare_unavailable_is_not_need_login() {
+        // 被删/地区限制的视频不能给"去登录"按钮 —— 登录完再试还是失败
+        let e = classify_ytdlp_error("ERROR: [youtube] abc: Video unavailable");
+        assert_eq!(e.kind, ProbeErrorKind::InvalidLink, "{:?}", e);
+        let e = classify_ytdlp_error("ERROR: This video is no longer available");
+        assert_eq!(e.kind, ProbeErrorKind::InvalidLink);
+        // 消息取"最后一条含 ERROR 的行"，不是可能被 traceback 占据的末行
+        let e = classify_ytdlp_error(
+            "ERROR: [youtube] abc: Video unavailable\nTraceback (inner most last):\n  File x",
+        );
+        assert!(e.message.starts_with("ERROR:"), "意外消息：{}", e.message);
     }
 
     #[test]

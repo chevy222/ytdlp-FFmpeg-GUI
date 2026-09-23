@@ -185,7 +185,20 @@ fn site_matches(site: &str, host: &str) -> bool {
 
 /// 读取并剥掉 UTF-8 BOM（Windows 记事本编辑过的配置带 BOM，
 /// serde_json 对 BOM 报"expected value"会被误判为损坏）。
+///
+/// 尺寸闸门：配置文件本该是几十 KB 量级。读一个 200MB 的"config.json"再整份
+/// 解析，既可能是磁盘坏档也可能是被人塞了垃圾 —— 两种情况都不该继续往下走。
 fn read_text_stripping_bom(path: &Path) -> Result<String> {
+    const MAX_CONFIG_BYTES: u64 = 8 * 1024 * 1024;
+    if let Ok(md) = std::fs::metadata(path) {
+        if md.len() > MAX_CONFIG_BYTES {
+            return Err(CoreError::ConfigCorrupt(format!(
+                "配置文件异常过大（{} 字节），拒绝读取：{}",
+                md.len(),
+                path.display()
+            )));
+        }
+    }
     let text = std::fs::read_to_string(path)?;
     Ok(text
         .strip_prefix('\u{feff}')
@@ -205,8 +218,88 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
+    /// 把越界/拼错的值归一到可执行范围。
+    ///
+    /// 这些值最终都会拼进外部工具的命令行，越界值的报错用户完全读不懂：
+    /// `fragments: 0` → `yt-dlp -N 0`；`max_h: 0` → `bv*[height<=0]` → "no formats"；
+    /// `collision_policy` 拼错会被 `paths.rs` 的 `_` 分支静默当 auto_inc。
+    /// **加载与保存两条路都要过**，否则设置页可以直接写入任意值。
+    pub fn normalize(&mut self) {
+        let g = &mut self.general;
+        g.max_gain_db = if g.max_gain_db.is_finite() {
+            g.max_gain_db.clamp(0.0, 24.0)
+        } else {
+            24.0
+        };
+        g.concurrency = g.concurrency.clamp(1, 16);
+        g.history_limit = g.history_limit.clamp(1, GeneralConfig::HISTORY_LIMIT_MAX);
+        if !matches!(g.collision_policy.as_str(), "auto_inc" | "skip") {
+            g.collision_policy = "auto_inc".into();
+        }
+        if let Some(dir) = &g.default_output_dir {
+            if dir.trim().is_empty() {
+                g.default_output_dir = None;
+            }
+        }
+
+        let d = &mut self.download;
+        d.fragments = d.fragments.clamp(1, 32);
+        d.retries = d.retries.clamp(0, 100);
+        if d.max_h == 0 {
+            d.max_h = 1080;
+        }
+        if d.max_dl_h == 0 {
+            d.max_dl_h = 2160;
+        }
+        if !matches!(
+            d.filename_template.as_str(),
+            "纯标题" | "标题+ID" | "UP主-标题" | "日期-标题"
+        ) {
+            d.filename_template = "纯标题".into();
+        }
+
+        let t = &mut self.transcode;
+        if t.max_w == 0 {
+            t.max_w = 1920;
+        }
+        if t.max_h == 0 {
+            t.max_h = 1080;
+        }
+        if !matches!(
+            t.force_encoder_mode.as_str(),
+            "auto" | "libx265" | "nvenc" | "amf"
+        ) {
+            t.force_encoder_mode = "auto".into();
+        }
+        if let Some(cap) = t.brcap_kbps {
+            if cap == 0 {
+                t.brcap_kbps = None;
+            }
+        }
+
+        // 依赖路径：空串一律视作"未配置"（走 PATH），否则三级回退会被空路径遮住
+        let dep = &mut self.dependencies;
+        for slot in [
+            &mut dep.yt_dlp_path,
+            &mut dep.ffmpeg_path,
+            &mut dep.ffprobe_path,
+            &mut dep.deno_path,
+        ] {
+            if let Some(p) = slot {
+                if p.trim().is_empty() {
+                    *slot = None;
+                }
+            }
+        }
+    }
+
+    /// 归一化后的副本（保存前用，保证落盘的值一定可用）。
+    pub fn sanitized(mut self) -> Self {
+        self.normalize();
+        self
+    }
+
     /// 加载；文件缺失返回默认；损坏则备份（`<原名>.corrupt-<ts>.json`）后回退默认（§3.7 规则）。
-    /// `max_gain_db < 0` 会触发 `f32::clamp` panic，加载时归一为 0。
     pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
@@ -225,14 +318,12 @@ impl AppConfig {
                 return Err(CoreError::ConfigCorrupt(format!("{}{}", e, detail)));
             }
         };
-        if cfg.general.max_gain_db < 0.0 {
-            cfg.general.max_gain_db = 0.0;
-        }
+        cfg.normalize();
         Ok(cfg)
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        atomic_write_json(path, self)
+        atomic_write_json(path, &self.clone().sanitized())
     }
 }
 
@@ -262,6 +353,59 @@ mod tests {
     #[test]
     fn history_limit_bounded() {
         assert!(GeneralConfig::HISTORY_LIMIT_MAX >= GeneralConfig::default().history_limit);
+    }
+
+    #[test]
+    fn normalize_rescues_out_of_range_values() {
+        let root = tempdir().unwrap();
+        let p = root.path().join("config.json");
+        // 手工写一份"每个字段都越界"的配置（设置页可以直接写任意值）
+        std::fs::write(
+            &p,
+            r#"{
+              "download": {"max_h": 0, "max_dl_h": 0, "fragments": 0, "retries": 99999,
+                            "filename_template": "拼错了"},
+              "transcode": {"force_encoder_mode": "qsv??", "max_w": 0, "max_h": 0, "brcap_kbps": 0},
+              "general": {"concurrency": 0, "history_limit": 4294967295, "max_gain_db": -50,
+                           "collision_policy": "overwrite"},
+              "dependencies": {"yt_dlp_path": "   "}
+            }"#,
+        )
+        .unwrap();
+        let c = AppConfig::load(&p).unwrap();
+        assert_eq!(c.download.max_h, 1080);
+        assert_eq!(c.download.max_dl_h, 2160);
+        assert_eq!(c.download.fragments, 1, "-N 0 会让 yt-dlp 直接报错");
+        assert_eq!(c.download.retries, 100);
+        assert_eq!(c.download.filename_template, "纯标题");
+        assert_eq!(c.transcode.force_encoder_mode, "auto");
+        assert_eq!(c.transcode.max_w, 1920);
+        assert_eq!(c.transcode.brcap_kbps, None);
+        assert_eq!(c.general.concurrency, 1);
+        assert_eq!(c.general.history_limit, GeneralConfig::HISTORY_LIMIT_MAX);
+        assert_eq!(c.general.max_gain_db, 0.0, "负增益上限会触发 clamp panic");
+        assert_eq!(c.general.collision_policy, "auto_inc");
+        assert!(c.dependencies.yt_dlp_path.is_none(), "空白路径必须视作未配置");
+    }
+
+    #[test]
+    fn save_sanitizes_before_writing() {
+        let root = tempdir().unwrap();
+        let p = root.path().join("config.json");
+        let mut c = AppConfig::default();
+        c.general.concurrency = 9999;
+        c.save(&p).unwrap();
+        let raw = std::fs::read_to_string(&p).unwrap();
+        assert!(raw.contains("\"concurrency\":16"), "落盘的值未归一：{raw}");
+    }
+
+    #[test]
+    fn load_rejects_absurdly_large_file() {
+        let root = tempdir().unwrap();
+        let p = root.path().join("config.json");
+        std::fs::write(&p, vec![b' '; 9 * 1024 * 1024]).unwrap();
+        let e = AppConfig::load(&p).unwrap_err();
+        assert!(e.to_string().contains("异常过大"), "意外错误：{e}");
     }
 
     #[test]

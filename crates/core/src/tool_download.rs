@@ -15,8 +15,9 @@
 //!   （303 跳转到当版 `packages/ffmpeg-<ver>-essentials_build.zip`；两工具同包各取所需）
 //! - deno.exe：https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip
 //!
-//! SHA-256：yt-dlp / deno 有 `.sha256` 旁路文件；gyan.dev 没有 → ffmpeg/ffprobe
-//! 跳过产物校验，版本一致性由上面的版本 feed 比对保证。
+//! SHA-256：yt-dlp / deno / gyan 的 zip 都有 `.sha256` 旁路文件（gyan 的是
+//! 303 别名，实测存在），取不到校验值时**拒绝安装**——本程序是把可执行文件
+//! 放到用户机器上去跑用户文件的，不接受未验证产物。
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -27,6 +28,10 @@ use crate::exec::Tool;
 
 /// ffmpeg/ffprobe 的下载包（gyan.dev release 别名，恒指向最新 release）。
 pub const FFMPEG_ZIP_URL: &str = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
+/// 上面那个 zip 的 SHA-256 旁路文件（同为 release 别名，303 跳转到当版
+/// `packages/ffmpeg-<ver>-essentials_build.zip.sha256`，响应体就是裸 64 位十六进制）。
+pub const FFMPEG_SHA256_URL: &str =
+    "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip.sha256";
 /// ffmpeg/ffprobe 的版本 feed：响应体即当前 release 版本号（如 `9.0.1`）。
 pub const FFMPEG_VERSION_FEED: &str = "https://www.gyan.dev/ffmpeg/builds/release-version";
 /// 人工查看/手动下载的构建页（依赖页"链接"按钮展示）。
@@ -98,15 +103,15 @@ impl ToolKind {
         }
     }
 
-    /// SHA-256 校验文件 URL（可能不存在，404 时跳过校验）。
-    /// gyan.dev 不提供 `.sha256` 旁路文件 → ffmpeg/ffprobe 下载后不做产物校验，
-    /// "有没有新版本"改由 `release-version` 文本比对保证（见 [`Self::version_feed`]）。
+    /// SHA-256 校验文件 URL。四个托管工具都有；取不到即视为异常并**拒绝安装**，
+    /// 不再"静默跳过校验"（那等于把 fail-open 当成默认路径）。
+    /// "有没有新版本"另由 [`Self::version_feed`] 判断。
     pub fn sha_url(&self) -> Option<&'static str> {
         match self {
             Self::YtDlp => Some(
                 "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe.sha256",
             ),
-            Self::Ffmpeg | Self::Ffprobe => None,
+            Self::Ffmpeg | Self::Ffprobe => Some(FFMPEG_SHA256_URL),
             Self::Deno => Some(
                 "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip.sha256",
             ),
@@ -150,11 +155,15 @@ impl ToolKind {
     }
 }
 
-/// 一次安装的结果：落地路径 + 远端产物指纹（拿不到远端 `.sha256` 时为 None）。
+/// 一次安装的结果：落地路径 + 远端产物指纹（拿不到远端校验值时为 None）。
 #[derive(Debug, Clone)]
 pub struct DownloadedTool {
     pub path: PathBuf,
     pub remote_sha256: Option<String>,
+    /// 产物是否与官方校验值比对过。取不到校验值时下载直接中止，
+    /// 所以正常情况下恒为 true；为 false 只可能是该工具没有配置 sidecar，
+    /// 此时必须把"未经校验"如实告诉用户，而不是当成已校验。
+    pub verified: bool,
 }
 
 /// 单个工具的安装指纹：上一次由本程序安装到的位置 + 当时远端产物的 SHA-256。
@@ -362,8 +371,10 @@ impl ToolDownloader {
             .unwrap_or("")
             .trim()
             .to_string();
-        if hex.len() == 64 {
-            Some(hex)
+        // 只按长度放行不够：非 ASCII 内容混进来后，报错信息里的 `&want[..16]`
+        // 会切在非字符边界上 panic（发生在 spawn_blocking，前端只见"下载任务异常"）
+        if hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            Some(hex.to_ascii_lowercase())
         } else {
             None
         }
@@ -383,15 +394,29 @@ impl ToolDownloader {
         }
         std::fs::create_dir_all(&self.temp_dir).map_err(|e| format!("创建临时目录失败：{e}"))?;
 
+        // 校验值必须在下载**之前**取：先下完再取，等于默认接受"下载的几分钟里
+        // 官方换了当版产物"这种错配；反过来只是一次请求往返。
+        // 取不到就中止（fail-closed）：旧写法 `unwrap_or_default()` 把"网络抖一下"
+        // 变成"跳过校验"，静默放行未验证的可执行文件。
+        on_progress("取校验值".into(), 0.0);
+        let want = match kind.sha_url() {
+            Some(_) => self.remote_sha(kind).ok_or_else(|| {
+                format!(
+                    "未取得 {} 的官方 SHA-256 校验值，已拒绝安装未验证的可执行文件；请稍后重试",
+                    kind.tool().name()
+                )
+            })?,
+            None => String::new(),
+        };
+
         let (raw, verify_zip) = self.download_artifact(kind, on_progress)?;
 
         on_progress("校验".into(), 0.0);
         let digest = sha256_hex(&raw).map_err(|e| format!("计算 SHA-256 失败：{e}"))?;
-        let want = self.remote_sha(kind).unwrap_or_default();
         if !want.is_empty() && !digest.eq_ignore_ascii_case(&want) {
             let _ = std::fs::remove_file(&raw);
             return Err(format!(
-                "SHA-256 校验失败：期望 {} 实际 {}",
+                "SHA-256 校验失败：期望 {} 实际 {}（若官方恰在下载间隙发布新版本，重试一次即可）",
                 &want[..16.min(want.len())],
                 &digest[..16]
             ));
@@ -414,9 +439,11 @@ impl ToolDownloader {
             let _ = std::fs::remove_file(&raw);
         }
         on_progress("完成".into(), 1.0);
+        let verified = !want.is_empty();
         Ok(DownloadedTool {
             path: dest.to_path_buf(),
-            remote_sha256: if want.is_empty() { None } else { Some(want) },
+            remote_sha256: verified.then(|| want),
+            verified,
         })
     }
 
@@ -624,8 +651,14 @@ mod tests {
         // ffmpeg/ffprobe 走 gyan.dev 的 release 别名包，两工具同 URL 各取所需
         assert_eq!(ToolKind::Ffmpeg.url(), FFMPEG_ZIP_URL);
         assert_eq!(ToolKind::Ffprobe.url(), FFMPEG_ZIP_URL);
-        // gyan.dev 没有 .sha256 旁路文件 → 产物校验跳过，版本靠 release-version 比对
-        assert_eq!(ToolKind::Ffmpeg.sha_url(), None);
+        // gyan.dev **有** release 别名的 .sha256 旁路文件（303 → 当版 zip.sha256，
+        // 实测响应体是裸 64 位十六进制）：旧断言"没有 sidecar 所以跳过校验"是错的，
+        // 它让 ffmpeg/ffprobe 这两个直接执行用户文件的二进制从来没被校验过。
+        assert_eq!(ToolKind::Ffmpeg.sha_url(), Some(FFMPEG_SHA256_URL));
+        assert_eq!(ToolKind::Ffprobe.sha_url(), Some(FFMPEG_SHA256_URL));
+        // 四个工具都配了校验源 → 取不到校验值即中止安装，不存在"跳过校验"分支
+        assert!(ToolKind::YtDlp.sha_url().is_some());
+        assert!(ToolKind::Deno.sha_url().is_some());
         assert_eq!(
             ToolKind::Ffmpeg.version_feed(),
             Some(VersionFeed::Text(FFMPEG_VERSION_FEED))
