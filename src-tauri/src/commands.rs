@@ -281,6 +281,8 @@ fn err_string(e: impl std::fmt::Display) -> String {
 }
 
 /// 更新条目并返回克隆（变更即原子写仅对状态迁移生效由调用方决定）。
+/// 仅用于低频的状态迁移/元数据更新；高频进度与日志走 update_progress / log_item
+/// 的轻量事件，避免每秒数十次全量 clone + 序列化整个 MediaItem（含 300 行日志）。
 fn update_item(app: &AppHandle, id: &str, f: impl FnOnce(&mut MediaItem)) -> Option<MediaItem> {
     let state = app.state::<AppState>();
     let mut hist = state.history.lock();
@@ -291,6 +293,40 @@ fn update_item(app: &AppHandle, id: &str, f: impl FnOnce(&mut MediaItem)) -> Opt
     drop(hist);
     let _ = app.emit("item:update", &item);
     Some(item)
+}
+
+/// 高频进度事件 payload：只带变化的字段（Option::None 表示本次不更新该字段），
+/// 不携带日志/元数据，IPC 体积从整条目（可达数十 KB）降到几十字节。
+#[derive(serde::Serialize, Clone)]
+struct ProgressPayload {
+    id: String,
+    percent: Option<f32>,
+    speed: Option<String>,
+    eta: Option<String>,
+    file: Option<String>,
+}
+
+/// 高频进度更新：锁内原地改数值（不 clone 整条目、不 upsert），出锁发轻量事件。
+fn update_progress(app: &AppHandle, p: ProgressPayload) {
+    {
+        let state = app.state::<AppState>();
+        let mut hist = state.history.lock();
+        if let Some(it) = hist.get_mut(&p.id) {
+            if let Some(pct) = p.percent {
+                it.percent = pct;
+            }
+            if p.speed.is_some() {
+                it.speed = p.speed.clone();
+            }
+            if p.eta.is_some() {
+                it.eta = p.eta.clone();
+            }
+            if p.file.is_some() {
+                it.file = p.file.clone();
+            }
+        }
+    }
+    let _ = app.emit("item:progress", &p);
 }
 
 /// 状态迁移收口（P1-1）：update_item 闭包内一律走 transition_in——
@@ -316,11 +352,18 @@ fn log_error_lines(app: &AppHandle, id: &str, prefix: &str, e: &CoreError) {
     }
 }
 
-/// 记录日志行并 emit。
+/// 记录日志行：锁内原地 push（不 clone 整条目），发轻量 `item:log` 事件
+/// （只含 id + 单行文本），前端增量 append；不再触发全量 item:update。
 fn log_item(app: &AppHandle, id: &str, line: impl Into<String>) {
-    update_item(app, id, |it| {
-        it.push_log(line);
-    });
+    let line = line.into();
+    {
+        let state = app.state::<AppState>();
+        let mut hist = state.history.lock();
+        if let Some(it) = hist.get_mut(id) {
+            it.push_log(line.clone());
+        }
+    }
+    let _ = app.emit("item:log", serde_json::json!({ "id": id, "line": line }));
 }
 
 /// 持久化（状态迁移后调用）。
@@ -687,23 +730,27 @@ fn run_download_task(app: AppHandle, id: String, format_id: Option<String>, audi
         &state.paths.temp_dir(),
         &cancel,
         move |p| {
-            update_item(&app2, &id2, |it| {
-                // Destination 行（切换到下一条流，percent 恒为 0）只更新目标文件名，
-                // 不把进度打回 0：DASH 双流下载视频 100% → 音频 Destination 会把
-                // percent 重置，快速下载看起来就像"一直 0%"
-                if p.file.is_some() {
-                    it.file = p.file.clone();
+            // Destination 行（切换到下一条流，percent 恒为 0）只更新目标文件名，
+            // 不把进度打回 0：DASH 双流下载视频 100% → 音频 Destination 会把
+            // percent 重置，快速下载看起来就像"一直 0%"
+            let progress = if p.file.is_some() {
+                ProgressPayload {
+                    id: id2.clone(),
+                    percent: None,
+                    speed: None,
+                    eta: None,
+                    file: p.file.clone(),
                 }
-                if p.file.is_none() || p.percent > 0.0 {
-                    it.percent = p.percent;
-                    if let Some(s) = p.speed {
-                        it.speed = Some(s);
-                    }
-                    if let Some(e) = p.eta {
-                        it.eta = Some(e);
-                    }
+            } else {
+                ProgressPayload {
+                    id: id2.clone(),
+                    percent: Some(p.percent),
+                    speed: p.speed,
+                    eta: p.eta,
+                    file: None,
                 }
-            });
+            };
+            update_progress(&app2, progress);
             if p.file.is_none() && p.percent < 100.0 {
                 let b = (p.percent / 25.0).floor() as u8;
                 if b > band.get() && b >= 1 {
@@ -1128,9 +1175,16 @@ fn run_merge_task(app: AppHandle, id: String) {
         &params,
         &cancel,
         move |pct| {
-            update_item(&app2, &id2, |it| {
-                it.percent = pct;
-            });
+            update_progress(
+                &app2,
+                ProgressPayload {
+                    id: id2.clone(),
+                    percent: Some(pct),
+                    speed: None,
+                    eta: None,
+                    file: None,
+                },
+            );
         },
         |line| log_item(&app, &id, line),
     );
@@ -1472,9 +1526,16 @@ fn run_transcode_task(app: AppHandle, id: String) {
         &meta,
         &cancel,
         move |pct| {
-            update_item(&app2, &id2, |it| {
-                it.percent = pct;
-            });
+            update_progress(
+                &app2,
+                ProgressPayload {
+                    id: id2.clone(),
+                    percent: Some(pct),
+                    speed: None,
+                    eta: None,
+                    file: None,
+                },
+            );
             if pct < 100.0 {
                 let b = (pct / 25.0).floor() as u8;
                 if b > band.get() && b >= 1 {

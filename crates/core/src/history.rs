@@ -53,6 +53,11 @@ impl History {
         self.items.iter().find(|i| i.id == id)
     }
 
+    /// 按 id 可变查找（高频进度/日志原地更新用，避免 clone 整个条目再 upsert）。
+    pub fn get_mut(&mut self, id: &str) -> Option<&mut MediaItem> {
+        self.items.iter_mut().find(|i| i.id == id)
+    }
+
     /// 追加或按 id 更新；超过上限时优先裁剪**最旧的终态条目**
     /// （Done/Failed/Canceled），避免把仍在处理中的活跃任务裁掉
     /// （任务完成 upsert 会"复活"被裁条目，造成列表闪烁）。

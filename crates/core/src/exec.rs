@@ -238,11 +238,17 @@ impl ChildGuard {
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
+        // std::process::Child 在 Rust 中 drop 不会自动 kill：异常路径（`?` 提前
+        // 返回、panic unwinding、进度解析中途出错）若不兜底，ffmpeg/yt-dlp 会成为
+        // 孤儿进程继续跑（占网络/CPU/写文件）。因此只要进程未确认退出，一律杀。
         if let Some(child) = self.child.as_mut() {
-            if let Ok(Some(_)) = child.try_wait() {
-                // 已退出
-            } else if self.cancelled {
-                let _ = child.kill();
+            match child.try_wait() {
+                Ok(Some(_)) => { /* 已退出，无需处理 */ }
+                _ => {
+                    // 仍在运行（或 try_wait 出错）：杀整棵进程树并回收，防僵尸/孤儿
+                    kill_tree_of(child);
+                    let _ = child.wait();
+                }
             }
         }
     }

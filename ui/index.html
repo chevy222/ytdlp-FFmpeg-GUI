@@ -601,10 +601,13 @@ function thumbSrc(p){
 // 数据即时入 S.items，渲染按 ~200ms 合帧——否则高速下载时每秒几十次全量
 // innerHTML 重建会把 UI 线程打满，看起来就像进度卡在 0% 不动
 let __renderQueued=false;
+function scheduleRender(){
+  if(!__renderQueued){__renderQueued=true;setTimeout(()=>{__renderQueued=false;render();},200);}
+}
 function upsertItem(it){
   const i=S.items.findIndex(x=>x.id===it.id);
   if(i>=0)S.items[i]=it;else S.items.unshift(it);
-  if(!__renderQueued){__renderQueued=true;setTimeout(()=>{__renderQueued=false;render();},200);}
+  scheduleRender();
 }
 
 // ===== 列表交互 =====
@@ -871,22 +874,27 @@ function closeUrlModal(){document.getElementById('urlModal').classList.remove('s
 
 // ===== 日志 =====
 let logId=null;
+// 单行日志渲染（openLog 全量渲染与 item:log 实时追加共用）
+function logLineHtml(txtRaw){
+  const txt=typeof txtRaw==='string'?txtRaw:String(txtRaw);
+  let cls=''; let body=txt;
+  if(txt.includes('失败')||txt.includes('错误')){cls='err';}
+  if(/403|Forbidden/i.test(txt)){
+    body+='\n\n[提示] HTTP 403：站点拒绝了请求。YouTube 请先点"去登录"用内置登录保存 Cookie 后重试；或更换代理节点；或更新 yt-dlp。';
+    cls='err';
+  }
+  return '<li class="'+cls+'">'+esc(body)+'</li>';
+}
 function openLog(id){
   const it=S.items.find(i=>i.id===id); if(!it)return;
   logId=id;
   document.getElementById('logTitle').textContent='日志 - '+(it.title||id);
   const log=it.log&&it.log.length?it.log:['（暂无日志）'];
-  document.getElementById('logList').innerHTML=log.map(l=>{
-    const txt=typeof l==='string'?l:String(l);
-    let cls=''; let body=txt;
-    if(txt.includes('失败')||txt.includes('错误')){cls='err';}
-    if(/403|Forbidden/i.test(txt)){
-      body+='\n\n[提示] HTTP 403：站点拒绝了请求。YouTube 请先点"去登录"用内置登录保存 Cookie 后重试；或更换代理节点；或更新 yt-dlp。';
-      cls='err';
-    }
-    return '<li class="'+cls+'">'+esc(body)+'</li>';
-  }).join('');
+  document.getElementById('logList').innerHTML=log.map(logLineHtml).join('');
   document.getElementById('logModal').classList.add('show');
+  // 打开时滚到底部，显示最新日志
+  const box=document.querySelector('#logModal .log-list');
+  if(box)box.scrollTop=box.scrollHeight;
 }
 function clearLogView(){document.getElementById('logList').innerHTML='<li>（已清空）</li>';}
 function copyLogView(){
@@ -894,7 +902,7 @@ function copyLogView(){
   const text=Array.from(lis).map(li=>li.textContent).join('\n');
   navigator.clipboard.writeText(text).then(()=>toast('日志已复制到剪贴板')).catch(()=>toast('复制失败'));
 }
-function closeLog(){document.getElementById('logModal').classList.remove('show');}
+function closeLog(){document.getElementById('logModal').classList.remove('show');logId=null;}
 
 // ===== 设置 =====
 let curPage='deps';
@@ -1131,6 +1139,37 @@ async function init(){
     render();
     refreshDeps();
     LISTEN('item:update', e=>{ upsertItem(e.payload); });
+    // 高频进度：只增量改字段（payload 仅含变化项），不接收全量条目
+    LISTEN('item:progress', e=>{
+      const p=e.payload; if(!p||!p.id)return;
+      const it=S.items.find(x=>x.id===p.id);
+      if(!it)return;
+      if(p.percent!=null)it.percent=p.percent;
+      if(p.speed!=null)it.speed=p.speed;
+      if(p.eta!=null)it.eta=p.eta;
+      if(p.file!=null)it.file=p.file;
+      scheduleRender();
+    });
+    // 高频日志：只带 id + 单行，前端增量 append（不触发列表重渲染）
+    LISTEN('item:log', e=>{
+      const d=e.payload; if(!d||!d.id)return;
+      const it=S.items.find(x=>x.id===d.id);
+      if(it){
+        if(!it.log)it.log=[];
+        it.log.push(d.line);
+        if(it.log.length>300)it.log.shift();
+      }
+      // 日志弹窗正打开该条目：实时追加并跟随滚动
+      if(logId===d.id && document.getElementById('logModal').classList.contains('show')){
+        const list=document.getElementById('logList');
+        // 首次实时追加前清掉占位行
+        const placeholder=list.querySelector('li');
+        if(placeholder && placeholder.textContent==='（暂无日志）')list.innerHTML='';
+        list.insertAdjacentHTML('beforeend', logLineHtml(d.line));
+        const box=document.querySelector('#logModal .log-list');
+        if(box)box.scrollTop=box.scrollHeight;
+      }
+    });
     LISTEN('item:removed', e=>{ S.items=S.items.filter(i=>i.id!==e.payload); S.selected.delete(e.payload); stopCountdown(e.payload); render(); });
     LISTEN('list:changed', async()=>{ S.items=await INVOKE('list_items'); render(); });
     LISTEN('item:ready', e=>{
