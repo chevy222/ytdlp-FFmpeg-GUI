@@ -27,11 +27,15 @@
 ```
 config/     config.json（设置）· history.json（列表/队列/条目日志）· cookies/<host>.json（站点 Cookie）
             cache/thumbs/<条目id>.jpg（封面缩略图）
-temp/       任务私有临时目录 temp/<任务id>/（导出的 Cookie 等）、temp/merge_<uuid>/（合并中间产物）
+temp/       任务私有临时目录 temp/<任务id>/（导出的 Cookie 等）、temp/merge_<uuid>/（合并中间产物）、
+            temp/tool_dl/（工具下载中间产物）
 tools/      yt-dlp / ffmpeg / ffprobe / deno（托管模式工具链）· installed.json（安装指纹，供"更新"判断新版本）
+logs/       运行日志 logs/app-<日期>.log（按天滚动、保留最近 7 天）
 ```
 
 - 所有 JSON 均为**原子写**（临时文件 + rename；损坏则备份后回退默认）。
+- GUI 程序没有控制台，`eprintln!` 看不到任何东西：配置/历史损坏、任务线程 panic、子进程清理失败等
+  一律写进 `logs/app-<日期>.log`（排查问题先看这里）。
 - 中间产物一律落在 `temp/`，不写进用户输出目录；任务结束/取消即清理本任务目录。
 - 下载/转码/合并产物输出到默认输出目录（**默认桌面**，可配置）。
 - 可执行文件解析顺序：设置里指定的路径 → exe 同级 `tools\` → 系统 PATH，**前一级取不到自动回退下一级**（首次运行 `tools\` 为空时，PATH 中已安装的工具照常可用）。

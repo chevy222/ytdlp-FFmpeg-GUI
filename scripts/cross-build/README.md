@@ -12,7 +12,7 @@
 |------|---------|------|
 | Rust | stable（含 `x86_64-pc-windows-msvc` target） | `rustup target add x86_64-pc-windows-msvc` |
 | cargo-xwin | 0.23+ | `cargo install cargo-xwin` |
-| zig | 0.13+（实测 0.16） | 任意位置，如 `~/toolchain/zigpip/ziglang/zig` |
+| zig | 0.13+（实测 0.16） | 从 zig 官网下载解压到任意位置，或用发行版包管理器安装 |
 | python3 + pefile | 任意 | `pip install pefile`（仅验证用） |
 
 xwin 首次构建会自动下载 MSVC SDK 并缓存（`~/.cache/xwin` 或 `XWIN_CACHE_DIR`），
@@ -31,8 +31,6 @@ zig 可执行文件需可通过 `zig` 命令找到：要么把 zig（或软链�
 | `lld-link` | MSVC 链接器 | `zig lld-link`（过滤 `-flavor link`） |
 | `llvm-rc` | 资源编译器（.rc → .res） | `zig rc`（过滤 `/no-preprocess`） |
 | `x86_64-w64-mingw32-windres` | GNU 资源编译器（备用） | `zig rc` |
-
-也可从旧仓库获取同款脚本：`https://github.com/chevy222/ytdlp-gui/tree/main/scripts/cross-build`。
 
 ## 构建命令（workspace 根执行）
 

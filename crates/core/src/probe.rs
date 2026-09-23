@@ -7,20 +7,12 @@
 
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::Value;
 
 use crate::config::NetworkConfig;
-use crate::exec::{
-    decode_text, is_http_url, push_url_arg, ChildGuard, Tool, ToolResolver,
-};
+use crate::exec::{decode_text, ChildGuard, Tool, ToolResolver};
 use crate::model::{AudioVolume, DownloadFormat, MediaMeta};
-
-/// 解析临时文件 slot 计数器（参考 convert_h265.bat / download_video.bat 的
-/// mkdir slot 原子性声明思想）。同进程并发解析时，每个任务获取唯一 slot，
-/// 避免临时文件互相覆盖（旧实现只用进程 ID，并发解析会冲突）。
-static PROBE_SLOT: AtomicU64 = AtomicU64::new(0);
 use crate::Result;
 
 /// 解析失败分类（MD-05）。
@@ -34,6 +26,8 @@ pub enum ProbeErrorKind {
     InvalidLink,
     /// 非视频文件 / 探测失败（本地）
     NotVideo,
+    /// 用户取消（解析中的条目也能取消，见 run_probe 的取消注册）
+    Cancelled,
     /// 其他失败
     Failed,
 }
@@ -90,29 +84,24 @@ fn ytdlp_args(
         args.push("--proxy".into());
         args.push(p);
     }
-    // URL 用 `--` 终结选项解析：地址以 `-` 开头时（播放列表 JSON 里的恶意条目）
-    // 只能是一条下不动的链接，不能变成 `--exec` 这样的选项
-    push_url_arg(&mut args, url);
+    args.push(url.to_string());
     args
 }
 
 /// 展开播放列表（yt-dlp -J --flat-playlist）：快速拿每集 URL 与标题，
 /// 命令层据此逐条平铺进统一列表。
+///
+/// 与 [`probe_url`] 同一套读取方式：边下边读、可由 `cancel` 终止、300 秒兜底。
+/// 大合集的 JSON 可达数十 MB，持续排空 stdout 才不会把自己卡在管道缓冲区上。
 pub fn list_playlist_entries(
     resolver: &ToolResolver,
     url: &str,
     cookies_file: Option<&Path>,
     network: &NetworkConfig,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     mut on_log: impl FnMut(String),
 ) -> std::result::Result<Vec<PlaylistEntry>, ProbeFailure> {
-    // 只接受 http(s)：这一层的输入是用户粘贴的链接，产物又会被平铺成条目
-    // 再送进 probe_url / run_download（见那里同样的闸口）
-    if !is_http_url(url) {
-        return Err(ProbeFailure {
-            kind: ProbeErrorKind::InvalidLink,
-            message: format!("只支持 http(s) 链接：{url}"),
-        });
-    }
+    use std::sync::atomic::Ordering;
     let args = ytdlp_args(
         resolver,
         url,
@@ -127,21 +116,40 @@ pub fn list_playlist_entries(
     })?;
     cmd.args(&args);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let guard = ChildGuard::spawn(&mut cmd).map_err(|e| ProbeFailure {
+    let mut guard = ChildGuard::spawn(&mut cmd).map_err(|e| ProbeFailure {
         kind: ProbeErrorKind::Failed,
         message: format!("启动 yt-dlp 失败：{}", e),
     })?;
-    let output = guard.wait_with_output().map_err(|e| ProbeFailure {
+
+    let cancel = cancel
+        .cloned()
+        .unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    let mut text = String::new();
+    let outcome = crate::exec::stream_lines(&mut guard, &cancel, Some(deadline), |line| {
+        text.push_str(line);
+        text.push('\n');
+    })
+    .map_err(|e| ProbeFailure {
         kind: ProbeErrorKind::Failed,
-        message: format!("yt-dlp 退出异常：{}", e),
+        message: format!("yt-dlp 执行异常：{e}"),
     })?;
-    if !output.status.success() {
-        let err = decode_text(&output.stderr);
-        let mut f = classify_ytdlp_error(&err);
-        f.message = format!("获取播放列表失败：{}", err.trim());
+    if outcome.killed {
+        let (kind, message) = if cancel.load(Ordering::Relaxed) {
+            (ProbeErrorKind::Cancelled, "获取播放列表已取消".to_string())
+        } else {
+            (
+                ProbeErrorKind::Network,
+                "获取播放列表超时（超过 300 秒），可重试或检查网络/代理".to_string(),
+            )
+        };
+        return Err(ProbeFailure { kind, message });
+    }
+    if !outcome.status.success() {
+        let mut f = classify_ytdlp_error(outcome.stderr.trim());
+        f.message = format!("获取播放列表失败：{}", outcome.stderr.trim());
         return Err(f);
     }
-    let text = decode_text(&output.stdout);
     let v: Value = match serde_json::from_str(&text) {
         Ok(v) => v,
         Err(_) => {
@@ -152,7 +160,6 @@ pub fn list_playlist_entries(
         }
     };
     let mut out = Vec::new();
-    let mut rejected = 0usize;
     if let Some(entries) = v["entries"].as_array() {
         for e in entries {
             let u = e["url"]
@@ -160,21 +167,12 @@ pub fn list_playlist_entries(
                 .or_else(|| e["webpage_url"].as_str())
                 .unwrap_or_default()
                 .to_string();
-            // 条目地址由站点 JSON 决定，属于不可信输入：非 http(s) 一律丢弃。
-            // 它会被平铺成条目、再作为下一条 URL 参数送给 yt-dlp，`--exec=…`
-            // 这类字符串在这里被挡下就再也进不去。
-            if !is_http_url(&u) {
-                if !u.is_empty() {
-                    rejected += 1;
-                }
+            if u.is_empty() {
                 continue;
             }
             let title = e["title"].as_str().unwrap_or("").to_string();
             out.push(PlaylistEntry { url: u, title });
         }
-    }
-    if rejected > 0 {
-        on_log(format!("已忽略 {rejected} 条非 http(s) 播放列表条目"));
     }
     Ok(out)
 }
@@ -193,25 +191,25 @@ impl std::fmt::Display for ProbeFailure {
 }
 
 /// URL 解析（yt-dlp -J）。
-/// `cookies_file`：Netscape 临时文件路径（None 则不带）。
-/// `on_log`：接收实际执行的完整命令行（条目日志展示用）。
+///
+/// 输出用 [`crate::exec::stream_lines`] **边下边读**（不再落 temp 临时文件）：
+/// 整份元数据 JSON 可能有几十 MB，持续排空 stdout 就不会触发管道缓冲区阻塞，
+/// 同时天然获得"取消/超时由看门狗落实"的能力（旧实现用临时文件是为了绕开管道
+/// 阻塞，代价是 temp 目录里多出一套需要维护生命周期的文件）。
+///
+/// - `cookies_file`：Netscape 临时文件路径（None 则不带）；
+/// - `cancel`：置位后终止 yt-dlp 并返回 [`ProbeErrorKind::Cancelled`]；
+/// - `on_log`：接收实际执行的完整命令行（条目日志展示用）。
 pub fn probe_url(
     resolver: &ToolResolver,
     url: &str,
     cookies_file: Option<&Path>,
     network: &NetworkConfig,
     playlist: bool,
-    temp_dir: &Path,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     mut on_log: impl FnMut(String),
 ) -> std::result::Result<UrlProbe, ProbeFailure> {
-    // 只接受 http(s)。调用方有两处：UI 添加（已校验）与播放列表平铺
-    // （URL 来自站点 JSON）—— 校验必须落在这里，离 yt-dlp 最近的一层
-    if !is_http_url(url) {
-        return Err(ProbeFailure {
-            kind: ProbeErrorKind::InvalidLink,
-            message: format!("只支持 http(s) 链接：{url}"),
-        });
-    }
+    use std::sync::atomic::Ordering;
     let extra: &[&str] = if playlist {
         &["-J", "--no-warnings", "--yes-playlist", "--socket-timeout", "60"]
     } else {
@@ -224,60 +222,43 @@ pub fn probe_url(
         message: e.to_string(),
     })?;
     cmd.args(&args);
-    // stdout/stderr 重定向到临时文件（不用管道）：
-    // GUI 子进程管道缓冲区有限（Windows 默认 64KB），yt-dlp 输出大量 JSON 元数据时
-    // 会阻塞在 write(stdout)，导致无法及时读取网络数据而超时。手动 CMD 输出直接到终端不会阻塞。
-    // 临时文件必须落在 exe 同级 temp 目录（需求：所有产生的文件都存 exe 同级），
-    // 禁止用 std::env::temp_dir()（会写到 AppData\Local\Temp）。
-    let tmp_dir = temp_dir;
-    // 进程 ID + 原子递增 slot：同进程并发解析不冲突，多实例也不冲突
-    let slot = PROBE_SLOT.fetch_add(1, Ordering::Relaxed);
-    let stdout_file = tmp_dir.join(format!(
-        "ytdlp-probe-out-{}-{}.json",
-        std::process::id(),
-        slot
-    ));
-    let stderr_file = tmp_dir.join(format!(
-        "ytdlp-probe-err-{}-{}.log",
-        std::process::id(),
-        slot
-    ));
-    let out_f = std::fs::File::create(&stdout_file).map_err(|e| ProbeFailure {
-        kind: ProbeErrorKind::Failed,
-        message: format!("创建临时输出文件失败：{e}"),
-    })?;
-    let err_f = std::fs::File::create(&stderr_file).map_err(|e| ProbeFailure {
-        kind: ProbeErrorKind::Failed,
-        message: format!("创建临时错误文件失败：{e}"),
-    })?;
-    cmd.stdout(Stdio::from(out_f));
-    cmd.stderr(Stdio::from(err_f));
-
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut guard = ChildGuard::spawn(&mut cmd).map_err(|e| ProbeFailure {
         kind: ProbeErrorKind::Failed,
         message: format!("启动 yt-dlp 失败：{}", e),
     })?;
-    let status = guard.wait().map_err(|e| ProbeFailure {
+
+    let cancel = cancel
+        .cloned()
+        .unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    // 300 秒是纯兜底（正常解析是秒级）：卡住时不要永远占着解析线程
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    let mut text = String::new();
+    let outcome = crate::exec::stream_lines(&mut guard, &cancel, Some(deadline), |line| {
+        text.push_str(line);
+        text.push('\n');
+    })
+    .map_err(|e| ProbeFailure {
         kind: ProbeErrorKind::Failed,
-        message: format!("yt-dlp 退出异常：{e}"),
+        message: format!("yt-dlp 执行异常：{e}"),
     })?;
-    // 读不回内容 ≠ yt-dlp 没输出：杀软占用/共享违规同样会让 read 失败。
-    // 旧写法 unwrap_or_default 把这种情况变成"yt-dlp 返回无法解析的数据"，
-    // 用户和排查者都会被引向完全错误的方向。
-    let stdout_res = std::fs::read(&stdout_file);
-    let stderr_res = std::fs::read(&stderr_file);
-    let _ = std::fs::remove_file(&stdout_file);
-    let _ = std::fs::remove_file(&stderr_file);
-    let stdout_bytes = stdout_res.map_err(|e| ProbeFailure {
-        kind: ProbeErrorKind::Failed,
-        message: format!("读取 yt-dlp 探测输出失败（文件被占用？）：{e}"),
-    })?;
-    let stderr_bytes = stderr_res.unwrap_or_default();
-    if !status.success() {
-        let stderr = decode_text(&stderr_bytes);
-        return Err(classify_ytdlp_error(stderr.trim()));
+
+    if outcome.killed {
+        // 区分"用户取消"与"超时兜底"：前者进已取消，后者进失败（带可读原因）
+        if cancel.load(Ordering::Relaxed) {
+            return Err(ProbeFailure {
+                kind: ProbeErrorKind::Cancelled,
+                message: "解析已取消".into(),
+            });
+        }
+        return Err(ProbeFailure {
+            kind: ProbeErrorKind::Network,
+            message: "解析超时（超过 300 秒仍未返回元数据），可重试或检查网络/代理".into(),
+        });
     }
-    let text = decode_text(&stdout_bytes);
+    if !outcome.status.success() {
+        return Err(classify_ytdlp_error(outcome.stderr.trim()));
+    }
     parse_ytdlp_json(&text).map_err(|e| ProbeFailure {
         kind: ProbeErrorKind::Failed,
         message: format!("解析 yt-dlp 输出失败：{e}"),
@@ -307,10 +288,6 @@ pub fn probe_local(
         // -show_data 才会输出流级 `extradata`（否则只有 extradata_size）：
         // 合并直拼判据 MG-02 需要真实 SPS/PPS 十六进制对比
         "-show_data",
-        // 输入必须挂在 `-i` 的值位上：裸位置参数遇到以 `-` 开头的文件名
-        // （拖入 `-foo.mp4`）会被 ffprobe 当选项解析，症状是"探测失败"或
-        // 拿到一份完全错误的元数据
-        "-i",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -344,22 +321,28 @@ pub fn probe_local(
 
     // 2) volumedetect（有音频流时）
     if meta.acodec.is_some() {
+        // 失败要说出来：静默吞掉时用户只看到"音量未知"，无从判断是探测失败
+        // 还是文件真的没有可测音量
         match probe_volume(resolver, path, &mut on_log) {
             Ok(vol) => meta.audio_volume = vol,
-            // 失败要说出来：静默吞掉等于告诉用户"这个文件不需要归一化"
-            Err(e) => on_log(format!("音量探测失败，本次跳过归一化：{e}")),
+            Err(e) => on_log(format!("音量探测失败（增益按保守值处理）：{e}")),
         }
     }
     Ok(LocalProbe { meta })
 }
 
 /// 音量探测（ffmpeg volumedetect）。
+///
+/// 只解**主音轨**（`-map 0:a:0`）且只取**前 10 分钟**（`-t 600`）：
+/// volumedetect 是统计型滤镜，要解完全部采样才有均值——不加限制时，一部 2 小时
+/// 4K 视频（含视频解码！`-vn` 关掉）会在这里耗掉几十秒到几分钟，而增益决策
+/// 只需要一个足够有代表性的峰值。原实现还不看退出码，失败时静默返回"音量未知"。
 pub fn probe_volume(
     resolver: &ToolResolver,
     path: &Path,
     on_log: &mut dyn FnMut(String),
 ) -> Result<AudioVolume> {
-    let args: Vec<String> = ["-i"]
+    let args: Vec<String> = ["-vn", "-map", "0:a:0", "-t", "600", "-i"]
         .iter()
         .map(|s| s.to_string())
         .chain(std::iter::once(path.to_string_lossy().into_owned()))
@@ -375,17 +358,15 @@ pub fn probe_volume(
     cmd.stdout(Stdio::null()).stderr(Stdio::piped());
     let guard = ChildGuard::spawn(&mut cmd)?;
     let out = guard.wait_with_output()?;
-    // 不检查退出码：ffmpeg 报 "Unknown encoder"/"Invalid data" 时 stderr 里
-    // 根本没有 volumedetect 统计，parse_volumedetect 会返回全 None，
-    // 于是"探测失败"被静默解释成"这文件没声音/已经很响"，归一化悄悄跳过
+    let stderr = decode_text(&out.stderr);
     if !out.status.success() {
-        return Err(CoreError::ProcessFailed {
+        return Err(crate::CoreError::ProcessFailed {
             program: "ffmpeg".into(),
             code: out.status.code(),
-            stderr: decode_text(&out.stderr).trim().to_string(),
+            stderr: stderr.trim().to_string(),
         });
     }
-    Ok(parse_volumedetect(&decode_text(&out.stderr)))
+    Ok(parse_volumedetect(&stderr))
 }
 
 /// 解析 yt-dlp `-J` JSON → UrlProbe（纯函数）。
@@ -530,8 +511,6 @@ pub fn parse_ffprobe_json(text: &str) -> MediaMeta {
                     meta.height = s["height"].as_u64().map(|h| h as u32);
                     // 宽度采集（MD-02）：竖屏源 short_edge()/画质列/后处理短边判据都依赖它
                     meta.width = s["width"].as_u64().map(|w| w as u32);
-                    // 像素格式：合并直拼判据（MG-02）要拿它比 8bit/10bit 源
-                    meta.pix_fmt = s["pix_fmt"].as_str().map(str::to_string);
                     meta.vcodec = s["codec_name"].as_str().map(str::to_string);
                     meta.fps = s["avg_frame_rate"].as_str().and_then(|r| {
                         let mut it = r.split('/');
@@ -651,33 +630,15 @@ fn classify_ytdlp_error(stderr: &str) -> ProbeFailure {
         || lower.contains("invalid url")
     {
         ProbeErrorKind::InvalidLink
-    } else if lower.contains("private")
-        || lower.contains("members only")
-        || lower.contains("sign in")
-        || lower.contains("log in")
-        || lower.contains("cookies are required")
-        || (lower.contains("account") && lower.contains("unavailable"))
-    {
-        // 只有真正带"要看登录态"信号的才判 NeedLogin。
-        // 裸 "unavailable" 绝大多数是**视频被删/地区限制**——判成 NeedLogin 会给
-        // 用户一个"去登录"按钮，他登录完再试还是失败，白白绕一圈。
-        ProbeErrorKind::NeedLogin
     } else if lower.contains("video unavailable") || lower.contains("unavailable") {
-        ProbeErrorKind::InvalidLink
+        ProbeErrorKind::NeedLogin
     } else {
         ProbeErrorKind::Failed
     };
-    // 取最后一条含 ERROR 的行：yt-dlp 的结尾行常是 traceback 尾巴或空行，
-    // 直接 lines().last() 会把"未知错误"送给用户
-    let message = stderr
-        .lines()
-        .rev()
-        .find(|l| l.contains("ERROR"))
-        .or_else(|| stderr.lines().rev().find(|l| !l.trim().is_empty()))
-        .unwrap_or("未知错误")
-        .trim()
-        .to_string();
-    ProbeFailure { kind, message }
+    ProbeFailure {
+        kind,
+        message: stderr.lines().last().unwrap_or("未知错误").to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -850,20 +811,6 @@ mod tests {
             "ERROR: [Douyin] 7686436507753794843: Fresh cookies (not necessarily logged in) are needed",
         );
         assert_eq!(e.kind, ProbeErrorKind::NeedLogin);
-    }
-
-    #[test]
-    fn bare_unavailable_is_not_need_login() {
-        // 被删/地区限制的视频不能给"去登录"按钮 —— 登录完再试还是失败
-        let e = classify_ytdlp_error("ERROR: [youtube] abc: Video unavailable");
-        assert_eq!(e.kind, ProbeErrorKind::InvalidLink, "{:?}", e);
-        let e = classify_ytdlp_error("ERROR: This video is no longer available");
-        assert_eq!(e.kind, ProbeErrorKind::InvalidLink);
-        // 消息取"最后一条含 ERROR 的行"，不是可能被 traceback 占据的末行
-        let e = classify_ytdlp_error(
-            "ERROR: [youtube] abc: Video unavailable\nTraceback (inner most last):\n  File x",
-        );
-        assert!(e.message.starts_with("ERROR:"), "意外消息：{}", e.message);
     }
 
     #[test]

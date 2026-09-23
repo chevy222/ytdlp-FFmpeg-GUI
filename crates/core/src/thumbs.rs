@@ -40,20 +40,44 @@ pub fn save_remote_thumb(url: &str, dest: &Path, proxy: Option<&str>) -> Result<
 }
 
 fn fetch_to(url: &str, dest: &Path, proxy: Option<&str>) -> Result<(), String> {
-    let tmp = dest.with_extension("tmp.jpg");
+    // 临时名带 UUID：同一 dest 被并发请求时不会互踩（固定名会让其中一个 rename 失败）
+    let tmp = dest.with_file_name(format!(".thumb-{}.tmp", uuid::Uuid::new_v4()));
     let tmp_str = tmp.to_string_lossy().into_owned();
     let mut cmd = std::process::Command::new("curl");
-    cmd.args(["-L", "--fail", "-sS", "-o", &tmp_str, url]);
+    // URL 来自三方元数据（yt-dlp 返回的 thumbnail），必须有上限：
+    // --max-time 防止假死连接占住线程，--max-filesize 防止写爆 cache 目录
+    cmd.args([
+        "-L",
+        "--fail",
+        "-sS",
+        "--connect-timeout",
+        "10",
+        "--max-time",
+        "30",
+        "--max-filesize",
+        "20971520",
+        "-o",
+        &tmp_str,
+        url,
+    ]);
     if let Some(p) = proxy {
         cmd.args(["--proxy", p]);
     }
     // GUI 程序启动控制台子进程会弹出一个黑窗（一闪而过）；这里与其它调用点
     // 保持一致，显式隐藏控制台。
     crate::exec::hide_console(&mut cmd);
-    let output = cmd.output().map_err(|e| format!("无法调用 curl：{e}"))?;
+    let output = cmd
+        .output()
+        .map_err(|e| format!("无法调用 curl（需要 Windows 10+ 自带的 curl.exe）：{e}"))?;
     if !output.status.success() || !tmp.is_file() {
         let _ = std::fs::remove_file(&tmp);
-        return Err("缩略图下载失败".into());
+        // curl 的报错在 stderr（-sS 保证有输出）：带出来才能分辨是网络还是代理问题
+        let detail = crate::exec::decode_text(&output.stderr);
+        return Err(if detail.trim().is_empty() {
+            "缩略图下载失败".to_string()
+        } else {
+            format!("缩略图下载失败：{}", detail.trim())
+        });
     }
     let size = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
     if size == 0 {
@@ -93,9 +117,20 @@ pub fn extract_cover(
     on_log(crate::exec::display_command("ffmpeg", &args));
     let mut cmd = resolver.command(Tool::Ffmpeg).map_err(|e| e.to_string())?;
     cmd.args(&args);
+    cmd.stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
     let child = ChildGuard::spawn(&mut cmd).map_err(|e| e.to_string())?;
     let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    Ok(out.status.success() && dest.is_file())
+    if out.status.success() && dest.is_file() {
+        return Ok(true);
+    }
+    // 取内嵌封面失败不算错误（可能本就没有封面流）：交给调用方回退抽帧，
+    // 但把 ffmpeg 的报错写进日志，别让"回退"变成无法解释的行为
+    let detail = crate::exec::decode_text(&out.stderr);
+    if !detail.trim().is_empty() {
+        on_log(format!("内嵌封面提取失败（回退抽帧）：{}", detail.trim()));
+    }
+    Ok(false)
 }
 
 /// 缩略图统一入口：**优先内嵌封面**（元数据），没有封面流才抽帧。
@@ -138,13 +173,15 @@ pub fn extract_thumb(
     on_log(crate::exec::display_command("ffmpeg", &args));
     let mut cmd = resolver.command(Tool::Ffmpeg).map_err(|e| e.to_string())?;
     cmd.args(&args);
+    // stderr 必须 pipe：未 pipe 时 wait_with_output 拿到的 stderr 恒为空，
+    // 报错只剩"抽帧失败："后面什么都没有
+    cmd.stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
     let child = ChildGuard::spawn(&mut cmd).map_err(|e| e.to_string())?;
     let out = child.wait_with_output().map_err(|e| e.to_string())?;
     if !out.status.success() || !dest.is_file() {
-        return Err(format!(
-            "抽帧失败：{}",
-            crate::exec::decode_text(&out.stderr)
-        ));
+        let detail = crate::exec::decode_text(&out.stderr);
+        return Err(format!("抽帧失败：{}", detail.trim()));
     }
     Ok(())
 }
@@ -159,6 +196,12 @@ fn ensure_parent(dest: &Path) -> std::io::Result<()> {
 /// thumb 目录 + 条目文件路径。
 pub fn thumb_path(cache_dir: &Path, id: &str) -> PathBuf {
     cache_dir.join("thumbs").join(format!("{id}.jpg"))
+}
+
+/// 删除某条目的缩略图缓存（删除条目/清空列表时调用）。
+/// 不清理的话 `config/cache/thumbs/` 会随使用时长无限累积。
+pub fn remove_thumb(cache_dir: &Path, id: &str) {
+    let _ = std::fs::remove_file(thumb_path(cache_dir, id));
 }
 
 #[cfg(test)]

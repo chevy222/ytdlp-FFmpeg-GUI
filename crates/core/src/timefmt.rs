@@ -1,7 +1,7 @@
 //! 本地时间格式化（无 chrono 依赖）。
 //!
 //! std 只提供 UTC epoch 秒，这里提供"epoch 秒 + 显式时区偏移"的纯函数
-//! （可单测）；偏移量由应用层按平台提供（Windows 用 GetTimeZoneInformation，
+//! （可单测）；偏移量本模块自行探测（Windows 读注册表 `ActiveTimeBias`，
 //! 其余平台按 UTC）。此前各处直接用 UTC 计算日期，东八区 0:00–8:00 会取到
 //! "昨天"，合并默认名 / `日期-标题` 模板 / `updated_at` 均受影响。
 
@@ -61,38 +61,42 @@ pub fn datetime_str(secs: u64, offset_secs: i64) -> String {
     format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, mo, d, h, mi, s)
 }
 
-/// 本地时区偏移秒（东八区 = 28800）。**按小时重探**，不冻结在首次调用。
+/// 本地时区偏移秒（东八区 = 28800）。
 ///
 /// - Windows：注册表 `ActiveTimeBias`（当前生效偏差，含夏令时；
 ///   bias = UTC − 本地，单位分钟）。经 `reg query` 读取——core 层保持
 ///   平台无关，不引入 Win32 依赖；
 /// - 其余平台：返回 0（UTC）。本项目生产环境为 Windows，测试按 UTC 断言。
 ///
-/// 探测失败（无 reg / 解析不出）一律回退 0，不阻塞调用方。
-///
-/// 为什么不能 OnceLock 缓存一次：偏移值会喂给 `updated_at`、`日期-标题`
-/// 文件名模板和 `合并_<YYYYMMDD>`。跨夏令时（或出差换时区）之后一直用旧偏移，
-/// 列表时间戳与文件名日期就永久偏一小时/一天，直到重启进程才恢复。
+/// **缓存 + TTL（5 分钟）**：`ActiveTimeBias` 会随夏令时切换变化，用 `OnceLock`
+/// 一次探测永久缓存，会让切换后所有时间戳（`updated_at`、`日期-标题`、
+/// 日志文件名）整整差一小时。TTL 到期重探；探测失败一律回退 0，不阻塞调用方。
 pub fn local_offset_secs() -> i64 {
-    use std::sync::atomic::{AtomicI64, Ordering};
-    static OFFSET: AtomicI64 = AtomicI64::new(i64::MIN);
-    static HOUR: AtomicI64 = AtomicI64::new(-1);
-    let hour = (now_secs() / 3600) as i64;
-    let cached = OFFSET.load(Ordering::Relaxed);
-    if cached != i64::MIN && HOUR.load(Ordering::Relaxed) == hour {
-        return cached;
+    const TTL: std::time::Duration = std::time::Duration::from_secs(300);
+    // LazyLock + Mutex：偏移会随夏令时变化，不能一次探测永久缓存（见上）
+    static CACHE: std::sync::LazyLock<parking_lot::Mutex<Option<(std::time::Instant, i64)>>> =
+        std::sync::LazyLock::new(|| parking_lot::Mutex::new(None));
+    let mut cache = CACHE.lock();
+    if let Some((at, v)) = *cache {
+        if at.elapsed() < TTL {
+            return v;
+        }
     }
-    let fresh = detect_offset();
-    OFFSET.store(fresh, Ordering::Relaxed);
-    HOUR.store(hour, Ordering::Relaxed);
-    fresh
+    // 锁内探测（约十几毫秒、5 分钟一次）：避免并发调用各起一个 reg query
+    let v = detect_offset();
+    *cache = Some((std::time::Instant::now(), v));
+    v
+}
+
+/// 启动时预热时区偏移：`MediaItem::new`（纯数据构造）会用到它，提前探好就不会
+/// 让"创建条目"这条路径隐式产生一个 `reg query` 子进程。
+pub fn warm_up() {
+    let _ = local_offset_secs();
 }
 
 #[cfg(windows)]
 fn detect_offset() -> i64 {
-    // 绝对路径：绿色便携版可能被放在任何目录，PATH 里被抢先放一个 reg.exe
-    // 就能把"读时区"变成"执行任意程序"
-    let mut cmd = std::process::Command::new(crate::exec::system_tool("reg.exe"));
+    let mut cmd = std::process::Command::new("reg");
     cmd.args([
         "query",
         r"HKLM\SYSTEM\CurrentControlSet\Control\TimeZoneInformation",

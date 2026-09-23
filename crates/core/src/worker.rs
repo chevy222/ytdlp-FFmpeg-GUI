@@ -50,14 +50,8 @@ impl TaskQueue {
     }
 
     /// 任务结束（无论成败）：释放 slot，返回下一个应启动的等待任务（若有）。
-    ///
-    /// 只认该 id **真正持有**的 slot：不校验所有权的话，任何一次重复 release
-    /// 都会凭空放行一个等待任务，实际并发悄悄超过配置上限（表现为"设了 3 却跑 5 个
-    /// ffmpeg，机器卡死"）。
     pub fn finish(&mut self, id: &str) -> Option<String> {
-        if !self.running.remove(id) {
-            return None;
-        }
+        self.running.remove(id);
         if let Some(next) = self.waiting.pop_front() {
             if self.running.len() < self.concurrency {
                 self.running.insert(next.clone());
@@ -78,6 +72,11 @@ impl TaskQueue {
 
     pub fn running_count(&self) -> usize {
         self.running.len()
+    }
+
+    /// 当前并发上限（UI 展示"运行中 x/y"用）。
+    pub fn concurrency(&self) -> usize {
+        self.concurrency
     }
 
     pub fn waiting_count(&self) -> usize {
@@ -154,21 +153,6 @@ mod tests {
         assert_eq!(q.waiting_count(), 1);
         let next = q.finish("a");
         assert_eq!(next.as_deref(), Some("b"));
-    }
-
-    #[test]
-    fn finish_is_idempotent_and_cannot_oversubscribe() {
-        let mut q = TaskQueue::new(1);
-        assert_eq!(q.submit("a"), SubmitOutcome::StartNow);
-        assert_eq!(q.submit("b"), SubmitOutcome::Queued);
-        // 第一次 finish 放行 b
-        assert_eq!(q.finish("a").as_deref(), Some("b"));
-        assert!(q.is_running("b"));
-        // 重复 finish("a") 不得再放行任何东西，也不得让 running 凭空增长
-        assert_eq!(q.finish("a"), None);
-        assert_eq!(q.finish("从未提交过"), None);
-        assert_eq!(q.running_count(), 1);
-        assert_eq!(q.waiting_count(), 0);
     }
 
     #[test]

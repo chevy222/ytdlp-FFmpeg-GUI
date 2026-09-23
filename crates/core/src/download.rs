@@ -6,14 +6,12 @@
 //! - 后处理（M1 基础版）：超画质上限降分辨率（libx265，QSV 协商留 M2）+ 音量归一化
 
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::config::{DownloadConfig, GeneralConfig};
-use crate::exec::{
-    decode_text, insert_before_url, is_http_url, progress_tail, push_url_arg, remove_with_retry,
-    Monitored, Tool, ToolResolver,
-};
+use crate::exec::{decode_text, ChildGuard, Tool, ToolResolver};
 use crate::model::MediaMeta;
 use crate::probe;
 use crate::{CoreError, Result};
@@ -184,6 +182,10 @@ pub fn build_args(url: &str, p: &DownloadParams, cfg: &DownloadConfig) -> Vec<St
     // 进度输出（逐行，供解析）——注意不能加 --no-progress，否则
     // yt-dlp 不输出 [download] 进度行，percent 永远解析不到
     args.push("--newline".into());
+    // 连接假死保护：yt-dlp 默认无 socket 超时，断流/被墙时读操作可以无限等，
+    // 任务表现为"进度不动、取消也杀不掉"。与解析链路（probe_url）保持同一口径。
+    args.push("--socket-timeout".into());
+    args.push("60".into());
     // 文件名安全
     args.push("--windows-filenames".into());
     args.push("--trim-filenames".into());
@@ -208,9 +210,8 @@ pub fn build_args(url: &str, p: &DownloadParams, cfg: &DownloadConfig) -> Vec<St
     args.push("--no-warnings".into());
     // 注意：不加 `--ignore-errors` —— 它会让"下载/后处理失败"仍以退出码 0 结束，
     // 使 run_download 的成功判定失效（失败任务会被当成完成）。见 §4 失败安全。
-    // URL 放最后，并用 `--` 终结选项解析：地址以 `-` 开头时（例如播放列表
-    // JSON 里回来的恶意字符串）只能是一条下不动的链接，不能是 `--exec` 选项
-    push_url_arg(&mut args, url);
+    // URL 最后
+    args.push(url.to_string());
     args
 }
 
@@ -411,11 +412,7 @@ fn cleanup_cancelled_outputs(
     };
     for p in extracted.iter().chain(merged.iter()).chain(dests.iter()) {
         if p.is_file() && is_new(p) {
-            // 刚 taskkill 完句柄常还占着：一次删除失败要重试并留痕，
-            // 否则"已取消，清理残留"是句假话，桌上留着几 GB 半成品
-            if let Err(e) = remove_with_retry(p) {
-                eprintln!("取消清理失败：{e}");
-            }
+            let _ = std::fs::remove_file(p);
         }
         let dir = match p.parent() {
             Some(d) => d,
@@ -451,11 +448,11 @@ pub struct DownloadOutcome {
     /// 本次没有任何新下载，"产物"是 yt-dlp 报"已下载过"的既有文件。
     /// 调用方此时**不应**再对它做后处理（否则会原地重编码覆盖用户既有文件）。
     pub preexisting: bool,
+    /// 产物是"目录里新出现的最新一个媒体文件"（弱证据，非 yt-dlp 自报路径）。
+    /// 调用方不应据此做后处理，也不应把它当作本条目的产物路径落库 ——
+    /// 并发下载写同一个输出目录时，这个文件可能是别的任务的产物。
+    pub matched_by_scan: bool,
 }
-
-/// `--print-to-file` 清单文件的进程内递增序号：并发任务必须各用一份，
-/// 只用 pid + 时间戳会撞名（`started.elapsed()` 在函数入口恒为 0）。
-static PRINT_SLOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// 执行下载（阻塞；逐行回调进度；取消置位后杀进程树）。
 /// `on_log`：接收实际执行的完整 yt-dlp 命令行（条目日志展示用）。
@@ -472,36 +469,27 @@ pub fn run_download(
     mut on_log: impl FnMut(String),
 ) -> Result<DownloadOutcome> {
     let started = std::time::SystemTime::now();
-    // 只接受 http(s)。地址可能来自站点返回的播放列表 JSON（见 probe::list_playlist_entries），
-    // 这一层是离 yt-dlp 最近的闸口，不能只信 UI 入口的那次校验。
-    if !is_http_url(url) {
-        return Err(CoreError::InvalidInput(format!("只支持 http(s) 链接：{url}")));
-    }
     let mut args = build_args(url, p, cfg);
     // --print-to-file after_move：yt-dlp 把最终产物路径写入此文件（UTF-8 无 BOM）。
     // 与解析输出行互为兜底：某些站点（如仅音频提取）不产生 Destination/Merger 行时，
     // 此文件是最可靠的产物定位来源。参考 download_video.bat 的 LASTFILE 机制。
     // 临时文件必须落在 exe 同级 temp 目录（需求：所有产生的文件都存 exe 同级），
     // 禁止用 std::env::temp_dir()（会写到 AppData\Local\Temp）。
-    // 序号必须进程内递增：`started.elapsed()` 恒为 0，只带 pid 会让并发任务
-    // 共用同一份清单文件、互相覆盖产物路径（同 probe 的 PROBE_SLOT 口径）。
-    let print_file = temp_dir.join(format!(
-        "ytdlp-print-{}-{}.txt",
-        std::process::id(),
-        PRINT_SLOT.fetch_add(1, Ordering::Relaxed)
-    ));
-    // 这三个是**选项**，必须插在 `--` 之前 —— 追加到尾部会被 yt-dlp 当成第二条 URL
-    insert_before_url(
-        &mut args,
-        [
-            "--print-to-file".to_string(),
-            "after_move:%(filepath)s".to_string(),
-            print_file.to_string_lossy().into_owned(),
-        ],
-    );
+    //
+    // 文件名用 UUID：并发下载（默认并发 3）共用同一个 temp 目录，任何"进程 id +
+    // 时间戳"式的命名都会撞名（同一进程内 pid 相同，毫秒级时间戳也常相同），
+    // 两条任务就会读到对方写进去的产物路径 —— 后处理与 path 回填都会指错文件。
+    // 用 UUID 也顺带避开"上次崩溃残留 + pid 回收"读到陈旧内容的可能。
+    let print_file = temp_dir.join(format!("ytdlp-print-{}.txt", uuid::Uuid::new_v4()));
+    args.push("--print-to-file".into());
+    args.push("after_move:%(filepath)s".into());
+    args.push(print_file.to_string_lossy().into_owned());
     on_log(crate::exec::display_command("yt-dlp", &args));
     let mut cmd = resolver.command(Tool::YtDlp)?;
     cmd.args(&args);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut guard = ChildGuard::spawn(&mut cmd)?;
 
     // [download] Destination: <中间/最终文件>
     let mut dest_paths: Vec<PathBuf> = Vec::new();
@@ -512,11 +500,12 @@ pub fn run_download(
     // [ExtractAudio] Destination: <最终音频文件>（DL-08 仅音频）
     let mut extracted_paths: Vec<PathBuf> = Vec::new();
 
-    // stderr 由 Monitored 在独立线程持续排空：旧实现等进程退出后才读 stderr，
-    // 出错刷屏（重试风暴）时管道缓冲写满、yt-dlp 阻塞在 write()，整个下载连
-    // 取消一起挂死。
-    let mut monitored = Monitored::spawn(&mut cmd)?;
-    let done = match monitored.pump(cancel, |line| {
+    // 逐行读取交给 exec::stream_lines：它同时排空 stderr（不排空 → 管道写满后
+    // yt-dlp 阻塞在写错误行上、父进程阻塞在读 stdout 上，双向死锁），并且用
+    // read_until + decode_text 逐行解码（`lines()` 遇 GBK 字节会中断整条读取）。
+    // 取消由它内部的看门狗线程落实：yt-dlp 卡住不再输出时，本线程正阻塞在读管道，
+    // 只有旁路线程才能把"取消"变成真正的进程树终止。
+    let outcome = crate::exec::stream_lines(&mut guard, cancel, None, |line| {
         if let Some(mp) = parse_merger_path(line) {
             push_unique(&mut merged_paths, mp);
         }
@@ -532,31 +521,21 @@ pub fn run_download(
             }
             on_progress(prog);
         }
-    }) {
-        Ok(done) => done,
-        Err(e) => {
-            // 取消：清掉本次已经落盘的产物与分片残留。否则"取消"之后输出目录里
-            // 仍会多出一个视频，与用户对"取消"的预期不符。
-            if matches!(e, CoreError::Cancelled) {
-                cleanup_cancelled_outputs(&extracted_paths, &dest_paths, &merged_paths, started);
-            }
-            let _ = std::fs::remove_file(&print_file);
-            return Err(e);
-        }
-    };
-    // 最后一条进度行之后才按下取消：进程已正常结束，但用户要的是"别留东西"
-    if cancel.load(Ordering::Relaxed) {
+    })?;
+
+    if outcome.killed || cancel.load(Ordering::Relaxed) {
+        // 取消：清掉本次已经落盘的产物与分片残留。否则"取消"之后输出目录里
+        // 仍会多出一个视频，与用户对"取消"的预期不符。
         cleanup_cancelled_outputs(&extracted_paths, &dest_paths, &merged_paths, started);
         let _ = std::fs::remove_file(&print_file);
         return Err(CoreError::Cancelled);
     }
-    if !done.status.success() {
-        let err = done.stderr.trim().to_string();
+    if !outcome.status.success() {
         let _ = std::fs::remove_file(&print_file);
         return Err(CoreError::ProcessFailed {
             program: "yt-dlp".into(),
-            code: done.status.code(),
-            stderr: err,
+            code: outcome.status.code(),
+            stderr: outcome.stderr,
         });
     }
 
@@ -580,8 +559,8 @@ pub fn run_download(
     // --print-to-file 兜底：某些站点不产生 Destination/Merger 行时，
     // yt-dlp 仍会把最终路径写入此文件。优先级高于目录扫描（更精确）。
     if output_paths.is_empty() {
-        if let Ok(content) = std::fs::read_to_string(&print_file) {
-            for line in content.lines() {
+        if let Ok(bytes) = std::fs::read(&print_file) {
+            for line in crate::exec::decode_text(&bytes).lines() {
                 let line = line.trim();
                 if !line.is_empty() {
                     let pb = PathBuf::from(line);
@@ -593,17 +572,19 @@ pub fn run_download(
         }
     }
     let _ = std::fs::remove_file(&print_file);
+    // 目录扫描是**弱证据**：并发下载（默认并发 3）写同一个输出目录时，"本次之后
+    // 新增的最新一个媒体文件"完全可能是别人刚下完的产物。命中它只作提示，不落库、
+    // 不做后处理（见 DownloadOutcome::matched_by_scan 与调用方处理）。
+    let mut matched_by_scan = false;
     if output_paths.is_empty() {
         if let Some(found) = newest_media_since(&p.out_dir, started) {
-            // 兜底靠时间戳，并发任务同目录时可能认领到兄弟任务的产物：
-            // 命中必须留痕，否则事后无从判断这个文件是不是本任务下的
-            on_log(format!("产物行未解析到，按时间兜底认领：{}", found.display()));
+            matched_by_scan = true;
             output_paths.push(found);
         }
     }
     if output_paths.is_empty() {
-        let err = done.stderr;
-        let hint = if err.trim().is_empty() {
+        let err = outcome.stderr.trim();
+        let hint = if err.is_empty() {
             "下载结束但未找到本次任务的产物文件（输出目录内既有文件未被改动）".to_string()
         } else {
             format!("下载结束但未找到产物文件。yt-dlp 输出：{}", err)
@@ -615,24 +596,12 @@ pub fn run_download(
         });
     }
     // 本次没有产生新文件（只有"已下载过"的既有文件）→ 不做后处理，避免覆盖用户既有文件
-    let preexisting = merged_paths.is_empty() && dest_paths.is_empty();
+    let preexisting = !matched_by_scan && merged_paths.is_empty() && dest_paths.is_empty();
     Ok(DownloadOutcome {
         output_paths,
         preexisting,
+        matched_by_scan,
     })
-}
-
-/// 取消/结束清理（§UL-06 取消清理）：
-/// **只清理本任务私有目录与本次导出的 Cookie 临时文件**。
-///
-/// 旧实现直接删除全局 `temp/`，会连带删掉其它并发任务的临时目录与 Cookie 文件。
-pub fn cleanup_on_cancel(temp_dir: &Path, cookies_file: Option<&Path>) {
-    if temp_dir.is_dir() {
-        let _ = std::fs::remove_dir_all(temp_dir);
-    }
-    if let Some(cf) = cookies_file {
-        let _ = std::fs::remove_file(cf);
-    }
 }
 
 /// 后处理（DL-04 M1 基础版）：超画质上限降分辨率 + 音量归一化。
@@ -746,7 +715,10 @@ pub fn post_process(
     // 音频（增益到峰值 0dBFS，MAXGAIN 封顶 24dB，TC-07 语义）
     if need_gain {
         let max_v = meta.audio_volume.max_volume_db.unwrap_or(0.0);
-        let gain = (-max_v).clamp(0.0, general.max_gain_db);
+        // `max_gain_db` 理论上已被 AppConfig::sanitize 收进 >=0，这里再夹一次下限：
+        // f32::clamp 在 min > max 时直接 panic，而 panic 发生在任务线程里等于
+        // "任务卡死 + 并发额度永久少一格"（GUI 下连报错都看不到）
+        let gain = (-max_v).clamp(0.0, general.max_gain_db.max(0.0));
         if gain > 0.1 {
             on_log(format!(
                 "音量归一化：max_volume {:.1}dB → +{:.1}dB 增益",
@@ -769,77 +741,51 @@ pub fn post_process(
     args.push("-movflags".into());
     args.push("+faststart".into());
     args.push("-y".into());
-    // 进度走 stdout、stderr 只留真错误：不加这一组时 ffmpeg 每 0.5s 往 stderr
-    // 写一条统计行，libx265 重编码几十秒就够把管道缓冲写满
-    args.extend(progress_tail().iter().map(|s| s.to_string()));
     args.push(out.to_string_lossy().into_owned());
     on_log(crate::exec::display_command("ffmpeg", &args));
 
     let mut cmd = resolver.command(Tool::Ffmpeg)?;
     cmd.args(&args);
-    // 旧写法把 stderr 设成 piped 却等进程退出之后才读：ffmpeg 的 stderr 写满管道
-    // 缓冲后阻塞在 write()，try_wait 永远返回 None —— 开启"画质上限/音量归一化"
-    // 的后处理必然卡在"后处理中"，只有取消能解开。Monitored 在独立线程排空两条管道。
-    let mut monitored = Monitored::spawn(&mut cmd)?;
-    let done = match monitored.pump(cancel, |_| {}) {
-        Ok(done) => done,
-        Err(e) => {
-            let _ = std::fs::remove_file(&out);
-            return Err(e);
+    cmd.stdout(Stdio::null()).stderr(Stdio::piped());
+    let mut guard = ChildGuard::spawn(&mut cmd)?;
+    // 简单等待（后处理通常较快；取消支持）
+    loop {
+        match guard.try_wait()? {
+            Some(_) => break,
+            None => {
+                if cancel.load(Ordering::Relaxed) {
+                    guard.kill_tree();
+                    let _ = std::fs::remove_file(&out);
+                    return Err(CoreError::Cancelled);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
         }
-    };
-    if !done.status.success() {
-        on_log(format!("后处理失败（保留原文件）：{}", done.stderr.trim()));
+    }
+    let status = guard.wait()?;
+    if !status.success() {
+        let err = guard
+            .stderr()
+            .map(|mut e| crate::exec::drain_stderr(&mut e))
+            .unwrap_or_default();
+        on_log(format!("后处理失败（保留原文件）：{}", err));
         let _ = std::fs::remove_file(&out);
         return Ok((input.to_path_buf(), meta.clone()));
     }
-    // 产物校验：降过分辨率才要求"能读出主视频流"；只做音量增益的音频产物根本没有
-    // 视频流，旧实现一律走 verify_video，于是**仅音频下载的后处理永远"校验失败"**，
-    // 归一化被静默跳过（日志只留一条误导性提示）。
-    let verified = if need_downscale {
-        verify_video(resolver, &out)
-    } else {
-        std::fs::metadata(&out).map(|m| m.len() >= 1024).unwrap_or(false)
-    };
-    if !verified {
+    // 产物校验（§1.3：校验成功后才原子替换）——能读出主视频流才算成功
+    if !verify_video(resolver, &out) {
         on_log("后处理产物校验失败（保留原文件）".to_string());
-        let _ = remove_with_retry(&out);
+        let _ = std::fs::remove_file(&out);
         return Ok((input.to_path_buf(), meta.clone()));
     }
-    // 后处理产物作为**新文件**落地，原文件一个字都不动。
-    //
-    // 原来 rename 覆盖 input：用户点一次下载，桌面上那个 `视频.mp4` 的内容就被
-    // 换成 HEVC 了 —— 这与 build_args 里特意加 `--no-overwrites`（"避免原地重编码
-    // 覆盖用户既有文件"）的策略自相矛盾，也违反 §1.3"失败安全、不破坏原文件"。
-    let dir = input.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
-    let stem = input
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "output".to_string());
-    let ext = input
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("mp4")
-        .to_ascii_lowercase();
-    let final_path = match crate::paths::unique_output_path(
-        &dir,
-        &format!("{stem}.opt"),
-        &ext,
-        "auto_inc",
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            on_log(format!("后处理产物命名失败，保留中间文件：{e}"));
-            return Ok((out.clone(), meta.clone()));
-        }
-    };
-    if let Err(e) = std::fs::rename(&out, &final_path) {
-        on_log(format!("后处理产物落地失败（保留原文件）：{e}"));
-        let _ = remove_with_retry(&out);
+    // 原子替换：Windows 上 std::fs::rename 直接覆盖已存在目标
+    // （MOVEFILE_REPLACE_EXISTING），不再"先删后改名"——那样中途失败会连原文件一起丢。
+    if let Err(e) = std::fs::rename(&out, input) {
+        on_log(format!("后处理产物替换失败（保留原文件）：{e}"));
+        let _ = std::fs::remove_file(&out);
         return Ok((input.to_path_buf(), meta.clone()));
     }
-    on_log(format!("后处理完成，产物：{}", final_path.display()));
-    Ok((final_path, meta.clone()))
+    Ok((input.to_path_buf(), meta.clone()))
 }
 
 /// 产物校验：ffprobe 能解析且存在主视频流。
@@ -854,8 +800,6 @@ fn verify_video(resolver: &ToolResolver, path: &Path) -> bool {
         "stream=codec_name",
         "-of",
         "csv=p=0",
-        // 输入放 `-i` 的值位，`-` 开头的文件名才不会被当成选项
-        "-i",
         p.as_str(),
     ];
     match crate::exec::run_tool_capture(resolver, Tool::Ffprobe, &args) {

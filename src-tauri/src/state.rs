@@ -1,7 +1,7 @@
 //! 应用全局状态：路径、配置、历史列表、并发队列、取消注册表。
 
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -33,9 +33,6 @@ impl From<ytdlp_core::cli::CliArgs> for CliOverrides {
     }
 }
 
-/// 解析队列容量：满时调用方退化为一次性线程，绝不静默丢任务。
-const PROBE_QUEUE_CAP: usize = 512;
-
 pub struct AppState {
     pub paths: Paths,
     pub history: Mutex<History>,
@@ -47,11 +44,12 @@ pub struct AppState {
     pub merge_jobs: Mutex<HashMap<String, crate::commands::MergeJob>>,
     /// CLI 本次调用级覆盖（--dir/--cookies/--yt-dlp-path/--deno-path）
     pub cli: Mutex<CliOverrides>,
-    /// 解析任务投递口（固定线程池消费）
-    pub probe_tx: std::sync::mpsc::SyncSender<String>,
-    probe_rx: Arc<Mutex<std::sync::mpsc::Receiver<String>>>,
-    /// 串行化"快照 → 写盘"全程
+    /// 历史写盘串行锁（同一时刻只有一个写入者）
     persist_lock: Mutex<()>,
+    /// persist 请求序号（每调用一次 +1）
+    persist_req: AtomicU64,
+    /// 已完成写盘的请求序号（写盘时取"当时最高的请求序号"）
+    persist_done: AtomicU64,
 }
 
 impl AppState {
@@ -62,16 +60,17 @@ impl AppState {
             Ok(c) => c,
             Err(e) => {
                 // 损坏文件已在 load 内备份为 .corrupt-<ts>.json；回退默认并告警
-                eprintln!("config 加载失败（回退默认设置）：{}", e);
+                ytdlp_core::log::error(format!("config 加载失败（回退默认设置）：{e}"));
                 AppConfig::default()
             }
         };
-        let history = History::load(&paths.history_file()).unwrap_or_else(|e| {
-            eprintln!("history 加载失败（回退空列表）：{}", e);
+        let mut history = History::load(&paths.history_file()).unwrap_or_else(|e| {
+            ytdlp_core::log::error(format!("history 加载失败（回退空列表）：{e}"));
             History::default()
         });
+        // 设置页的"历史上限"要真正生效（此前只存在于配置里，UI 只能标注"暂未生效"）
+        history.set_limit(config.general.history_limit);
         let concurrency = config.general.concurrency as usize;
-        let (probe_tx, probe_rx) = std::sync::mpsc::sync_channel::<String>(PROBE_QUEUE_CAP);
         Self {
             paths,
             history: Mutex::new(history),
@@ -80,25 +79,10 @@ impl AppState {
             cancels: Mutex::new(HashMap::new()),
             merge_jobs: Mutex::new(HashMap::new()),
             cli: Mutex::new(CliOverrides::default()),
-            probe_tx,
-            probe_rx: Arc::new(Mutex::new(probe_rx)),
             persist_lock: Mutex::new(()),
+            persist_req: AtomicU64::new(0),
+            persist_done: AtomicU64::new(0),
         }
-    }
-
-    /// 解析队列接收端（供 lib.rs 启动固定数量的解析线程）。
-    pub fn probe_receiver(&self) -> Arc<Mutex<std::sync::mpsc::Receiver<String>>> {
-        self.probe_rx.clone()
-    }
-
-    /// 投递一个解析任务。返回 Err 表示队列已满，调用方需自行退化处理。
-    pub fn submit_probe(&self, id: &str) -> Result<(), String> {
-        self.probe_tx
-            .try_send(id.to_string())
-            .map_err(|e| match e {
-                std::sync::mpsc::TrySendError::Full(_) => "解析队列已满".to_string(),
-                std::sync::mpsc::TrySendError::Disconnected(_) => "解析池已关闭".to_string(),
-            })
     }
 
     /// 当前工具解析器（按 config 依赖段构造；CLI 覆盖优先）。
@@ -136,16 +120,27 @@ impl AppState {
     }
 
     /// 持久化历史（变更即原子写，写失败降级为内存态并告警）。
+    ///
+    /// §11.15 锁纪律：锁内只取快照，序列化 + 写盘在锁外——
+    /// 持锁写盘（满载 100 条 × 300 行日志时毫秒到百毫秒级）会阻塞所有 update_item。
+    ///
+    /// 但"锁外写"意味着多个任务线程可能同时写（每个任务收尾都 persist）：
+    /// - 临时文件名已按 `pid + 序号` 隔离，互相不会截断（见 `paths::atomic_write_json`）；
+    /// - 这里再把写入者串行化，并做**写合并**：同时刻多个请求只需最后那一次写盘
+    ///   （写盘者取的是"当时最高请求号"对应的最新快照，被覆盖的请求直接返回）。
+    ///   批量任务（播放列表展开、批量转码）收尾时的 N 次多 MB 写盘会收敛成 1 次。
     pub fn persist(&self) {
-        // §11.15 锁纪律：锁内只取快照，序列化 + 写盘在锁外——
-        // 持锁写盘（满载 100 条 × 300 行日志时毫秒到百毫秒级）会阻塞所有 update_item
-        //
-        // 但"快照"也必须在这把锁之内取：只串行化写盘的话，A 先快照、B 后快照，
-        // B 先落盘、A 后落盘，磁盘上留下的仍是**较旧**的那份（丢更新）。
-        let _w = self.persist_lock.lock();
+        let my_seq = self.persist_req.fetch_add(1, Ordering::SeqCst) + 1;
+        let _writer = self.persist_lock.lock();
+        let highest = self.persist_req.load(Ordering::SeqCst);
+        if self.persist_done.load(Ordering::SeqCst) >= my_seq {
+            // 已有写入者用不早于我这轮的快照写过盘了
+            return;
+        }
         let snapshot = self.history.lock().clone();
-        if let Err(e) = snapshot.save(&self.paths.history_file()) {
-            eprintln!("history 持久化失败（保持内存态）：{}", e);
+        match snapshot.save(&self.paths.history_file()) {
+            Ok(()) => self.persist_done.store(highest, Ordering::SeqCst),
+            Err(e) => ytdlp_core::log::error(format!("history 持久化失败（保持内存态）：{e}")),
         }
     }
 }

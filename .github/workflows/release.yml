@@ -71,9 +71,23 @@ jobs:
           Compress-Archive -Path $Exe -DestinationPath "$Root\$ZipName" -Force
           Write-Host "ZIP: $ZipName"
 
-      - name: 发布 GitHub Release（zip 附件）
+      # 产物未做代码签名（Windows 用户首次运行会遇到 SmartScreen 拦截），
+      # 至少给出校验和，让用户能确认下载内容与构建产出一致
+      - name: 生成校验和（SHA256SUMS.txt）
+        shell: pwsh
+        run: |
+          $Root = $env:GITHUB_WORKSPACE
+          $Tag = $env:GITHUB_REF_NAME
+          $Zip = "ytdlp-FFmpeg-GUI-$Tag-win64.zip"
+          $Hash = (Get-FileHash -Algorithm SHA256 "$Root\$Zip").Hash.ToLower()
+          "$Hash  $Zip" | Out-File -Encoding ascii "$Root\SHA256SUMS.txt"
+          Write-Host "SHA256: $Hash"
+
+      - name: 发布 GitHub Release（zip + 校验和）
         uses: softprops/action-gh-release@v3
         with:
-          files: ytdlp-FFmpeg-GUI-${{ github.ref_name }}-win64.zip
+          files: |
+            ytdlp-FFmpeg-GUI-${{ github.ref_name }}-win64.zip
+            SHA256SUMS.txt
           draft: true
           generate_release_notes: true

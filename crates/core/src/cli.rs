@@ -20,7 +20,26 @@ impl CliArgs {
     /// 是否有任何待执行动作（URL 或路径覆盖）。
     pub fn has_action(&self) -> bool {
         !self.urls.is_empty()
+            || self.dir.is_some()
+            || self.cookies.is_some()
+            || self.yt_dlp_path.is_some()
+            || self.deno_path.is_some()
     }
+}
+
+/// 取下一个参数作为选项值。
+///
+/// 缺值、空值、以及"值其实是另一个选项"（以 `-` 开头）都视为**缺值且不消耗**该
+/// 参数，让它自己按选项解析。否则 `--cookies --dir D:\out` 会把 `--dir` 当成
+/// cookie 文件路径、再把 `D:\out` 当裸参数收进 URL 列表（`add_url` 又按"非 http"
+/// 丢弃），整条命令静默无动作，用户完全看不出哪里错了。
+fn take_value(it: &mut std::slice::Iter<'_, String>) -> Option<String> {
+    let v = it.clone().next()?;
+    if v.is_empty() || v.starts_with('-') {
+        return None;
+    }
+    it.next();
+    Some(v.clone())
 }
 
 /// 解析命令行参数（不含 argv[0]）。
@@ -33,16 +52,14 @@ pub fn parse_cli_args(args: &[String]) -> CliArgs {
     while let Some(a) = it.next() {
         match a.as_str() {
             "--url" | "-u" => {
-                if let Some(v) = it.next() {
-                    if !v.is_empty() {
-                        out.urls.push(v.clone());
-                    }
+                if let Some(v) = take_value(&mut it) {
+                    out.urls.push(v);
                 }
             }
-            "--cookies" => out.cookies = it.next().filter(|v| !v.is_empty()).cloned(),
-            "--dir" => out.dir = it.next().filter(|v| !v.is_empty()).cloned(),
-            "--yt-dlp-path" => out.yt_dlp_path = it.next().filter(|v| !v.is_empty()).cloned(),
-            "--deno-path" => out.deno_path = it.next().filter(|v| !v.is_empty()).cloned(),
+            "--cookies" => out.cookies = take_value(&mut it),
+            "--dir" => out.dir = take_value(&mut it),
+            "--yt-dlp-path" => out.yt_dlp_path = take_value(&mut it),
+            "--deno-path" => out.deno_path = take_value(&mut it),
             "--help" | "-h" | "--version" | "-v" => { /* 参数保留在 urls 外的语义：忽略 */
             }
             other => {
@@ -108,6 +125,23 @@ mod tests {
         let c = parse_cli_args(&a(&["--dir"]));
         assert_eq!(c.dir, None);
         assert!(!c.has_action());
+    }
+
+    #[test]
+    fn option_value_does_not_swallow_next_flag() {
+        // `--cookies` 后面跟的是另一个选项 → 视为缺值，且不能把 --dir 消耗掉
+        let c = parse_cli_args(&a(&["--cookies", "--dir", "D:\\out"]));
+        assert_eq!(c.cookies, None);
+        assert_eq!(c.dir.as_deref(), Some("D:\\out"));
+        assert!(c.urls.is_empty(), "D:\\out 不应被当成 URL：{:?}", c.urls);
+    }
+
+    #[test]
+    fn has_action_covers_pure_overrides() {
+        // 只带覆盖项（不带 URL）也是"有动作"：主进程要把 --dir 应用到本实例
+        assert!(parse_cli_args(&a(&["--dir", "D:\\out"])).has_action());
+        assert!(parse_cli_args(&a(&["--deno-path", "C:\\deno.exe"])).has_action());
+        assert!(!parse_cli_args(&a(&["--help"])).has_action());
     }
 
     #[test]

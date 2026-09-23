@@ -88,26 +88,32 @@ fn build_login_window(app: &AppHandle, host: &str, url: &str) -> Result<(), Stri
     .initialization_script(&script)
     // close / done 两个"魔法 URL"的嗅探走导航开始事件：即使 127.0.0.1 上没人监听
     // （导航必然失败）也能触发，返回 false 顺手取消这次无意义的导航。
+    //
+    // 判定必须用**结构化字段全等**（scheme+host+port+path），不能用
+    // `url.contains("ytdlp-login-done")`：任何被登录窗加载的页面（广告 iframe、
+    // 被劫持的跳转）只要导航到含该子串的地址，就能带着自己构造的 `cookies=…`
+    // 走进"保存 Cookie"分支，把攻击者给的凭据写进该站点的 cookie 库。
     .on_navigation(move |url| {
-        let target = url.as_str();
-        if target.contains("ytdlp-login-close") {
-            let app = app_for_nav.clone();
-            std::thread::spawn(move || close_login_window(&app));
-            return false;
+        match classify_magic_url(url) {
+            Some(MagicNav::Close) => {
+                let app = app_for_nav.clone();
+                std::thread::spawn(move || close_login_window(&app));
+                return false;
+            }
+            Some(MagicNav::Done) => {
+                let app = app_for_nav.clone();
+                let host = host_for_nav.clone();
+                let done = url.to_string();
+                // 回调在主线程：保存流程（with_webview + 泵消息、写 Cookie、关窗）一律下放子线程
+                std::thread::spawn(move || {
+                    if let Some(win) = app.get_webview_window("ytdlp-login") {
+                        handle_login_done(&win, &host, &done);
+                    }
+                });
+                return false;
+            }
+            None => true,
         }
-        if target.contains("ytdlp-login-done") {
-            let app = app_for_nav.clone();
-            let host = host_for_nav.clone();
-            let done = target.to_string();
-            // 回调在主线程：保存流程（with_webview + 泵消息、写 Cookie、关窗）一律下放子线程
-            std::thread::spawn(move || {
-                if let Some(win) = app.get_webview_window("ytdlp-login") {
-                    handle_login_done(&win, &host, &done);
-                }
-            });
-            return false;
-        }
-        true
     })
     .build()
     .map_err(|e| format!("打开登录窗口失败：{}", e))?;
@@ -117,6 +123,30 @@ fn build_login_window(app: &AppHandle, host: &str, url: &str) -> Result<(), Stri
 fn close_login_window(app: &AppHandle) {
     if let Some(win) = app.get_webview_window("ytdlp-login") {
         let _ = win.close();
+    }
+}
+
+/// 注入脚本使用的两个"魔法 URL"（关窗 / 登录完成）。
+const CLOSE_URL: &str = "http://127.0.0.1/ytdlp-login-close";
+const DONE_URL: &str = "http://127.0.0.1/ytdlp-login-done";
+
+/// 魔法 URL 的判定结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MagicNav {
+    Close,
+    Done,
+}
+
+/// 严格识别魔法 URL：必须是 `http://127.0.0.1[:80]` 上的固定路径，查询串不参与
+/// 判定（`cookies=…` 由保存流程自己解析）。返回 None 表示这是普通导航，放行。
+fn classify_magic_url(url: &url::Url) -> Option<MagicNav> {
+    if url.scheme() != "http" || url.host_str() != Some("127.0.0.1") || url.port().is_some() {
+        return None;
+    }
+    match url.path() {
+        "/ytdlp-login-close" => Some(MagicNav::Close),
+        "/ytdlp-login-done" => Some(MagicNav::Done),
+        _ => None,
     }
 }
 
@@ -334,5 +364,35 @@ mod tests {
         assert!(LOGIN_USER_AGENT.contains("Chrome/"));
         assert!(!LOGIN_USER_AGENT.contains("Edg/"));
         assert!(!LOGIN_USER_AGENT.contains("WebView2"));
+    }
+
+    #[test]
+    fn injected_script_uses_the_magic_urls() {
+        // 注入脚本里的 URL 必须与 classify_magic_url 认得的一模一样
+        let s = login_inject_script();
+        assert!(s.contains(CLOSE_URL), "脚本缺少关闭 URL");
+        assert!(s.contains(DONE_URL), "脚本缺少登录完成 URL");
+    }
+
+    #[test]
+    fn magic_url_matching_is_strict() {
+        for raw in [
+            "http://127.0.0.1/ytdlp-login-close",
+            "http://127.0.0.1/ytdlp-login-done?host=x&cookies=y",
+        ] {
+            let u = url::Url::parse(raw).unwrap();
+            assert!(classify_magic_url(&u).is_some(), "{raw} 应被识别");
+        }
+        // 关键回归：任意页面只要"碰巧"带了魔法词，不得触发关窗/保存 Cookie
+        for raw in [
+            "https://evil.example/ytdlp-login-done?cookies=SID%3Dx",
+            "http://evil.example/ytdlp-login-close",
+            "http://127.0.0.1:8080/ytdlp-login-done",
+            "http://127.0.0.1/other/ytdlp-login-done",
+            "http://127.0.0.1.evil.example/ytdlp-login-done",
+        ] {
+            let u = url::Url::parse(raw).unwrap();
+            assert!(classify_magic_url(&u).is_none(), "{raw} 不应被识别");
+        }
     }
 }

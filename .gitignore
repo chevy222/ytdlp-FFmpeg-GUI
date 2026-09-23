@@ -14,6 +14,8 @@ src-tauri/target
 *.msi
 dist/
 node_modules/
+# Tauri 生成的 ACL/能力 schema（每次依赖升级都会重生成，不入库）
+src-tauri/gen/schemas/
 
 # 编辑器
 .idea/

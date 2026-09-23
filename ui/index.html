@@ -347,6 +347,18 @@
   </div>
 </div>
 
+<!-- ===== 确认弹窗（Promise 版：window.confirm 会阻塞 WebView2 的 JS 线程，下载中弹框会让进度停摆） ===== -->
+<div class="modal small" id="confirmModal">
+  <div class="box">
+    <div class="hd"><span>确认</span></div>
+    <div class="bd stack"><div id="confirmText"></div></div>
+    <div class="ft"><span class="sp"></span>
+      <button class="btn sm" data-confirm="0">取消</button>
+      <button class="btn sm primary" data-confirm="1">确定</button>
+    </div>
+  </div>
+</div>
+
 <!-- ===== 格式选择弹窗 ===== -->
 <div class="modal small" id="fmtModal">
   <div class="box">
@@ -429,6 +441,8 @@ function toast(msg) {
 // ===== 渲染 =====
 const ST_CLS = { Probing:'probing', Ready:'ready', Downloading:'downloading', PostProcessing:'working', Transcoding:'working', Merging:'working', Done:'done', Failed:'failed', Canceled:'canceled', NeedLogin:'needlogin' };
 const ST_LABEL = { Probing:'解析中', Ready:'已就绪', Downloading:'下载中', PostProcessing:'后处理中', Transcoding:'转码中', Merging:'合并中', Done:'已完成', Failed:'失败', Canceled:'已取消', NeedLogin:'需要登录' };
+// 进行中的状态：后端会拒绝删除这类条目（"请先取消再删除"），兜底轮询与批量删除也按这份清单判断
+const BUSY_STATUS = ['Probing','Downloading','PostProcessing','Transcoding','Merging'];
 
 function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
@@ -509,6 +523,9 @@ function ops(it){
   if (s==='Failed'||s==='Canceled'||s==='NeedLogin') h += '<button class="btn sm" data-act="retry" data-id="'+id+'">重试</button>';
   if (s==='Done') h += '<button class="btn sm" data-act="open" data-id="'+id+'">打开</button>';
   if (s==='Done'||s==='Failed'||s==='Canceled') h += '<button class="btn sm" data-act="del" data-id="'+id+'">删除</button>';
+  // 解析/下载/后处理/转码/合并中后端会拒绝 remove_item（"请先取消再删除"）：
+  // 只画一个不可点的删除示意，别让用户点了才发现删不掉
+  if (BUSY_STATUS.includes(s)) h += '<button class="btn sm" disabled title="任务正在运行，请先取消再删除">删除</button>';
   h += '<button class="btn sm icon" data-act="log" data-id="'+id+'" title="日志">'+
     '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="16" y2="17"/></svg></button>';
   h += '</div>';
@@ -542,7 +559,7 @@ function rowHtml(it){
   const hasFile = it.kind!=='UrlTask' || ['PostProcessing','Done','Transcoding'].includes(it.status);
   const cv = probing
     ? '<div class="cv"><div class="thumb empty"><span class="ph">影</span></div></div>'
-    : '<div class="cv"><div class="thumb'+(it.thumb?'':' empty')+(ang?' rot'+(ang%360):'')+'" data-id="'+id+'">'+(it.thumb?('<img src="'+thumbSrc(it.thumb)+'" alt="">'):'<span class="ph">影</span>')+'</div>'+
+    : '<div class="cv"><div class="thumb'+(it.thumb?'':' empty')+(ang?' rot'+(ang%360):'')+'" data-id="'+id+'">'+(it.thumb?('<img src="'+esc(thumbSrc(it.thumb))+'" alt="">'):'<span class="ph">影</span>')+'</div>'+
       '<span class="rotbadge'+(ang?' show':'')+'">'+ang+'°</span></div>';
   const rots = (probing || !hasFile) ? '' :
       '<button class="rotbtn" data-act="rotcw" data-id="'+id+'" title="顺时针">'+rotSvg(true)+'</button>'+
@@ -581,10 +598,23 @@ function renderBatch(){
   document.getElementById('batchbar').classList.toggle('show',n>0);
   document.getElementById('selCount').textContent=n;
 }
+// 队列读数以后端 queue_status 为准：本地只能数"状态看起来在跑"的条目，
+// 排队中的会被算成运行中，出现"运行中 5/3（并发上限）"这种读不懂的数字
+let qstat=null;
 function renderQueue(){
-  const running=S.items.filter(i=>['Downloading','PostProcessing','Transcoding','Merging'].includes(i.status)).length;
+  const el=document.getElementById('queueInfo');
   const c=S.config&&S.config.general?S.config.general.concurrency:3;
-  document.getElementById('queueInfo').textContent='运行中 '+running+'/'+c+'（并发上限）';
+  if(qstat){
+    el.textContent='运行中 '+qstat.running+'/'+(qstat.concurrency||c)+(qstat.waiting?' · 排队 '+qstat.waiting:'');
+    return;
+  }
+  // 后端读数拿不到（调用失败）时退回本地计数，绝不显示"未知"
+  const running=S.items.filter(i=>['Downloading','PostProcessing','Transcoding','Merging'].includes(i.status)).length;
+  el.textContent='运行中 '+running+'/'+c+'（并发上限）';
+}
+function refreshQueue(){
+  INVOKE('queue_status').then(s=>{ qstat=(s&&typeof s.running==='number')?s:null; renderQueue(); })
+    .catch(()=>{ qstat=null; renderQueue(); });
 }
 function pickLocalFiles(){
   window.__TAURI__.dialog.open({ multiple:true, directory:false,
@@ -604,11 +634,62 @@ let __renderQueued=false;
 function scheduleRender(){
   if(!__renderQueued){__renderQueued=true;setTimeout(()=>{__renderQueued=false;render();},200);}
 }
+// 进度事件每秒 5 次：整表重建会把所有 <img> 重新创建、勾选与滚动位置也一起丢，
+// 所以只 patch 这一行的进度单元格与状态 chip（元素层次与 progressCell 保持一致）。
+// 安全网：行或节点对不上（状态切换、速度有无变化导致结构不同）→ 退回整表 render，
+// 宁可多重建一次也绝不允许"进度不动了"
+function patchRow(it){
+  const row=document.querySelector('tr[data-id="'+CSS.escape(it.id)+'"]');
+  if(!row){scheduleRender();return;}
+  const chip=row.querySelector('.chip');
+  const td=row.children[4];                       // 列序：勾选/名称/画质/状态/进度/操作
+  const prog=td?td.querySelector('.prog'):null;
+  const pct=prog?prog.firstChild:null;            // progressCell 里 "12.3%" 是 .prog 的首个文本节点
+  const spd=prog?prog.querySelector('.spd'):null; // 有速度才有这个 span
+  const bar=prog?prog.querySelector('.bar > i'):null;
+  // chip 的 class 与状态不一致 = 这一行已经过时（状态切换的 item:update 还没渲染），
+  // 整表重画才能把操作按钮一并换成新状态该有的那一套；速度文本的有无也按 progressCell 对齐
+  const hasSpd=!!spd, wantSpd=!!it.speed;
+  if(!chip||!prog||!pct||pct.nodeType!==3||!bar||hasSpd!==wantSpd||chip.className!=='chip '+(ST_CLS[it.status]||'')){scheduleRender();return;}
+  const p=Math.min(100,Math.max(0,it.percent||0));
+  chip.textContent=ST_LABEL[it.status]||it.status;
+  pct.nodeValue=p.toFixed(1)+'%';
+  if(spd)spd.textContent=' '+(it.speed||'')+(it.eta?' · ETA '+it.eta:'');
+  bar.style.width=p+'%';
+}
 function upsertItem(it){
   const i=S.items.findIndex(x=>x.id===it.id);
   if(i>=0)S.items[i]=it;else S.items.unshift(it);
   scheduleRender();
 }
+
+// ===== 确认弹窗（Promise 版）=====
+// window.confirm 会阻塞 WebView2 的 JS 线程：下载中弹一下，进度事件就全停摆，
+// 所以用页面已有的 modal 结构做异步确认框
+let askResolve=null;
+function askConfirm(msg){
+  const el=document.getElementById('confirmModal');
+  const txt=el?document.getElementById('confirmText'):null;
+  const btnYes=el?el.querySelector('[data-confirm="1"]'):null;
+  // 本机没有浏览器可验证 UI：万一弹窗节点缺失就直接退回同步 confirm，
+  // 宁可回到旧行为，也不能出现"点了没反应"
+  if(!el||!txt||!btnYes)return Promise.resolve(window.confirm(msg));
+  txt.textContent=msg;
+  // 上一个确认还没答完就再弹（如批量操作连点）：直接当取消，别让 Promise 悬挂
+  if(askResolve){const r=askResolve;askResolve=null;r(false);}
+  el.classList.add('show');
+  btnYes.focus();
+  return new Promise(res=>{ askResolve=res; });
+}
+function closeConfirm(ok){
+  const el=document.getElementById('confirmModal');
+  if(el)el.classList.remove('show');
+  if(askResolve){const r=askResolve;askResolve=null;r(!!ok);}
+}
+const confirmEl=document.getElementById('confirmModal');
+if(confirmEl)confirmEl.addEventListener('click',e=>{
+  const b=e.target.closest('[data-confirm]'); if(b)closeConfirm(b.dataset.confirm==='1');
+});
 
 // ===== 列表交互 =====
 document.getElementById('tbody').addEventListener('click', e=>{
@@ -616,11 +697,11 @@ document.getElementById('tbody').addEventListener('click', e=>{
   if(!act)return;
   const a=act.dataset.act, id=act.dataset.id;
   if(a==='dl')startDownload(id);
-  else if(a==='tc')INVOKE('start_transcode',{ids:[id]}).catch(err=>toast(err));
-  else if(a==='cancel')INVOKE('cancel_item',{id}).catch(err=>toast(err));
+  else if(a==='tc')INVOKE('start_transcode',{ids:[id]}).then(refreshQueue).catch(err=>toast(err));
+  else if(a==='cancel')INVOKE('cancel_item',{id}).then(refreshQueue).catch(err=>toast(err));
   else if(a==='retry')INVOKE('retry_item',{id}).then(()=>toast('已重新解析')).catch(err=>toast(err));
   else if(a==='relogin')INVOKE('relogin_item',{id}).catch(err=>toast(err));
-  else if(a==='del'){ if(confirm('删除该条目？')) INVOKE('remove_item',{id}).catch(err=>toast(err)); }
+  else if(a==='del'){ askConfirm('删除该条目？').then(ok=>{ if(ok) INVOKE('remove_item',{id}).catch(err=>toast(err)); }); }
   else if(a==='open')INVOKE('open_item_dir',{id}).catch(err=>toast(err));
   else if(a==='log'||a==='err')openLog(id);
   else if(a==='fmt')openFmt(id);
@@ -674,19 +755,31 @@ try{
 }catch(err){ console.warn('drag-drop unavailable:',err); }
 document.getElementById('btnClearList').addEventListener('click', ()=>{
   if(!S.items.length){toast('列表已是空的');return;}
-  if(!confirm('清空列表全部 '+S.items.length+' 个条目？'))return;
-  Promise.all(S.items.map(i=>INVOKE('remove_item',{id:i.id}).catch(()=>{}))).then(()=>{S.items=[];S.selected.clear();render();toast('列表已清空');});
+  askConfirm('清空列表（已完成/失败/已取消的条目会被移除，进行中的保留）？').then(ok=>{
+    if(!ok)return;
+    // 用 clear_done：后端只删终态条目，进行中的任务不会被"清"掉
+    // （旧实现对每个条目发 remove_item 并吞掉错误，进行中的条目静默留下、本地列表却清空了）
+    INVOKE('clear_done').then(()=>refreshQueue()).catch(err=>toast(err));
+  });
 });
 document.getElementById('btnDelSel').addEventListener('click', ()=>{
-  if(!confirm('删除选中的 '+S.selected.size+' 个条目？'))return;
-  Promise.all([...S.selected].map(id=>INVOKE('remove_item',{id}).catch(()=>{}))).then(()=>{S.selected.clear();render();});
+  const ids=[...S.selected];
+  // 进行中的条目后端会拒绝删除（"请先取消再删除"）：先滤掉并如实告知，
+  // 而不是发出去再把错误吞掉（用户只会看到"点删了但没删掉"）
+  const busy=ids.filter(id=>{const it=S.items.find(x=>x.id===id);return it&&BUSY_STATUS.includes(it.status);});
+  const okIds=ids.filter(id=>!busy.includes(id));
+  if(!okIds.length){toast('选中的条目都在进行中，请先取消');return;}
+  askConfirm('删除选中的 '+okIds.length+' 个条目？'+(busy.length?('（'+busy.length+' 个进行中的已跳过）'):'')).then(ok=>{
+    if(!ok)return;
+    Promise.all(okIds.map(id=>INVOKE('remove_item',{id}).catch(err=>toast(err)))).then(()=>{S.selected.clear();render();});
+  });
 });
 document.getElementById('btnRotCW').addEventListener('click',()=>batchRot(90));
 document.getElementById('btnRotCCW').addEventListener('click',()=>batchRot(-90));
 document.getElementById('btnTranscode').addEventListener('click',()=>{
   if(!S.selected.size){toast('请先勾选条目');return;}
   const ids=[...S.selected];
-  INVOKE('start_transcode',{ids}).then(()=>{S.selected.clear();render();}).catch(err=>toast(err));
+  INVOKE('start_transcode',{ids}).then(()=>{S.selected.clear();render();refreshQueue();}).catch(err=>toast(err));
 });
 document.getElementById('btnMerge').addEventListener('click',openMerge);
 
@@ -697,7 +790,15 @@ function addUrls(){
   INVOKE('add_url',{urls}).then(()=>{document.getElementById('urlInput').value='';}).catch(err=>toast(err));
 }
 function startDownload(id, formatId, audioOnly){
-  INVOKE('start_download',{id,formatId:formatId||null,audioOnly:audioOnly||false}).then(()=>stopCountdown(id)).catch(err=>toast(err));
+  // 行内"下载"与 5 秒倒计时自动下载都不带参数：这里补上条目已记住的选择，
+  // 否则用户选过的格式/仅音频会在这一步被丢成 null（后端还会把它们写回条目）
+  const it=S.items.find(i=>i.id===id);
+  if(it){
+    if(formatId===undefined)formatId=it.format_id;
+    if(audioOnly===undefined)audioOnly=!!it.audio_only;
+  }
+  INVOKE('start_download',{id,formatId:formatId||null,audioOnly:audioOnly||false})
+    .then(()=>{stopCountdown(id);refreshQueue();}).catch(err=>toast(err));
 }
 function rotItem(id,delta){
   const it=S.items.find(i=>i.id===id); if(!it)return;
@@ -706,7 +807,8 @@ function rotItem(id,delta){
   const next=((cur+delta)%360+360)%360;
   it.rot_angle=next;
   render();
-  INVOKE('rot_item',{id,degrees:next}).catch(()=>{});
+  // 失败必须提示：以前静默吞掉，角度只在本机变、下次刷新又回退，用户完全看不懂
+  INVOKE('rot_item',{id,degrees:next}).catch(err=>toast(err));
   render();
 }
 function batchRot(delta){ [...S.selected].forEach(id=>rotItem(id,delta)); }
@@ -771,7 +873,7 @@ document.getElementById('btnMergeOk').addEventListener('click',()=>{
   const encoder=document.getElementById('mergeEncoder').value;
   const normalize=document.getElementById('mergeNorm').checked;
   INVOKE('start_merge',{ids,filename,container,encoder,normalize})
-    .then(()=>{M.ids=[];S.selected.clear();render();closeMerge();toast('已开始合并');})
+    .then(()=>{M.ids=[];S.selected.clear();render();refreshQueue();closeMerge();toast('已开始合并');})
     .catch(err=>toast(err));
 });
 
@@ -896,7 +998,13 @@ function openLog(id){
   const box=document.querySelector('#logModal .log-list');
   if(box)box.scrollTop=box.scrollHeight;
 }
-function clearLogView(){document.getElementById('logList').innerHTML='<li>（已清空）</li>';}
+function clearLogView(){
+  document.getElementById('logList').innerHTML='<li>（已清空）</li>';
+  // 只清 DOM 的话数据还在 it.log 里，关闭再打开（openLog 按 it.log 全量渲染）旧日志又全回来
+  const it=S.items.find(i=>i.id===logId);
+  if(it)it.log=[];
+  toast('已清空（该条目的日志）');
+}
 function copyLogView(){
   const lis=document.querySelectorAll('#logList li');
   const text=Array.from(lis).map(li=>li.textContent).join('\n');
@@ -911,8 +1019,11 @@ function openSettings(){
 }
 function closeSettings(){
   // 防呆：改了没保存就关闭（分流站点/代理不生效的最常见原因），确认后再丢
-  if(S.configSaved!=null && JSON.stringify(S.config)!==S.configSaved && !confirm('设置有未保存的修改，确定关闭（修改将丢失）？'))return;
-  document.getElementById('settingsModal').classList.remove('show');
+  const changed=S.configSaved!=null && JSON.stringify(S.config)!==S.configSaved;
+  if(!changed){document.getElementById('settingsModal').classList.remove('show');return;}
+  askConfirm('设置有未保存的修改，确定关闭（修改将丢失）？').then(ok=>{
+    if(ok)document.getElementById('settingsModal').classList.remove('show');
+  });
 }
 document.getElementById('setNav').addEventListener('click', e=>{
   const b=e.target.closest('button[data-page]'); if(!b)return;
@@ -982,7 +1093,8 @@ function renderSetPage(){
     if(S.hw===undefined)probeHw();
     h+=row('长边上限 MAXW',num('transcode.max_w',t.max_w,0,7680));
     h+=row('短边上限 MAXH',num('transcode.max_h',t.max_h,0,4320));
-    h+=row('码率封顶 kbps（留空 = 自动）',txt('transcode.brcap_kbps',t.brcap_kbps==null?'':t.brcap_kbps,'留空自动'));
+    // 后端是 Option<u32>：用文本框会把 "5000" 当字符串发过去，serde 类型不匹配会让整份设置保存失败
+    h+=row('码率封顶 kbps（留空 = 自动）',num('transcode.brcap_kbps',t.brcap_kbps,1,200000));
     h+=row('兜底码率 kbps',num('transcode.br_default_kbps',t.br_default_kbps,0,100000));
     const encOpts=[['auto','自动'],['libx265','libx265'],['nvenc','NVENC H.265'+(S.hw&&!S.hw.nvenc?'（未检测到）':'')],['amf','AMF H.265'+(S.hw&&!S.hw.amf?'（未检测到）':'')]];
     h+=row('默认编码器（自动 = QSV → libx265 兜底）',sel('transcode.force_encoder_mode',t.force_encoder_mode,encOpts),'硬件编码器运行失败自动回退 libx265；未检测到的选项仍可选用');
@@ -995,7 +1107,7 @@ function renderSetPage(){
     h+=row('音量增益上限 dB',num('general.max_gain_db',g.max_gain_db,0,48));
     h+=row('并发任务数（全局：下载/转码/合并共享）',num('general.concurrency',g.concurrency,1,16));
     h+=row('启动时检查更新',chk('general.check_update',g.check_update,'').replace('<input ','<input disabled '),'【暂未生效】该配置项后端尚未读取，改动不生效。');
-    h+=row('历史上限（条，默认 100、上限 200）',num('general.history_limit',g.history_limit,1,200).replace('<input ','<input disabled '),'【暂未生效】该配置项后端尚未读取（当前固定 100 条），改动不生效。');
+    h+=row('历史上限（条，默认 100、上限 200）',num('general.history_limit',g.history_limit,1,200),'超出上限时优先裁剪最旧的终态条目（进行中的任务不会被裁掉）。');
     h+=row('清理解析缓存','<button class="btn sm" data-act="clear-cache">清理解析缓存</button>','解析缓存存于 config/cache.json + config/cache/（P1 接入）');
   }
   page.innerHTML=h;
@@ -1018,7 +1130,12 @@ function loadCookieList(){
     el.innerHTML=list.map(c=>'<div class="site-row"><span class="host">'+esc(c.host)+'</span>'+
       '<span class="meta">'+c.count+' 条</span>'+
       '<button class="del" data-del-cookie="'+esc(c.host)+'">×</button></div>').join('');
-  }).catch(()=>{});
+  }).catch(err=>{
+    // 静默吞掉的话面板会永远停在"加载中…"，看不出到底是没 Cookie 还是调用失败
+    const el=document.getElementById('cookieList');
+    if(el)el.innerHTML='<div class="site-loading">加载失败：'+esc(err)+'</div>';
+    toast(err);
+  });
 }
 function bindSetEvents(){
   const page=document.getElementById('setPage');
@@ -1125,7 +1242,15 @@ function refreshDeps(){
       el.textContent=t.tool+(t.ok?(t.version?(' '+t.version):'（已找到）'):'（未找到）');
       el.title=t.path||'tools\\ 与系统 PATH 中均未找到';
     });
-  }).catch(()=>{});
+  }).catch(err=>{
+    toast(err);
+    // 探测失败时不能保留上一次的绿点：留着"假绿"会让人以为工具都还在
+    const labels={depYt:'yt-dlp',depFfmpeg:'ffmpeg',depFfprobe:'ffprobe',depDeno:'deno'};
+    Object.keys(labels).forEach(k=>{
+      const el=document.getElementById(k); if(!el)return;
+      el.className='dep bad'; el.textContent=labels[k]+' 探测失败'; el.title=String(err);
+    });
+  });
 }
 function saveSettings(){
   INVOKE('save_config',{config:S.config}).then(()=>{toast('设置已保存');closeSettings();}).catch(err=>toast(err));
@@ -1134,11 +1259,10 @@ function saveSettings(){
 // ===== 初始化 =====
 async function init(){
   try{
-    S.items=await INVOKE('list_items');
-    try{ S.config=await INVOKE('get_config'); }catch(_){}
-    render();
-    refreshDeps();
-    LISTEN('item:update', e=>{ upsertItem(e.payload); });
+    // 监听必须先于拉数据注册：首个 await（list_items）一旦失败就跳到末尾 catch，
+    // 那时如果还没监听，所有事件全丢，界面表现为"点什么都没反应"
+    const unlisteners=[];
+    LISTEN('item:update', e=>{ upsertItem(e.payload); }).then(un=>unlisteners.push(un)).catch(()=>{});
     // 高频进度：只增量改字段（payload 仅含变化项），不接收全量条目
     LISTEN('item:progress', e=>{
       const p=e.payload; if(!p||!p.id)return;
@@ -1148,8 +1272,8 @@ async function init(){
       if(p.speed!=null)it.speed=p.speed;
       if(p.eta!=null)it.eta=p.eta;
       if(p.file!=null)it.file=p.file;
-      scheduleRender();
-    });
+      patchRow(it);
+    }).then(un=>unlisteners.push(un)).catch(()=>{});
     // 高频日志：只带 id + 单行，前端增量 append（不触发列表重渲染）
     LISTEN('item:log', e=>{
       const d=e.payload; if(!d||!d.id)return;
@@ -1166,23 +1290,29 @@ async function init(){
         const placeholder=list.querySelector('li');
         if(placeholder && placeholder.textContent==='（暂无日志）')list.innerHTML='';
         list.insertAdjacentHTML('beforeend', logLineHtml(d.line));
+        // DOM 同样裁到 300 行（与 it.log 上限一致），否则长任务会把弹窗堆到几千行
+        while(list.children.length>300)list.removeChild(list.firstChild);
         const box=document.querySelector('#logModal .log-list');
         if(box)box.scrollTop=box.scrollHeight;
       }
-    });
-    LISTEN('item:removed', e=>{ S.items=S.items.filter(i=>i.id!==e.payload); S.selected.delete(e.payload); stopCountdown(e.payload); render(); });
-    LISTEN('list:changed', async()=>{ S.items=await INVOKE('list_items'); render(); });
+    }).then(un=>unlisteners.push(un)).catch(()=>{});
+    // 后端已改为对象载荷 { id }（旧格式是裸字符串 id，一并兼容）
+    LISTEN('item:removed', e=>{
+      const rid=(e.payload&&e.payload.id)||e.payload;
+      S.items=S.items.filter(i=>i.id!==rid); S.selected.delete(rid); stopCountdown(rid); render();
+    }).then(un=>unlisteners.push(un)).catch(()=>{});
+    LISTEN('list:changed', async()=>{ S.items=await INVOKE('list_items'); render(); }).then(un=>unlisteners.push(un)).catch(()=>{});
     LISTEN('item:ready', e=>{
       const it=S.items.find(i=>i.id===e.payload.id);
       if(it&&it.kind==='UrlTask'&&it.status==='Ready')startCountdown(it.id);
-    });
+    }).then(un=>unlisteners.push(un)).catch(()=>{});
     LISTEN('login:done', ()=>{
       toast('Cookie 已保存，正在重新解析需要登录的条目');
       // 真正触发重解析：NeedLogin 条目逐个 retry（后端 retry_item 允许该状态）
       S.items.filter(i=>i.status==='NeedLogin')
         .forEach(i=>INVOKE('retry_item',{id:i.id}).catch(()=>{}));
-    });
-    LISTEN('cookies:changed', ()=>{ if(curPage==='cookie')loadCookieList(); });
+    }).then(un=>unlisteners.push(un)).catch(()=>{});
+    LISTEN('cookies:changed', ()=>{ if(curPage==='cookie')loadCookieList(); }).then(un=>unlisteners.push(un)).catch(()=>{});
     LISTEN('tool:progress', e=>{
       const p=e.payload; if(!p||!p.tool)return;
       const cancelBtn=document.querySelector('.toolrow [data-tool="'+p.tool+'"][data-act="tool-cancel"]');
@@ -1191,12 +1321,22 @@ async function init(){
       const phase=p.phase||'下载';
       cancelBtn.textContent='取消 '+phase+' '+pct+'%';
       cancelBtn.title=phase+' '+pct+'%';
-    });
-    // 兜底轮询：活动任务期间每 1.5s 对账一次，事件偶发丢失也不会让进度卡死
+    }).then(un=>unlisteners.push(un)).catch(()=>{});
+    // 关窗/刷新时解除监听，避免 WebView 重载后旧监听器堆积
+    window.addEventListener('beforeunload', ()=>{ unlisteners.forEach(fn=>{ try{ fn(); }catch(_){} }); });
+    // 队列读数不等 list_items：拉数据失败也要能显示（内部失败会退回本地计数）
+    refreshQueue();
+    // 兜底轮询：每 1.5s 同步一次队列读数（queue_status），活动任务期间再对账整张列表，
+    // 事件偶发丢失也不会让读数/进度卡死；拉数据失败时定时器照样活着
     setInterval(()=>{
-      const active=S.items.some(i=>['Downloading','PostProcessing','Transcoding','Merging','Probing'].includes(i.status));
+      const active=S.items.some(i=>BUSY_STATUS.includes(i.status));
+      refreshQueue();
       if(active)INVOKE('list_items').then(list=>{S.items=list;render();}).catch(()=>{});
     },1500);
+    S.items=await INVOKE('list_items');
+    try{ S.config=await INVOKE('get_config'); }catch(_){}
+    render();
+    refreshDeps();
   }catch(err){ console.error(err); toast('初始化失败：'+err); }
 }
 init();

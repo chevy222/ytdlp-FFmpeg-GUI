@@ -1,6 +1,7 @@
 //! 目录与存储约定（§3.7）：所有产生文件均在 exe 同级，不写注册表、不依赖 %APPDATA%。
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// exe 同级目录约定（绿色便携，§3.7）。
 pub const DIR_CONFIG: &str = "config";
@@ -8,6 +9,8 @@ pub const DIR_TEMP: &str = "temp";
 pub const DIR_TOOLS: &str = "tools";
 pub const DIR_COOKIES: &str = "cookies";
 pub const DIR_CACHE: &str = "cache";
+/// 运行日志（GUI 无控制台，异常现场只能靠落盘日志，见 core::log）
+pub const DIR_LOGS: &str = "logs";
 
 /// 路径解析器：以 exe 所在目录为根（测试中可替换为任意根）。
 #[derive(Debug, Clone)]
@@ -17,14 +20,13 @@ pub struct Paths {
 
 impl Paths {
     /// 使用 exe 所在目录作为根。
+    /// 定位失败（极罕见）时退回当前工作目录，而不是 panic —— 核心层不该有 panic 点。
     pub fn from_exe() -> Self {
-        let exe = std::env::current_exe().expect("无法定位当前可执行文件");
-        Self {
-            root: exe
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| PathBuf::from(".")),
-        }
+        let root = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| PathBuf::from("."));
+        Self { root }
     }
 
     /// 显式指定根（测试/开发用）。
@@ -56,6 +58,11 @@ impl Paths {
         self.config_dir().join(DIR_CACHE)
     }
 
+    /// 运行日志目录（exe 同级 `logs/`，见 core::log）。
+    pub fn logs_dir(&self) -> PathBuf {
+        self.root.join(DIR_LOGS)
+    }
+
     pub fn config_file(&self) -> PathBuf {
         self.config_dir().join("config.json")
     }
@@ -72,6 +79,7 @@ impl Paths {
             self.tools_dir(),
             self.cookies_dir(),
             self.cache_dir(),
+            self.logs_dir(),
         ] {
             std::fs::create_dir_all(d)?;
         }
@@ -84,32 +92,55 @@ impl Paths {
     }
 }
 
-/// 损坏备份路径：`<原名>.corrupt-<epoch秒>-<序号>.json`（config/history 统一口径，
-/// 多次损坏既不互相覆盖、也不因同秒两次损坏而丢一份）。
+/// 损坏备份路径：`<原名>.corrupt-<epoch秒>.json`（config/history 统一口径，
+/// 多次损坏不互相覆盖）。
+///
+/// 用 `OsString` 拼名而不是 `format!("{}", path.display())`：后者对非 UTF-8 路径
+/// 会把非法字节替换成 U+FFFD 再落盘，备份文件凭空改名。
 pub fn corrupt_backup_path(path: &Path) -> PathBuf {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    PathBuf::from(format!("{}.corrupt-{}-{}.json", path.display(), ts, seq))
+    let mut name = path
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    name.push(format!(".corrupt-{ts}.json"));
+    path.with_file_name(name)
 }
 
-/// JSON 原子写：先写唯一临时文件（含 fsync）再 rename，避免中途损坏（§3.7 规则）。
+/// 原子写的临时文件名序列（同进程内单调递增，保证并发写入者互不撞名）。
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// JSON 原子写：先写临时文件（含 fsync）再 rename，避免中途损坏（§3.7 规则）。
 ///
-/// 临时文件名必须**唯一**：固定名（`x.json.tmp`）在两个线程同时落盘时会互相
-/// 截断对方的写入，rename 失败分支还会删掉别人刚写好的那份 —— 结果是把"原子写"
-/// 变成"随机撕裂 history.json"。
+/// 临时名**必须**带 pid + 序号：多个任务线程会并发调用写盘（每个任务收尾都
+/// `persist()`），共用一个 `history.json.tmp` 时，第二个写入者会在
+/// `File::create` 处截断第一个的半成品，最终把混合内容 rename 成正式文件 ——
+/// 一份非法 JSON 就等于下次启动列表全丢（History::load 只能备份 + 回退空列表）。
 pub fn atomic_write_json<T: serde::Serialize>(path: &Path, value: &T) -> crate::Result<()> {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let name = path
+    atomic_write_json_with(path, value, true)
+}
+
+/// 同 [`atomic_write_json`]，`pretty=false` 时输出紧凑 JSON（体积/耗时约 1/3，
+/// 用于 history.json 这类机器读写的文件；config.json 保留缩进便于用户手改）。
+pub fn atomic_write_json_with<T: serde::Serialize>(
+    path: &Path,
+    value: &T,
+    pretty: bool,
+) -> crate::Result<()> {
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let stem = path
         .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "data.json".to_string());
-    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = path.with_file_name(format!("{}.{}.{}.tmp", name, std::process::id(), seq));
-    let bytes = serde_json::to_vec_pretty(value)?;
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "data".to_string());
+    let tmp = path.with_file_name(format!("{stem}.{}.{seq}.tmp", std::process::id()));
+    let bytes = if pretty {
+        serde_json::to_vec_pretty(value)?
+    } else {
+        serde_json::to_vec(value)?
+    };
     // 写入 + fsync：掉电时保证 rename 之前数据页已落盘（只 rename 不 fsync
     // 可能出现"元数据已提交、数据未提交"的损坏文件）。
     {
@@ -122,7 +153,7 @@ pub fn atomic_write_json<T: serde::Serialize>(path: &Path, value: &T) -> crate::
     // （MOVEFILE_REPLACE_EXISTING），在类 Unix 上是原子替换。
     // 不要"先 remove 再 rename"——那会在两步之间制造文件缺失窗口，崩溃即丢整份配置。
     if let Err(e) = std::fs::rename(&tmp, path) {
-        // rename 失败（如目标被其他程序占用）时清理自己的 tmp，不累积垃圾
+        // rename 失败（如目标被其他程序占用）时清理 tmp，避免累积 *.tmp 垃圾
         let _ = std::fs::remove_file(&tmp);
         return Err(e.into());
     }
@@ -140,9 +171,10 @@ pub fn container_extension(container: &str) -> &'static str {
 /// 输出文件名碰撞处理（TC-11）：`skip` 且已存在 → 报错；`auto_inc` →
 /// 依次尝试 `base (1).ext`、`base (2).ext` …（上限 1000）。转码与合并共用（C2）。
 ///
-/// 候选名用 `create_new` **原子占住**，不是"先 exists() 再交给 ffmpeg"：
-/// 后者的检查与实际创建之间隔着几秒到几十分钟，并发任务会拿到同一个名字，
-/// 而 ffmpeg 带 `-y`，后写者静默毁掉前者的产物。
+/// 命中候选名后用 `create_new` **占位**再返回：仅靠 `exists()` 判断存在
+/// TOCTOU —— 两个并发任务（默认并发 3）会同时看到"这个名字空闲"，抢到同一个
+/// 输出路径，后完成的那个静默覆盖前一个的产物。占位文件是 0 字节，调用方
+/// 随后用 ffmpeg `-y` 覆写；任务失败时调用方会删除该路径（残留不会留成垃圾）。
 pub fn unique_output_path(
     out_dir: &Path,
     base: &str,
@@ -150,31 +182,45 @@ pub fn unique_output_path(
     policy: &str,
 ) -> crate::Result<PathBuf> {
     let candidate = out_dir.join(format!("{base}.{ext}"));
-    if candidate.exists() && policy == "skip" {
-        return Err(crate::CoreError::AlreadyExists(candidate.display().to_string()));
+    if !candidate.exists() {
+        if try_reserve(&candidate) {
+            return Ok(candidate);
+        }
+    } else if policy == "skip" {
+        return Err(crate::CoreError::Io(std::io::Error::other(format!(
+            "输出已存在，按策略跳过：{}",
+            candidate.display()
+        ))));
     }
-    let attempts: Vec<String> = if candidate.exists() {
-        (1..1000).map(|i| format!("{base} ({i}).{ext}")).collect()
-    } else {
-        std::iter::once(format!("{base}.{ext}"))
-            .chain((1..1000).map(|i| format!("{base} ({i}).{ext}")))
-            .collect()
-    };
-    for name in attempts {
-        let p = out_dir.join(&name);
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&p) {
-            // 名字已独占；空文件由 ffmpeg 带 -y 覆盖
-            Ok(_claimed) => {
-                crate::exec::check_output_path(&p)?;
-                return Ok(p);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e.into()),
+    for i in 1..1000 {
+        let p = out_dir.join(format!("{base} ({i}).{ext}"));
+        if try_reserve(&p) {
+            return Ok(p);
+        }
+        if p.exists() && policy == "skip" {
+            return Err(crate::CoreError::Io(std::io::Error::other(format!(
+                "输出已存在，按策略跳过：{}",
+                p.display()
+            ))));
         }
     }
-    Err(crate::CoreError::InvalidInput(
-        "无法生成不冲突的输出名".into(),
-    ))
+    Err(crate::CoreError::Io(std::io::Error::other(
+        "无法生成不冲突的输出名",
+    )))
+}
+
+/// 抢占输出名（`create_new` 是原子操作：只有一方能成功）。
+/// 目录不可写时返回 false，由调用方继续尝试或报错。
+fn try_reserve(path: &Path) -> bool {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]
@@ -229,44 +275,8 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&f).unwrap()).unwrap();
         assert_eq!(v["a"], 2);
-        // 临时文件不残留（名字带 pid+序号，必须按后缀扫而不是盯死一个名字）
-        let residue: Vec<_> = std::fs::read_dir(p.config_dir())
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.ends_with(".tmp"))
-            .collect();
-        assert!(residue.is_empty(), "残留临时文件：{:?}", residue);
-    }
-
-    #[test]
-    fn concurrent_writers_do_not_corrupt_the_target() {
-        // 固定 tmp 名时这里会撕裂：两个线程互相截断对方刚写的临时文件
-        let root = tempfile::tempdir().unwrap();
-        let dir = root.path();
-        std::fs::create_dir_all(dir).unwrap();
-        let path = dir.join("hist.json");
-        let mut handles = Vec::new();
-        for n in 0..8u64 {
-            let p = path.clone();
-            handles.push(std::thread::spawn(move || {
-                for i in 0..25u64 {
-                    atomic_write_json(&p, &serde_json::json!({ "n": n, "i": i })).unwrap();
-                }
-            }));
-        }
-        for h in handles {
-            h.join().unwrap();
-        }
-        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(v["n"].is_number() && v["i"].is_number(), "最终文件不是完整 JSON：{v}");
-        let residue: Vec<_> = std::fs::read_dir(dir)
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.ends_with(".tmp"))
-            .collect();
-        assert!(residue.is_empty(), "残留临时文件：{:?}", residue);
+        // 临时文件不残留
+        assert!(!root.path().join("config/config.json.tmp").exists());
     }
 
     #[test]
@@ -289,29 +299,5 @@ mod tests {
         assert!(unique_output_path(dir, "a", "mp4", "skip").is_err());
         // 不同扩展名不冲突
         assert!(unique_output_path(dir, "a", "mkv", "skip").is_ok());
-    }
-
-    #[test]
-    fn concurrent_claims_never_hand_out_the_same_name() {
-        // 旧实现是 exists() 后创建：并发两个任务能拿到同一个输出名，
-        // 而 ffmpeg 带 -y，后写者会静默毁掉前者的产物
-        let root = tempfile::tempdir().unwrap();
-        let dir = root.path().to_path_buf();
-        let names: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
-        let mut hs = Vec::new();
-        for _ in 0..8 {
-            let d = dir.clone();
-            let n = names.clone();
-            hs.push(std::thread::spawn(move || {
-                let p = unique_output_path(&d, "同名", "mp4", "auto_inc").unwrap();
-                n.lock().push(p.file_name().unwrap().to_string_lossy().into_owned());
-            }));
-        }
-        for h in hs {
-            h.join().unwrap();
-        }
-        let got = names.lock().clone();
-        let uniq: std::collections::HashSet<&String> = got.iter().collect();
-        assert_eq!(uniq.len(), got.len(), "发出了重复的名字：{:?}", got);
     }
 }

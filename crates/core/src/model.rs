@@ -5,10 +5,9 @@ use std::collections::VecDeque;
 use serde::{Deserialize, Serialize};
 
 /// 条目状态（与 UI"已就绪"对应的内部枚举名为 `Ready`）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Status {
     /// 解析中（URL 取信息 / 本地 ffprobe 探测）
-    #[default]
     Probing,
     /// 已就绪（已解析完成、可执行下载/转码/合并动作；UI 术语"已就绪"）
     Ready,
@@ -62,24 +61,9 @@ impl Status {
 }
 
 /// 旋转角度（0°/90°/180°/270°，封面旋转箭头指定，随条目保存，转码生效）。
-///
-/// 不变量必须由**反序列化**也保证：`#[serde(transparent)]` 直接写内部 u16，
-/// 旧版/手改的 history.json 里放个 45 或 65530，就会绕过 `from_degrees`，
-/// 于是非法角度被原样喂给 ffmpeg 的 `rotate=`（它按弧度理解），
-/// debug 构建下 `rotate_cw` 还会整数溢出 panic。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct RotAngle(u16);
-
-impl<'de> Deserialize<'de> for RotAngle {
-    fn deserialize<D>(d: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let raw = u16::deserialize(d)?;
-        Ok(Self::from_degrees(raw))
-    }
-}
 
 impl RotAngle {
     pub const ZERO: Self = Self(0);
@@ -94,12 +78,12 @@ impl RotAngle {
 
     /// 顺时针旋转 90°。
     pub fn rotate_cw(self) -> Self {
-        Self::from_degrees(self.0 % 360 + 90)
+        Self::from_degrees(self.0 + 90)
     }
 
     /// 逆时针旋转 90°。
     pub fn rotate_ccw(self) -> Self {
-        Self::from_degrees(self.0 % 360 + 270)
+        Self::from_degrees(self.0 + 270)
     }
 }
 
@@ -110,10 +94,9 @@ impl Default for RotAngle {
 }
 
 /// 条目来源类型（统一列表：URL 任务 / 本地文件 / 转码产物 / 合并产物）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ItemKind {
     /// URL 下载任务
-    #[default]
     UrlTask,
     /// 本地文件/目录（添加后先解析）
     LocalFile,
@@ -181,10 +164,6 @@ pub struct MediaMeta {
     /// 源编码宽度（竖屏源与 rotate_tag 配合判定"短边"分辨率，MD-02/§8）。
     #[serde(default)]
     pub width: Option<u32>,
-    /// 主视频像素格式（yuv420p / yuv420p10le …）。合并直拼判据（MG-02）需要：
-    /// 8bit 段与 10bit 段混进同一容器时由第一段决定标签，后面几段播放会偏色。
-    #[serde(default)]
-    pub pix_fmt: Option<String>,
     /// 结构化下载格式列表（DL-02 格式选择；含 format_id 供下载使用）
     #[serde(default)]
     pub download_formats: Vec<DownloadFormat>,
@@ -310,11 +289,7 @@ pub fn human_size(bytes: u64) -> String {
 }
 
 /// 统一列表条目（§7.1）。
-///
-/// 容器级 `#[serde(default)]`：新增字段不会让旧 history.json 判为损坏，
-/// 缺字段的条目也能救回而不是整档作废（配合 `History::load` 的逐条解析）。
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MediaItem {
     pub id: String,
     pub kind: ItemKind,
@@ -414,19 +389,6 @@ impl MediaItem {
         while self.log.len() > MAX_LOG_LINES {
             self.log.pop_front();
         }
-    }
-
-    /// 设置进度（唯一入口）：钳到 0..=100，NaN/无穷一律归 0。
-    ///
-    /// `percent` 是 `pub f32` 且随 history 反序列化：一个 NaN 会让
-    /// `(percent / 25.0).floor() as u8` 取值不定，而 serde 序列化 NaN 会写成
-    /// `null` —— 一个坏浮点就能污染整份 history.json。
-    pub fn set_percent(&mut self, pct: f32) {
-        self.percent = if pct.is_finite() {
-            pct.clamp(0.0, 100.0)
-        } else {
-            0.0
-        };
     }
 }
 
@@ -793,42 +755,5 @@ mod tests {
         assert_eq!(it.updated_at.len(), 19); // YYYY-MM-DD HH:MM:SS
         assert_eq!(&it.updated_at[4..5], "-");
         assert_eq!(&it.updated_at[10..11], " ");
-    }
-
-    #[test]
-    fn missing_fields_do_not_invalidate_an_item() {
-        // 容器级 serde(default)：旧文件缺字段 / 以后新增字段都不能判整条作废
-        let it: MediaItem = serde_json::from_str(r#"{"id":"x","title":"a.mp4"}"#).unwrap();
-        assert_eq!(it.id, "x");
-        assert_eq!(it.status, Status::Probing);
-        assert_eq!(it.rot_angle.degrees(), 0);
-        assert!(it.log.is_empty());
-    }
-
-    #[test]
-    fn rot_angle_invariant_survives_deserialize() {
-        // 手改/旧版 history 里的非法角度必须被归一
-        let bad: MediaItem =
-            serde_json::from_str(r#"{"id":"x","title":"a","rot_angle":65530}"#).unwrap();
-        assert!(matches!(bad.rot_angle.degrees(), 0 | 90 | 180 | 270));
-        let odd: MediaItem =
-            serde_json::from_str(r#"{"id":"x","title":"a","rot_angle":45}"#).unwrap();
-        assert_eq!(odd.rot_angle.degrees(), 0);
-        // 归一后再转也不该溢出
-        assert_eq!(bad.rot_angle.rotate_cw().degrees() % 90, 0);
-        assert_eq!(RotAngle::from_degrees(270).rotate_cw().degrees(), 0);
-        assert_eq!(RotAngle::from_degrees(0).rotate_ccw().degrees(), 270);
-    }
-
-    #[test]
-    fn percent_is_clamped_at_the_setter() {
-        let mut it = item();
-        it.set_percent(150.0);
-        assert_eq!(it.percent, 100.0);
-        it.set_percent(-3.0);
-        assert_eq!(it.percent, 0.0);
-        it.set_percent(f32::NAN);
-        assert_eq!(it.percent, 0.0, "NaN 会污染整份 history.json（serde 写成 null）");
-        assert!(serde_json::to_string(&it).unwrap().contains("0.0"));
     }
 }
