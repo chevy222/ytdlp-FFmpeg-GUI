@@ -16,7 +16,7 @@ fn apply_cli(app: &tauri::AppHandle) {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cli = ytdlp_core::cli::parse_cli_args(&args);
     let st = app.state::<state::AppState>();
-    *st.cli.lock().unwrap() = state::CliOverrides::from(cli.clone());
+    *st.cli.lock() = state::CliOverrides::from(cli.clone());
     if !cli.urls.is_empty() {
         let _ = commands::add_url(app.clone(), cli.urls);
     }
@@ -31,7 +31,7 @@ pub fn run() {
             let args: Vec<String> = argv.iter().skip(1).map(|s| s.to_string()).collect();
             let cli = ytdlp_core::cli::parse_cli_args(&args);
             let st = app.state::<state::AppState>();
-            *st.cli.lock().unwrap() = state::CliOverrides::from(cli.clone());
+            *st.cli.lock() = state::CliOverrides::from(cli.clone());
             if !cli.urls.is_empty() {
                 let _ = commands::add_url(app.clone(), cli.urls);
             }
@@ -76,7 +76,7 @@ pub fn run() {
             // 启动时恢复队列（UL-10）：中断的任务标记失败，可重试。
             // NeedLogin 除外 —— 它不是"中断"，未登录的状态跨重启依然成立
             {
-                let mut hist = state.history.lock().unwrap();
+                let mut hist = state.history.lock();
                 for item in hist.items.iter_mut() {
                     if !item.status.is_terminal()
                         && item.status != Status::Ready

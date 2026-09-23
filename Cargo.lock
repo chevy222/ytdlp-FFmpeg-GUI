@@ -4995,6 +4995,7 @@ name = "ytdlp-core"
 version = "0.1.0"
 dependencies = [
  "encoding_rs",
+ "parking_lot",
  "regex",
  "serde",
  "serde_json",
@@ -5010,6 +5011,7 @@ dependencies = [
 name = "ytdlp-gui"
 version = "0.1.0"
 dependencies = [
+ "parking_lot",
  "serde",
  "serde_json",
  "tauri",

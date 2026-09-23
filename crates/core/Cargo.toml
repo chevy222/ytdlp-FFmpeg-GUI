@@ -12,6 +12,7 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 url = { workspace = true }
 regex = { workspace = true }
+parking_lot = { workspace = true }
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
 sha2 = "0.10"
 encoding_rs = "0.8"

@@ -25,6 +25,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 ytdlp-core = { path = "../crates/core" }
 url = { workspace = true }
+parking_lot = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.38"

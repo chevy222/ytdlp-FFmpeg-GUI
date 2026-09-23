@@ -11,7 +11,8 @@ use std::io::BufRead;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
+use parking_lot::Mutex;
 
 use crate::exec::{decode_text, ChildGuard, Tool, ToolResolver};
 use crate::model::{MediaMeta, RotAngle};
@@ -25,17 +26,11 @@ use crate::{CoreError, Result};
 static LOCKED_TIER: OnceLock<Mutex<Option<TranscodeTier>>> = OnceLock::new();
 
 fn locked_tier() -> Option<TranscodeTier> {
-    LOCKED_TIER
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .ok()
-        .and_then(|g| *g)
+    *LOCKED_TIER.get_or_init(|| Mutex::new(None)).lock()
 }
 
 fn set_locked_tier(tier: TranscodeTier) {
-    if let Ok(mut g) = LOCKED_TIER.get_or_init(|| Mutex::new(None)).lock() {
-        *g = Some(tier);
-    }
+    *LOCKED_TIER.get_or_init(|| Mutex::new(None)).lock() = Some(tier);
 }
 
 /// 转码参数（来自 设置-转码/通用/下载 + 条目 rot_angle，TC-05）。
@@ -783,7 +778,7 @@ fn run_transcode_once(
 
     // stderr 必须持续读取：管道缓冲区只有 64KB，ffmpeg 转码中往 stderr
     // 输出 warning/info 时若无人读取会写满阻塞，导致 stdout 进度行不再产出。
-    let err_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let err_buf = Arc::new(Mutex::new(String::new()));
     {
         let err_buf = err_buf.clone();
         std::thread::spawn(move || {
@@ -793,9 +788,7 @@ fn run_transcode_once(
                 if chunk.is_empty() {
                     break;
                 }
-                if let Ok(mut s) = err_buf.lock() {
-                    s.push_str(&String::from_utf8_lossy(&chunk));
-                }
+                err_buf.lock().push_str(&String::from_utf8_lossy(&chunk));
                 chunk.clear();
             }
         });
@@ -841,7 +834,7 @@ fn run_transcode_once(
         return Err(CoreError::Cancelled);
     }
     if !status.success() {
-        let err = err_buf.lock().map(|s| s.clone()).unwrap_or_default();
+        let err = err_buf.lock().clone();
         // 多行 stderr 拆成逐条日志：单条塞进一个 entry 时 UI 侧易被截断观感，
         // 逐行落日志才能完整回看 ffmpeg 的报错原因
         let mut lines = err.lines();

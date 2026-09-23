@@ -122,7 +122,7 @@ pub async fn download_tool(
     let outcome = run_tool_install(&ctx, kind, update, &flag).await;
     // 无论成功/失败/取消（含"未找到""已是最新"这类早退）都清理取消标志，
     // 否则注册表条目泄漏，之后每次点按钮都报"该工具正在下载中"
-    state.cancels.lock().unwrap().remove(&cancel_key);
+    state.cancels.lock().remove(&cancel_key);
     outcome
 }
 
@@ -283,7 +283,7 @@ fn err_string(e: impl std::fmt::Display) -> String {
 /// 更新条目并返回克隆（变更即原子写仅对状态迁移生效由调用方决定）。
 fn update_item(app: &AppHandle, id: &str, f: impl FnOnce(&mut MediaItem)) -> Option<MediaItem> {
     let state = app.state::<AppState>();
-    let mut hist = state.history.lock().unwrap();
+    let mut hist = state.history.lock();
     let item = hist.get(id)?.clone();
     let mut item = item;
     f(&mut item);
@@ -333,7 +333,7 @@ fn persist(app: &AppHandle) {
 #[tauri::command]
 pub fn add_url(app: AppHandle, urls: Vec<String>) -> CmdResult<()> {
     let state = app.state::<AppState>();
-    let mut hist = state.history.lock().unwrap();
+    let mut hist = state.history.lock();
     for raw in urls {
         let url = clean_url(&raw);
         if url.is_empty() {
@@ -374,7 +374,7 @@ pub fn add_local(app: AppHandle, paths: Vec<String>, recursive: bool) -> CmdResu
         return Err("没有找到可添加的文件".into());
     }
     let state = app.state::<AppState>();
-    let mut hist = state.history.lock().unwrap();
+    let mut hist = state.history.lock();
     for f in files {
         let item = MediaItem::from_path(f.to_string_lossy().into_owned());
         let id = item.id.clone();
@@ -420,7 +420,7 @@ fn clean_url(raw: &str) -> String {
 fn run_probe(app: AppHandle, id: String) {
     let state = app.state::<AppState>();
     let item = {
-        let hist = state.history.lock().unwrap();
+        let hist = state.history.lock();
         hist.get(&id).cloned()
     };
     let Some(item) = item else {
@@ -429,10 +429,10 @@ fn run_probe(app: AppHandle, id: String) {
     log_item(&app, &id, "开始解析元数据…");
 
     let resolver = state.resolver();
-    let network = state.config.lock().unwrap().network.clone();
+    let network = state.config.lock().network.clone();
     let netscape = resolve_cookies(&state, &item);
 
-    let playlist_on = state.config.lock().unwrap().download.playlist;
+    let playlist_on = state.config.lock().download.playlist;
     let result = if item.url.is_some() {
         probe::probe_url(
             &resolver,
@@ -563,7 +563,7 @@ fn run_probe(app: AppHandle, id: String) {
 
 #[tauri::command]
 pub fn list_items(state: State<'_, AppState>) -> CmdResult<Vec<MediaItem>> {
-    let hist = state.history.lock().unwrap();
+    let hist = state.history.lock();
     Ok(hist.items.clone())
 }
 
@@ -578,7 +578,7 @@ pub fn start_download(
 ) -> CmdResult<()> {
     let state = app.state::<AppState>();
     {
-        let mut hist = state.history.lock().unwrap();
+        let mut hist = state.history.lock();
         let mut item = hist.get(&id).cloned().ok_or("条目不存在")?;
         if item.status != Status::Ready {
             return Err(format!("当前状态不可下载：{}", item.status.label()));
@@ -596,7 +596,7 @@ pub fn start_download(
     }
     // 提交并发队列
     let outcome = {
-        let mut q = state.queue.lock().unwrap();
+        let mut q = state.queue.lock();
         q.submit(&id)
     };
     if outcome == SubmitOutcome::Queued {
@@ -621,23 +621,23 @@ fn run_download_task(app: AppHandle, id: String, format_id: Option<String>, audi
         // 只在锁内 clone 条目：后续 Cookie 导出（export_netscape）是文件 IO，
         // 持 history 锁做会阻塞所有 update_item 调用（前端刷新卡顿）
         let item = {
-            let hist = state.history.lock().unwrap();
+            let hist = state.history.lock();
             hist.get(&id).cloned()
         };
         let Some(item) = item else {
             // 条目在排队期间被删除：释放并发 slot 并清掉取消标志，
             // 否则这个额度会被永久占用，等待中的任务永远不启动
-            state.cancels.lock().unwrap().remove(&id);
+            state.cancels.lock().remove(&id);
             release_slot(&app, &id);
             return;
         };
         let url = item.url.clone().unwrap_or_default();
-        let cfg = state.config.lock().unwrap().download.clone();
-        let general = state.config.lock().unwrap().general.clone();
+        let cfg = state.config.lock().download.clone();
+        let general = state.config.lock().general.clone();
         let resolver = state.resolver();
         let out_dir = default_output_dir(&state);
         let template = cfg.filename_template.clone();
-        let proxy = state.config.lock().unwrap().network.resolve_proxy(&url);
+        let proxy = state.config.lock().network.resolve_proxy(&url);
         let netscape = resolve_cookies(&state, &item);
         let sections = item.sections.clone();
         // JS 运行时（§3.6 依赖）：托管/配置的 deno 必须显式传给 yt-dlp，
@@ -821,7 +821,7 @@ fn finish_download(
     if final_status == Status::Done {
         if let Some(out_path) = final_path {
             let (need_thumb, cover_idx) = {
-                let hist = state.history.lock().unwrap();
+                let hist = state.history.lock();
                 match hist.get(id) {
                     // 产物已有缩略图则不动；否则优先取 yt-dlp --write-thumbnail
                     // 写在输出目录的封面文件，ffmpeg 抽帧仅作兜底
@@ -884,19 +884,19 @@ fn finish_download(
     let _ = std::fs::remove_dir_all(state.paths.task_temp_dir(id));
     // 清理取消标志注册表条目（否则随任务数无限累积；也让后续 cancel_item
     // 的 cancel_flag 查询能正确区分"运行中"与"已结束"）
-    state.cancels.lock().unwrap().remove(id);
+    state.cancels.lock().remove(id);
     // 释放并发 slot，启动下一个等待任务（下载/转码/合并共用）
     release_slot(app, id);
     persist(app);
 }
 
 fn default_output_dir(state: &AppState) -> PathBuf {
-    if let Some(dir) = &state.cli.lock().unwrap().dir {
+    if let Some(dir) = &state.cli.lock().dir {
         if !dir.is_empty() {
             return PathBuf::from(dir);
         }
     }
-    if let Some(dir) = &state.config.lock().unwrap().general.default_output_dir {
+    if let Some(dir) = &state.config.lock().general.default_output_dir {
         if !dir.is_empty() {
             return PathBuf::from(dir);
         }
@@ -915,7 +915,7 @@ fn default_output_dir(state: &AppState) -> PathBuf {
 
 /// Cookie 文件解析：CLI `--cookies` 优先；否则从 Cookie 库按站点导出 Netscape 临时文件。
 fn resolve_cookies(state: &AppState, item: &MediaItem) -> Option<PathBuf> {
-    if let Some(p) = &state.cli.lock().unwrap().cookies {
+    if let Some(p) = &state.cli.lock().cookies {
         let pb = PathBuf::from(p);
         if pb.is_file() {
             return Some(pb);
@@ -934,7 +934,7 @@ fn resolve_cookies(state: &AppState, item: &MediaItem) -> Option<PathBuf> {
 fn release_slot(app: &AppHandle, id: &str) {
     let state = app.state::<AppState>();
     let next = {
-        let mut q = state.queue.lock().unwrap();
+        let mut q = state.queue.lock();
         q.finish(id)
     };
     if let Some(next_id) = next {
@@ -971,7 +971,7 @@ pub fn start_merge(
     // std::sync::Mutex 不可重入，锁内调用会当场死锁（UI 永久冻结）
     let mut skipped: Vec<(String, String)> = Vec::new();
     {
-        let mut hist = state.history.lock().unwrap();
+        let mut hist = state.history.lock();
         for id in &ids {
             let Some(item) = hist.get(id).cloned() else {
                 return Err(format!("条目不存在：{id}"));
@@ -1005,7 +1005,7 @@ pub fn start_merge(
     if jobs.len() < 2 {
         return Err("可合并条目不足 2 个".into());
     }
-    let norm = normalize.unwrap_or_else(|| state.config.lock().unwrap().general.normalize_audio);
+    let norm = normalize.unwrap_or_else(|| state.config.lock().general.normalize_audio);
     let job = MergeJob {
         ids: jobs,
         filename: filename.unwrap_or_else(default_merge_name),
@@ -1020,11 +1020,10 @@ pub fn start_merge(
         state
             .merge_jobs
             .lock()
-            .unwrap()
             .insert(id.clone(), job.clone());
     }
     let outcome = {
-        let mut q = state.queue.lock().unwrap();
+        let mut q = state.queue.lock();
         q.submit(&anchor)
     };
     for id in &job.ids {
@@ -1060,14 +1059,14 @@ fn today_stamp() -> String {
 fn run_merge_task(app: AppHandle, id: String) {
     let state = app.state::<AppState>();
     let cancel = state.register_cancel(&id);
-    let job = state.merge_jobs.lock().unwrap().get(&id).cloned();
+    let job = state.merge_jobs.lock().get(&id).cloned();
     let Some(job) = job else {
         release_slot(&app, &id);
         return;
     };
     // 取消标志共享给全部参与条目：从任意被勾选条目点"取消"都能取消这次合并
     {
-        let mut cancels = state.cancels.lock().unwrap();
+        let mut cancels = state.cancels.lock();
         for jid in &job.ids {
             cancels.insert(jid.clone(), cancel.clone());
         }
@@ -1076,7 +1075,7 @@ fn run_merge_task(app: AppHandle, id: String) {
         let mut inputs = Vec::new();
         let mut anchor = None;
         {
-            let hist = state.history.lock().unwrap();
+            let hist = state.history.lock();
             for jid in &job.ids {
                 if let Some(item) = hist.get(jid) {
                     if anchor.is_none() {
@@ -1088,7 +1087,7 @@ fn run_merge_task(app: AppHandle, id: String) {
                 }
             }
         }
-        let cfg = state.config.lock().unwrap().clone();
+        let cfg = state.config.lock().clone();
         let p = MergeParams {
             inputs,
             out_dir: default_output_dir(&state),
@@ -1106,7 +1105,7 @@ fn run_merge_task(app: AppHandle, id: String) {
     if inputs.len() < 2 {
         log_item(&app, &id, "合并输入不足，已取消");
         {
-            let mut jobs = state.merge_jobs.lock().unwrap();
+            let mut jobs = state.merge_jobs.lock();
             for jid in &job.ids {
                 jobs.remove(jid);
             }
@@ -1189,7 +1188,7 @@ fn finish_merge(
         prod.percent = 100.0;
         prod.meta = meta;
         prod.updated_at = now_str();
-        state.history.lock().unwrap().upsert(prod.clone());
+        state.history.lock().upsert(prod.clone());
         // 产物缩略图：从最终产物抽帧（与下载完成兜底同链路）
         {
             let app2 = app.clone();
@@ -1220,14 +1219,14 @@ fn finish_merge(
         let _ = app.emit("list:changed", ());
     }
     {
-        let mut jobs = state.merge_jobs.lock().unwrap();
+        let mut jobs = state.merge_jobs.lock();
         for jid in ids {
             jobs.remove(jid);
         }
     }
     // 合并的取消标志注册在每个参与条目上（run_merge_task），一并清理
     {
-        let mut cancels = state.cancels.lock().unwrap();
+        let mut cancels = state.cancels.lock();
         for jid in ids {
             cancels.remove(jid);
         }
@@ -1286,7 +1285,7 @@ pub fn start_transcode(app: AppHandle, ids: Vec<String>) -> CmdResult<()> {
     // 同 start_merge：跳过日志出锁后再写，避免 history 锁重入死锁
     let mut skipped: Vec<(String, String)> = Vec::new();
     {
-        let mut hist = state.history.lock().unwrap();
+        let mut hist = state.history.lock();
         for id in &ids {
             let Some(item) = hist.get(id).cloned() else {
                 return Err(format!("条目不存在：{id}"));
@@ -1314,7 +1313,7 @@ pub fn start_transcode(app: AppHandle, ids: Vec<String>) -> CmdResult<()> {
                     hist.upsert(updated.clone());
                     drop(hist);
                     let _ = app.emit("item:update", &updated);
-                    hist = state.history.lock().unwrap();
+                    hist = state.history.lock();
                     to_run.push(id.clone());
                 }
                 Err(e) => skipped.push((id.clone(), format!("转码被跳过：{e}"))),
@@ -1329,7 +1328,7 @@ pub fn start_transcode(app: AppHandle, ids: Vec<String>) -> CmdResult<()> {
     }
     for id in to_run {
         let outcome = {
-            let mut q = state.queue.lock().unwrap();
+            let mut q = state.queue.lock();
             q.submit(&id)
         };
         if outcome == SubmitOutcome::Queued {
@@ -1368,7 +1367,7 @@ fn expand_playlist(
             let mut ids = Vec::with_capacity(entries.len());
             {
                 let st = app.state::<AppState>();
-                let mut hist = st.history.lock().unwrap();
+                let mut hist = st.history.lock();
                 for e in entries {
                     let entry = MediaItem::from_url(e.url);
                     ids.push(entry.id.clone());
@@ -1398,12 +1397,12 @@ fn run_transcode_task(app: AppHandle, id: String) {
     // 锁纪律（§11.15）：history 锁内只 clone 条目，config/cli/default_output_dir
     // 一律出锁后再取（P1-3：持 history 锁期间嵌套取 config/cli 锁会让 update_item 卡顿）
     let (item, path) = {
-        let hist = state.history.lock().unwrap();
+        let hist = state.history.lock();
         let item = match hist.get(&id) {
             Some(i) => i.clone(),
             None => {
                 // 条目在排队期间被删除：释放 slot + 取消标志，避免额度被永久占用
-                state.cancels.lock().unwrap().remove(&id);
+                state.cancels.lock().remove(&id);
                 release_slot(&app, &id);
                 return;
             }
@@ -1417,7 +1416,7 @@ fn run_transcode_task(app: AppHandle, id: String) {
                     transition_in(it, Status::Failed);
                     it.error = Some("无本地输入文件".into());
                 });
-                state.cancels.lock().unwrap().remove(&id);
+                state.cancels.lock().remove(&id);
                 release_slot(&app, &id);
                 persist(&app);
                 return;
@@ -1425,7 +1424,7 @@ fn run_transcode_task(app: AppHandle, id: String) {
         };
         (item, path)
     };
-    let cfg = state.config.lock().unwrap().clone();
+    let cfg = state.config.lock().clone();
     let out_dir = default_output_dir(&state);
     // 产物命名：条目标题是 URL（探测没拿到真标题）或为空时，退回输入文件名——
     // 否则标题经 sanitize 后 "https___www.youtube.com_watch_v=xxx.mp4" 就是输出名
@@ -1534,7 +1533,7 @@ fn finish_transcode(app: &AppHandle, id: &str, result: Result<std::path::PathBuf
         prod.percent = 100.0;
         prod.meta = meta;
         prod.updated_at = now_str();
-        state.history.lock().unwrap().upsert(prod.clone());
+        state.history.lock().upsert(prod.clone());
         // 产物缩略图：从最终产物抽帧（与下载完成兜底同链路）
         {
             let app2 = app.clone();
@@ -1565,7 +1564,7 @@ fn finish_transcode(app: &AppHandle, id: &str, result: Result<std::path::PathBuf
         let _ = app.emit("list:changed", ());
     }
     // 清理取消标志 + 释放并发 slot，启动下一个等待任务
-    state.cancels.lock().unwrap().remove(id);
+    state.cancels.lock().remove(id);
     release_slot(app, id);
     persist(app);
 }
@@ -1573,7 +1572,7 @@ fn finish_transcode(app: &AppHandle, id: &str, result: Result<std::path::PathBuf
 /// 转码结束后原条目恢复状态：本地文件 → 已就绪；下载产物/转码产物 → 已完成（可再转码）。
 fn restore_status(app: &AppHandle, id: &str) -> Status {
     let state = app.state::<AppState>();
-    let hist = state.history.lock().unwrap();
+    let hist = state.history.lock();
     let Some(item) = hist.get(id) else {
         return Status::Ready;
     };
@@ -1589,7 +1588,7 @@ fn launch_next(app: &AppHandle, next_id: String) {
     std::thread::spawn(move || {
         let st = app2.state::<AppState>();
         let item = {
-            let h = st.history.lock().unwrap();
+            let h = st.history.lock();
             h.get(&next_id).cloned()
         };
         let Some(item) = item else {
@@ -1623,7 +1622,7 @@ pub fn cancel_item(app: AppHandle, id: String) -> CmdResult<()> {
     let state = app.state::<AppState>();
     // 等待中：直接移除
     let removed = {
-        let mut q = state.queue.lock().unwrap();
+        let mut q = state.queue.lock();
         q.cancel_waiting(&id)
     };
     if removed {
@@ -1651,7 +1650,7 @@ pub fn cancel_item(app: AppHandle, id: String) -> CmdResult<()> {
 #[tauri::command]
 pub fn remove_item(app: AppHandle, id: String) -> CmdResult<()> {
     let state = app.state::<AppState>();
-    let mut hist = state.history.lock().unwrap();
+    let mut hist = state.history.lock();
     if hist.remove(&id) {
         drop(hist);
         persist(&app);
@@ -1665,7 +1664,7 @@ pub fn remove_item(app: AppHandle, id: String) -> CmdResult<()> {
 #[tauri::command]
 pub fn clear_done(app: AppHandle) -> CmdResult<()> {
     let state = app.state::<AppState>();
-    state.history.lock().unwrap().clear_terminal();
+    state.history.lock().clear_terminal();
     persist(&app);
     let _ = app.emit("list:changed", ());
     Ok(())
@@ -1675,7 +1674,7 @@ pub fn clear_done(app: AppHandle) -> CmdResult<()> {
 pub fn retry_item(app: AppHandle, id: String) -> CmdResult<()> {
     let state = app.state::<AppState>();
     {
-        let mut hist = state.history.lock().unwrap();
+        let mut hist = state.history.lock();
         let mut item = hist.get(&id).cloned().ok_or("条目不存在")?;
         if !item.status.is_terminal() && item.status != Status::NeedLogin {
             return Err("仅失败/已取消/需要登录可重试".into());
@@ -1716,7 +1715,7 @@ async fn open_login_off_main_thread(
 pub async fn relogin_item(app: AppHandle, id: String) -> CmdResult<()> {
     let host = {
         let state = app.state::<AppState>();
-        let hist = state.history.lock().unwrap();
+        let hist = state.history.lock();
         let item = hist.get(&id).ok_or("条目不存在")?;
         item.host.clone().or_else(|| {
             item.url
@@ -1755,14 +1754,14 @@ pub async fn open_login_site(app: AppHandle, host: String) -> CmdResult<()> {
 
 #[tauri::command]
 pub fn get_config(state: State<'_, AppState>) -> CmdResult<AppConfig> {
-    Ok(state.config.lock().unwrap().clone())
+    Ok(state.config.lock().clone())
 }
 
 #[tauri::command]
 pub fn save_config(app: AppHandle, config: AppConfig) -> CmdResult<()> {
     let state = app.state::<AppState>();
     {
-        let mut cur = state.config.lock().unwrap();
+        let mut cur = state.config.lock();
         *cur = config.clone();
     }
     let path = state.paths.config_file();
@@ -1772,7 +1771,6 @@ pub fn save_config(app: AppHandle, config: AppConfig) -> CmdResult<()> {
     state
         .queue
         .lock()
-        .unwrap()
         .set_concurrency(config.general.concurrency as usize);
     Ok(())
 }
@@ -1862,7 +1860,7 @@ pub fn probe_dependencies(state: State<'_, AppState>) -> CmdResult<Vec<ToolStatu
 
 #[tauri::command]
 pub fn open_item_dir(state: State<'_, AppState>, id: String) -> CmdResult<()> {
-    let hist = state.history.lock().unwrap();
+    let hist = state.history.lock();
     let item = hist.get(&id).ok_or("条目不存在")?;
     let target = item
         .file
@@ -1899,7 +1897,7 @@ pub fn clear_temp(app: AppHandle) -> CmdResult<()> {
     if dir.is_dir() {
         // 跳过运行中任务的私有目录（temp/<任务id>/ 里是正在使用的 Cookie 导出等）
         // 与工具下载的 temp/tool_dl；只清历史残留，避免把进行中的任务搞坏
-        let active: Vec<String> = state.cancels.lock().unwrap().keys().cloned().collect();
+        let active: Vec<String> = state.cancels.lock().keys().cloned().collect();
         let tool_dl_busy = active.iter().any(|k| k.starts_with("tool-dl-"));
         for e in std::fs::read_dir(&dir).map_err(err_string)? {
             let e = e.map_err(err_string)?;

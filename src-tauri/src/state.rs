@@ -2,7 +2,9 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use ytdlp_core::config::AppConfig;
 use ytdlp_core::exec::ToolResolver;
@@ -74,9 +76,9 @@ impl AppState {
 
     /// 当前工具解析器（按 config 依赖段构造；CLI 覆盖优先）。
     pub fn resolver(&self) -> ToolResolver {
-        let mut cfg = self.config.lock().unwrap().clone();
+        let mut cfg = self.config.lock().clone();
         {
-            let cli = self.cli.lock().unwrap();
+            let cli = self.cli.lock();
             if let Some(p) = &cli.yt_dlp_path {
                 cfg.dependencies.yt_dlp_path = Some(p.clone());
             }
@@ -98,20 +100,19 @@ impl AppState {
         let flag = Arc::new(AtomicBool::new(false));
         self.cancels
             .lock()
-            .unwrap()
             .insert(id.to_string(), flag.clone());
         flag
     }
 
     pub fn cancel_flag(&self, id: &str) -> Option<Arc<AtomicBool>> {
-        self.cancels.lock().unwrap().get(id).cloned()
+        self.cancels.lock().get(id).cloned()
     }
 
     /// 持久化历史（变更即原子写，写失败降级为内存态并告警）。
     pub fn persist(&self) {
         // §11.15 锁纪律：锁内只取快照，序列化 + 写盘在锁外——
         // 持锁写盘（满载 100 条 × 300 行日志时毫秒到百毫秒级）会阻塞所有 update_item
-        let snapshot = self.history.lock().unwrap().clone();
+        let snapshot = self.history.lock().clone();
         if let Err(e) = snapshot.save(&self.paths.history_file()) {
             eprintln!("history 持久化失败（保持内存态）：{}", e);
         }
