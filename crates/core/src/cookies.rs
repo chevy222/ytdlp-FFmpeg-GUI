@@ -500,8 +500,9 @@ mod tests {
         let root = tempdir().unwrap();
         let dir = root.path().join("cookies");
         std::fs::create_dir_all(&dir).unwrap();
-        let (gbk, _, _) = encoding_rs::GBK.encode(sess_line("学习近值"));
-        write_cookie_file(&dir, gbk.as_ref());
+        let line = sess_line("学习近值");
+        let gbk = encoding_rs::GBK.encode(line.as_str()).0.to_vec();
+        write_cookie_file(&dir, &gbk);
         assert_eq!(load_value(&dir)[0].value, "学习近值");
     }
 
