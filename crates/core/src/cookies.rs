@@ -53,15 +53,16 @@ impl CookieStore {
     }
 
     /// 读取某站点 cookie（Netscape 格式）。
-    /// 用字节读 + `decode_text`：用户用记事本另存为 GBK 后，`read_to_string` 会
-    /// 整段失败，cookie 明明在却报"没有 cookie"（下载侧表现为"需要登录"）。
+    /// 用字节读 + [`decode_cookie_file`]：`read_to_string` 遇 GBK 会整段失败，
+    /// cookie 明明在却报"没有 cookie"（下载侧表现为"需要登录"）；而直接走
+    /// `exec::decode_text` 又会把"恰好是合法 UTF-8 的 GBK 字节"静默解成乱码。
     pub fn load_host(&self, host: &str) -> Result<Vec<CookieEntry>> {
         let f = self.host_file(host);
         if !f.exists() {
             return Ok(Vec::new());
         }
         let bytes = std::fs::read(f)?;
-        Ok(netscape_parse(&crate::exec::decode_text(&bytes)))
+        Ok(netscape_parse(&decode_cookie_file(&bytes)))
     }
 
     /// 已保存站点列表（按文件名排序，不含扩展名）。
@@ -161,6 +162,67 @@ fn netscape_format(cookies: &[CookieEntry]) -> String {
         ));
     }
     out
+}
+
+/// 解码用户手工保存的 cookie 文件（记事本"ANSI" = 中文 Windows 的 GBK）。
+///
+/// [`crate::exec::decode_text`] 让 UTF-8 优先，这对子进程输出是对的，对这类文件
+/// 却会静默翻车：汉字的 GBK 双字节里有一批同时是合法 UTF-8 二字节序列
+/// （`值` = `D6 B5` → U+05B5），文件"读成功了"，cookie 值却是乱的，表现成
+/// "明明登录了还是提示需要登录"，且日志里没有任何异常。
+///
+/// 判据用**文件形态**而不是通用字符集猜测：Netscape 格式正文按规范只有 ASCII，
+/// 非 ASCII 只可能出现在 domain/path/name/value 四处，而中文站点的值就是中文。
+/// 于是"所有非 ASCII 字符都落在 UTF-8 二字节区间，且按 GBK 解能出中日韩文字"
+/// 就是被误读的 GBK 文件的特征，据此改判。
+///
+/// 代价：值里只有纯拉丁/西里尔/希伯来文字且其 UTF-8 字节恰好组成合法 GBK 汉字对
+/// 时会误判。实践中 cookie 值是会话令牌（ASCII），这个组合不会出现；反过来
+/// 若把它做成无条件 GBK 优先，UTF-8 保存的中文 cookie 就会坏掉（两边都有实测
+/// 用例，见 tests）。
+fn decode_cookie_file(bytes: &[u8]) -> String {
+    let as_text = crate::exec::decode_text(bytes);
+    if !only_two_byte_band(&as_text) {
+        return as_text;
+    }
+    let (gbk, _, had_errors) = encoding_rs::GBK.decode(bytes);
+    if !had_errors && has_cjk(&gbk) {
+        return gbk.into_owned();
+    }
+    as_text
+}
+
+/// 非 ASCII 字符是否**全部**落在 U+0080..U+07FF（UTF-8 二字节序列的取值区间）。
+/// 出现三/四字节字符（汉字本身、emoji）就说明这份文本不可能是"GBK 被误读"的产物。
+fn only_two_byte_band(s: &str) -> bool {
+    let mut saw_non_ascii = false;
+    for c in s.chars() {
+        let u = c as u32;
+        if u < 0x80 {
+            continue;
+        }
+        if u > 0x7FF {
+            return false;
+        }
+        saw_non_ascii = true;
+    }
+    saw_non_ascii
+}
+
+/// 是否含中日韩文字：基本汉字 U+4E00..U+9FFF、扩展 A U+3400..U+4DBF、
+/// 兼容汉字 U+F900..U+FAFF、假名 U+3040..U+30FF、CJK 标点 U+3000..U+303F、
+/// 全角形式 U+FF00..U+FFEF。GBK 正确解出中文时必定命中其中之一。
+fn has_cjk(s: &str) -> bool {
+    s.chars().any(|c| {
+        matches!(
+            c as u32,
+            0x3000..=0x30FF
+                | 0x3400..=0x4DBF
+                | 0x4E00..=0x9FFF
+                | 0xF900..=0xFAFF
+                | 0xFF00..=0xFFEF
+        )
+    })
 }
 
 /// 从 Netscape 文本解析 cookie 列表。
@@ -403,5 +465,92 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].name, "SESS");
         assert_eq!(loaded[0].value, "值");
+    }
+
+    /// 只换编码、其余一律与上面那条测试同形的 cookie 行（保证两边可比）。
+    fn sess_line(value: &str) -> String {
+        format!("# Netscape HTTP Cookie File\n.example.com\tTRUE\t/\tTRUE\t\tSESS\t{value}\n")
+    }
+
+    fn write_cookie_file(dir: &Path, bytes: &[u8]) {
+        std::fs::write(dir.join("example.com.txt"), bytes).unwrap();
+    }
+
+    fn load_value(dir: &Path) -> Vec<CookieEntry> {
+        CookieStore::new(dir).load_host("example.com").unwrap()
+    }
+
+    #[test]
+    fn utf8_cookie_file_is_not_rewritten_as_gbk() {
+        // 与 GBK 那条互为反向：改判必须有依据，不能一律偏向 GBK，
+        // 否则"记事本另存为 UTF-8"这条路径反而坏掉
+        let root = tempdir().unwrap();
+        let dir = root.path().join("cookies");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_cookie_file(&dir, sess_line("值").as_bytes());
+        let loaded = load_value(&dir);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].value, "值");
+    }
+
+    #[test]
+    fn multi_char_gbk_cookie_file_readable() {
+        // 多个汉字时字节流通常不再是合法 UTF-8，走的是 decode_text 的 GBK 分支；
+        // 与单字（歧义分支）两条路径都要通
+        let root = tempdir().unwrap();
+        let dir = root.path().join("cookies");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (gbk, _, _) = encoding_rs::GBK.encode(sess_line("学习近值"));
+        write_cookie_file(&dir, gbk.as_ref());
+        assert_eq!(load_value(&dir)[0].value, "学习近值");
+    }
+
+    #[test]
+    fn utf16_and_bom_cookie_files_readable() {
+        let root = tempdir().unwrap();
+        let dir = root.path().join("cookies");
+        std::fs::create_dir_all(&dir).unwrap();
+        let line = sess_line("值");
+
+        // UTF-8 BOM：记事本"UTF-8"另存在 Win10 1903+ 默认带 BOM
+        let mut bom8 = vec![0xEF, 0xBB, 0xBF];
+        bom8.extend_from_slice(line.as_bytes());
+        write_cookie_file(&dir, &bom8);
+        assert_eq!(load_value(&dir)[0].value, "值");
+
+        // UTF-16LE：PowerShell 的 `>` 重定向默认产物
+        let mut le: Vec<u8> = vec![0xFF, 0xFE];
+        le.extend(line.encode_utf16().flat_map(|u| u.to_le_bytes()));
+        write_cookie_file(&dir, &le);
+        assert_eq!(load_value(&dir)[0].value, "值");
+
+        // UTF-16BE
+        let mut be: Vec<u8> = vec![0xFE, 0xFF];
+        be.extend(line.encode_utf16().flat_map(|u| u.to_be_bytes()));
+        write_cookie_file(&dir, &be);
+        assert_eq!(load_value(&dir)[0].value, "值");
+    }
+
+    #[test]
+    fn ascii_cookie_file_is_untouched() {
+        // 绝大多数真实 cookie 全是 ASCII：这条守住了改判逻辑不去动正常文件
+        let root = tempdir().unwrap();
+        let dir = root.path().join("cookies");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_cookie_file(&dir, sess_line("CAISxgJ1q6Ft5B2yfSjIr5bK").as_bytes());
+        let loaded = load_value(&dir);
+        assert_eq!(loaded[0].value, "CAISxgJ1q6Ft5B2yfSjIr5bK");
+        assert_eq!(loaded[0].domain, ".example.com");
+    }
+
+    #[test]
+    fn gbk_misread_signature_is_detected() {
+        // 歧义的来源：值 的 GBK 编码 D6 B5 同时是合法 UTF-8 的 U+05B5
+        assert_eq!(std::str::from_utf8(&[0xD6, 0xB5]).unwrap(), "\u{5b5}");
+        assert!(only_two_byte_band("\u{5b5}"));
+        assert!(!only_two_byte_band("值")); // 三字节汉字不是这个特征
+        assert!(!only_two_byte_band("pure ascii"));
+        assert!(has_cjk("值"));
+        assert!(!has_cjk("\u{5b5}"));
     }
 }

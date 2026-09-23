@@ -591,21 +591,61 @@ pub fn hide_console(cmd: &mut std::process::Command) {
     }
 }
 
-/// 子进程文本输出解码：优先 UTF-8；非法序列时 Windows 走 GBK（yt-dlp
-/// 在中文 Windows 下常输出 cp936），其余平台做 lossy 替换。
+/// 文本解码：BOM（无歧义）→ UTF-8 → GBK → lossy。
+///
+/// **为什么不按平台分支**：字节是什么编码由产出方决定，与"谁在读"无关。旧的
+/// `cfg(windows)` 分支让同一份字节在开发机（Linux）与生产机（Windows）上解出
+/// 不同结果，GBK 相关的回归测试在开发机上永远验不到。
+///
+/// **残留的歧义**：GBK 双字节序列中 lead ∈ C2..DF 且 trail ∈ 80..BF 的那一批，
+/// 同时也是合法的 UTF-8 二字节序列（`值` = `D6 B5` 会被解成 U+05B5 希伯来元音）。
+/// 子进程输出以 UTF-8 为真身，所以这里让 UTF-8 优先；用户手工保存的 cookie 文件
+/// 情况正好相反，由 `cookies::decode_cookie_file` 按文件形态改判 GBK。
 pub fn decode_text(bytes: &[u8]) -> String {
+    if let Some(s) = decode_with_bom(bytes) {
+        return s;
+    }
     if let Ok(s) = std::str::from_utf8(bytes) {
         return s.to_string();
     }
-    #[cfg(windows)]
-    {
-        let (cow, _, _) = encoding_rs::GBK.decode(bytes);
-        cow.into_owned()
+    let (cow, _, had_errors) = encoding_rs::GBK.decode(bytes);
+    if had_errors {
+        // 连 GBK 都解不动（如孤立高位字节）：退化成替换符，不返回半成品乱码
+        return String::from_utf8_lossy(bytes).into_owned();
     }
-    #[cfg(not(windows))]
-    {
-        String::from_utf8_lossy(bytes).into_owned()
+    cow.into_owned()
+}
+
+/// BOM 能唯一确定编码，必须排在任何"猜"之前。
+///
+/// UTF-16 的现实来源：PowerShell 的 `>` 重定向默认写 UTF-16LE，用户用它导出
+/// cookie 文件（`curl ... > cookies.txt`）后导进来，缺这一步就是整文件乱码。
+fn decode_with_bom(bytes: &[u8]) -> Option<String> {
+    if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        return Some(String::from_utf8_lossy(rest).into_owned());
     }
+    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        return Some(decode_utf16(rest, true));
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        return Some(decode_utf16(rest, false));
+    }
+    None
+}
+
+/// 按字节对解码 UTF-16：BOM 已在上游剥掉，这里两两成组即可（奇数尾字节丢弃）。
+fn decode_utf16(bytes: &[u8], little_endian: bool) -> String {
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|b| {
+            if little_endian {
+                u16::from_le_bytes([b[0], b[1]])
+            } else {
+                u16::from_be_bytes([b[0], b[1]])
+            }
+        })
+        .collect();
+    String::from_utf16_lossy(&units)
 }
 
 /// 排空子进程 stderr 并收集为字符串（trim 后返回；失败原因收集用，P2-8）。
@@ -907,5 +947,34 @@ mod tests {
             "超时应及时返回，实际 {:?}",
             t0.elapsed()
         );
+    }
+
+    #[test]
+    fn decode_text_honors_byte_order_marks() {
+        // 无 BOM 的 UTF-8
+        assert_eq!(decode_text("影栈".as_bytes()), "影栈");
+        // UTF-8 BOM：剥掉，不留下 U+FEFF（它会粘在第一行上破坏 "# " 注释判定）
+        let mut bom8 = vec![0xEF, 0xBB, 0xBF];
+        bom8.extend_from_slice("影栈".as_bytes());
+        assert_eq!(decode_text(&bom8), "影栈");
+        // UTF-16LE（PowerShell 重定向的默认产物）与 BE
+        let mut le = vec![0xFF, 0xFE];
+        le.extend("影栈".encode_utf16().flat_map(|u| u.to_le_bytes()));
+        assert_eq!(decode_text(&le), "影栈");
+        let mut be = vec![0xFE, 0xFF];
+        be.extend("影栈".encode_utf16().flat_map(|u| u.to_be_bytes()));
+        assert_eq!(decode_text(&be), "影栈");
+        // 连 GBK 都解不动的孤立高位字节：退化为替换符，不 panic
+        assert!(decode_text(&[0x81]).contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn gbk_pair_can_be_valid_utf8() {
+        // 钉死这个歧义本身，而不是某个编码分支的输出：`值` 的 GBK 编码 D6 B5
+        // 同时是合法 UTF-8（U+05B5）。所以"UTF-8 优先"对**子进程输出**是对的
+        // （那里 UTF-8 是真身），对**用户手工保存的 cookie 文件**是错的 ——
+        // 后者由 cookies::decode_cookie_file 按文件形态改判，不能把两边合并成一个函数。
+        assert_eq!(std::str::from_utf8(&[0xD6, 0xB5]).unwrap(), "\u{5b5}");
+        assert_eq!(decode_text(&[0xD6, 0xB5]), "\u{5b5}");
     }
 }
