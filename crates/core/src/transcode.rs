@@ -344,8 +344,9 @@ pub fn build_args_for_tier(
         enc_args.push("hvc1".into());
     }
 
-    // —— 音频增益（normalize_audio + 解析音量；接近满度/无音量/多音轨不处理）——
-    // 多音轨跳过：volumedetect 峰值只测了第一轨（MediaMeta::needs_audio_gain）。
+    // —— 音频增益（normalize_audio + 解析音量；接近满度/无音量不处理）——
+    // 只处理主音频：-map 0:a:0? 只保留第一条音轨，其余抛弃，
+    // volumedetect 峰值与增益目标始终是同一条流。
     let need_gain = meta.needs_audio_gain(params.normalize_audio);
     let gain = if need_gain {
         let max_v = meta.audio_volume.max_volume_db.unwrap_or(0.0);
@@ -452,7 +453,7 @@ pub fn build_args_for_tier(
                         args.push("-map".into());
                         args.push("[v]".into());
                         args.push("-map".into());
-                        args.push("0:a?".into());
+                        args.push("0:a:0?".into());
                         args.push("-map".into());
                         args.push("[cv]".into());
                     } else {
@@ -460,7 +461,7 @@ pub fn build_args_for_tier(
                         args.push("-map".into());
                         args.push("[v]".into());
                         args.push("-map".into());
-                        args.push("0:a?".into());
+                        args.push("0:a:0?".into());
                         args.push("-map".into());
                         args.push(format!("0:{ci}?"));
                     }
@@ -477,7 +478,7 @@ pub fn build_args_for_tier(
                             .unwrap_or_else(|| "0:v:0?".to_string()),
                     );
                     args.push("-map".into());
-                    args.push("0:a?".into());
+                    args.push("0:a:0?".into());
                     if let Some(ci) = cover_idx {
                         args.push("-map".into());
                         args.push(format!("0:{ci}?"));
@@ -493,7 +494,7 @@ pub fn build_args_for_tier(
             args.push("-map".into());
             args.push(format!("{main_label}?"));
             args.push("-map".into());
-            args.push("0:a?".into());
+            args.push("0:a:0?".into());
             if rotated {
                 if let Some(ci) = cover_idx {
                     // 封面从第二软件输入取，CPU 滤镜旋转
@@ -515,7 +516,7 @@ pub fn build_args_for_tier(
             args.push("-map".into());
             args.push(format!("{main_label}?"));
             args.push("-map".into());
-            args.push("0:a?".into());
+            args.push("0:a:0?".into());
             if rotated {
                 if let Some(ci) = cover_idx {
                     args.push("-map".into());

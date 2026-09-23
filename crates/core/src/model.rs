@@ -252,12 +252,11 @@ impl MediaMeta {
         }
     }
 
-    /// 是否需要音量增益：normalize 开启 + 峰值有效（-100~-0.5dB）+ **单音轨**。
-    /// 多音轨跳过增益：volumedetect 峰值只测了第一轨，一个增益应用到所有轨
-    /// 可能削波或不足（download_video.bat PROBE_AUDIO 同款保护）。
+    /// 是否需要音量增益：normalize 开启 + 峰值有效（-100~-0.5dB）。
+    /// 只处理主音频（第一条音轨），其余音轨在 ffmpeg 层用 `-map 0:a:0?` 抛弃，
+    /// 因此 volumedetect 峰值与增益目标始终是同一条流，不存在多轨增益不准的问题。
     pub fn needs_audio_gain(&self, normalize: bool) -> bool {
         normalize
-            && self.audio_tracks.unwrap_or(1) <= 1
             && self
                 .audio_volume
                 .max_volume_db
@@ -661,10 +660,10 @@ mod tests {
     }
 
     #[test]
-    fn needs_audio_gain_skips_multitrack() {
-        // 单音轨 + 音量有效 → 增益
+    fn needs_audio_gain_decision() {
+        // 音量有效 + normalize 开 → 增益（多音轨也增益，只处理第一条）
         let mut m = MediaMeta {
-            audio_tracks: Some(1),
+            audio_tracks: Some(2),
             audio_volume: AudioVolume {
                 max_volume_db: Some(-8.2),
                 ..Default::default()
@@ -672,11 +671,7 @@ mod tests {
             ..Default::default()
         };
         assert!(m.needs_audio_gain(true));
-        // 多音轨 → 跳过（峰值只测了第一轨，bat PROBE_AUDIO 同款）
-        m.audio_tracks = Some(2);
-        assert!(!m.needs_audio_gain(true));
         // normalize 关 → 不增益
-        m.audio_tracks = Some(1);
         assert!(!m.needs_audio_gain(false));
         // 接近满度/无音量 → 不增益
         m.audio_volume.max_volume_db = Some(-0.2);

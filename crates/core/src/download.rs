@@ -632,8 +632,8 @@ pub fn post_process(
         .short_edge()
         .map(|s| s > cfg.max_h && cfg.max_h > 0)
         .unwrap_or(false);
-    // 多音轨跳过增益：volumedetect 峰值只测了第一轨（MediaMeta::needs_audio_gain，
-    // download_video.bat PROBE_AUDIO 同款保护）。
+    // 只处理主音频：-map 0:a:0? 只保留第一条音轨，其余抛弃，
+    // volumedetect 峰值与增益目标始终是同一条流。
     let need_gain = meta.needs_audio_gain(general.normalize_audio);
 
     if !need_downscale && !need_gain {
@@ -672,7 +672,7 @@ pub fn post_process(
             args.push("-map".into());
             args.push("[v]".into());
             args.push("-map".into());
-            args.push("0:a?".into());
+            args.push("0:a:0?".into());
             args.push("-map".into());
             args.push(format!("0:{ci}?"));
             args.push("-c:v:0".into());
@@ -700,7 +700,7 @@ pub fn post_process(
                     .unwrap_or_else(|| "0:v:0?".to_string()),
             );
             args.push("-map".into());
-            args.push("0:a?".into());
+            args.push("0:a:0?".into());
             if let Some(ci) = cover_idx {
                 args.push("-map".into());
                 args.push(format!("0:{ci}?"));
