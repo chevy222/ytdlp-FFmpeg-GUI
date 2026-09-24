@@ -1171,9 +1171,8 @@ fn finish_download(app: &AppHandle, id: &str, result: Result<download::DownloadO
                     // 不需要重新从网络下载，也不需要 ffmpeg 抽帧。
                     let written = ytdlp_core::thumbs::collect_written_thumbnail(out);
                     let ok = if let Some(thumb_file) = written {
-                        match std::fs::copy(&thumb_file, &dest) {
+                        let copied = match std::fs::copy(&thumb_file, &dest) {
                             Ok(_) => {
-                                let _ = std::fs::remove_file(&thumb_file);
                                 log_item(&app2, &id2, format!("缩略图：取自 yt-dlp 封面 {}", thumb_file.display()));
                                 true
                             }
@@ -1181,7 +1180,22 @@ fn finish_download(app: &AppHandle, id: &str, result: Result<download::DownloadO
                                 log_item(&app2, &id2, format!("缩略图：复制封面失败（{}），回退 ffmpeg 抽帧", e));
                                 false
                             }
+                        };
+                        // 无论复制成功与否，封面文件都不再需要（成功已进缓存，
+                        // 失败则回退 ffmpeg 抽帧）。Windows 上刚下载完的文件
+                        // 可能被 AV 锁定，重试 5 次（每次 200ms），仍失败则记日志。
+                        for attempt in 0..5 {
+                            match std::fs::remove_file(&thumb_file) {
+                                Ok(_) => break,
+                                Err(_) if attempt < 4 => {
+                                    std::thread::sleep(std::time::Duration::from_millis(200));
+                                }
+                                Err(e) => {
+                                    log_item(&app2, &id2, format!("缩略图：清理封面文件失败（{}），请手动删除 {}", e, thumb_file.display()));
+                                }
+                            }
                         }
+                        copied
                     } else {
                         log_item(&app2, &id2, "缩略图：输出目录无封面文件，ffmpeg 抽帧".to_string());
                         false
