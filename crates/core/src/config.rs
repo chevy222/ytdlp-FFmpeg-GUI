@@ -254,8 +254,12 @@ impl AppConfig {
             self.general.collision_policy = "auto_inc".into();
         }
 
-        self.download.max_h = self.download.max_h.clamp(1, MAX_EDGE);
-        self.download.max_dl_h = self.download.max_dl_h.clamp(1, MAX_EDGE);
+        // 分辨率上限保留 0 = "不限制"（UI 允许 0、消费端 download.rs:635 也以
+        // `cfg.max_h > 0` 判定是否需要降采样）。用 .min 而非 .clamp(1,…)：
+        // 否则用户设 0 存盘变 1 → need_downscale 恒真，毁掉全部下载。
+        // transcode.max_w/max_h 同语义字段即用 .min(MAX_EDGE)，这里保持一致。
+        self.download.max_h = self.download.max_h.min(MAX_EDGE);
+        self.download.max_dl_h = self.download.max_dl_h.min(MAX_EDGE);
         self.download.fragments = self.download.fragments.clamp(1, 16);
         self.download.retries = self.download.retries.clamp(0, 10);
 
@@ -443,7 +447,9 @@ mod tests {
         assert_eq!(c.general.history_limit, GeneralConfig::HISTORY_LIMIT_MAX);
         assert_eq!(c.general.collision_policy, "auto_inc");
         assert_eq!(c.download.fragments, 1);
-        assert_eq!(c.download.max_h, 1);
+        // max_h 保留 0 = "不限制"（见 sanitize 注释；clamp 到 1 会把 0 吃成 1，
+        // 使"不限制"变成恒降采样）
+        assert_eq!(c.download.max_h, 0);
         assert_eq!(c.transcode.brcap_kbps, Some(1));
         assert_eq!(c.transcode.force_encoder_mode, "auto");
 

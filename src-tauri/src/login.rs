@@ -159,9 +159,15 @@ fn classify_magic_url(url: &url::Url) -> Option<MagicNav> {
     }
 }
 
-fn handle_login_done(win: &tauri::WebviewWindow, host: &str, url: &str) {
+fn handle_login_done(win: &tauri::WebviewWindow, host: &str, _url: &str) {
     let app = win.app_handle().clone();
-    // 1) Windows：尝试 COM 抓取（含 HttpOnly）
+    // 仅保留 COM 抓取通路：**不接受 URL 携带的 `cookies=` 载荷**。
+    // 该回退分支无法区分"是我注入的完成按钮点的"还是"页面任何脚本发起的
+    // 顶层跳转"（`window.top.location='http://127.0.0.1/ytdlp-login-done?cookies=…'`
+    // 被风控的广告脚本就够）——攻击者可直接写入任意 cookie 并关窗、伪造
+    // "已保存"提示。COM CookieManager 抓取的是当前页面真实会话（含 HttpOnly），
+    // 且 on_navigation 已取消到 127.0.0.1 的导航、webview 仍停留在原站点，
+    // 因此只从 COM 取、失败就明确报错，绝不写页面提供的载荷。
     #[cfg(windows)]
     {
         let (tx, rx) = std::sync::mpsc::channel::<Option<Vec<ytdlp_core::cookies::CookieEntry>>>();
@@ -169,46 +175,43 @@ fn handle_login_done(win: &tauri::WebviewWindow, host: &str, url: &str) {
         let _ = win.with_webview(move |webview| {
             let _ = tx.send(crate::login_win::fetch_cookies_com(&webview, &host_owned));
         });
-        // 兜底超时：CookieManager 回调不返回时不要永久挂起，直接走下面的
-        // URL 携带 cookie 回退路径。（主线程侧的泵另有截止时间，见 login_win.rs）
+        // 兜底超时：CookieManager 回调不返回时不要永久挂起
         let got = rx
             .recv_timeout(std::time::Duration::from_secs(10))
             .ok()
             .flatten();
         if let Some(cookies) = got {
-            if !cookies.is_empty() {
-                let _ = save_cookies(app.clone(), host.to_string(), cookies);
-                finish_login(&app, host);
+            if cookies.is_empty() {
+                // 站点确实没给会话 cookie（可能未登录成功）——不要静默当"完成"
+                let _ = app.emit(
+                    "login:failed",
+                    serde_json::json!({ "host": host, "reason": "未捕获到登录 cookie，请确认已在页面内完成登录" }),
+                );
                 return;
             }
-        }
-    }
-    // 2) 回退：解析 URL 携带的 document.cookie
-    if let Ok(parsed) = url::Url::parse(url) {
-        let mut cookies = Vec::new();
-        for (k, v) in parsed.query_pairs() {
-            if k == "cookies" {
-                for c in parse_cookie_header(v.as_ref()) {
-                    cookies.push(ytdlp_core::cookies::CookieEntry {
-                        name: c.0,
-                        value: c.1,
-                        // strip_prefix 只剥一次：trim_start_matches 会把 www.www- 这类
-                        // 前缀反复剥掉，得出错误域
-                        domain: format!(".{}", host.strip_prefix("www.").unwrap_or(host)),
-                        path: "/".into(),
-                        expires: None,
-                        http_only: false,
-                        secure: true,
-                        same_site: "lax".into(),
-                    });
-                }
+            if let Err(e) = save_cookies(app.clone(), host.to_string(), cookies) {
+                let _ = app.emit(
+                    "login:failed",
+                    serde_json::json!({ "host": host, "reason": format!("保存 cookie 失败：{e}") }),
+                );
+                return;
             }
-        }
-        if !cookies.is_empty() {
-            let _ = save_cookies(app.clone(), host.to_string(), cookies);
+            finish_login(&app, host);
+        } else {
+            let _ = app.emit(
+                "login:failed",
+                serde_json::json!({ "host": host, "reason": "读取浏览器 Cookie 失败，请重试登录" }),
+            );
         }
     }
-    finish_login(&app, host);
+    // 非 Windows 平台没有 COM CookieManager，也没有安全通路，明确报错而非写假载荷
+    #[cfg(not(windows))]
+    {
+        let _ = app.emit(
+            "login:failed",
+            serde_json::json!({ "host": host, "reason": "当前平台不支持自动读取登录 Cookie" }),
+        );
+    }
 }
 fn finish_login(app: &AppHandle, host: &str) {
     // 关闭登录窗
@@ -217,20 +220,6 @@ fn finish_login(app: &AppHandle, host: &str) {
     }
     // 通知前端（触发 NeedLogin 条目自动重解析）
     let _ = app.emit("login:done", serde_json::json!({ "host": host }));
-}
-
-/// 解析 `a=b; c=d` 形式 cookie 字符串。
-fn parse_cookie_header(s: &str) -> Vec<(String, String)> {
-    s.split(';')
-        .filter_map(|part| {
-            let part = part.trim();
-            if part.is_empty() {
-                return None;
-            }
-            let (k, v) = part.split_once('=')?;
-            Some((k.trim().to_string(), v.trim().to_string()))
-        })
-        .collect()
 }
 
 /// 注入脚本：顶部中心"登录完成"按钮 + 提示条 + SPA 800ms 保活重建（DL-05）。
@@ -335,14 +324,6 @@ mod tests {
             .unwrap()
             .contains("douyin"));
         assert!(login_url_for_host("example.com").is_none());
-    }
-
-    #[test]
-    fn parse_cookie_header_basic() {
-        let c = parse_cookie_header("SID=abc; VISITOR_INFO1_LIVE=x; empty");
-        assert_eq!(c.len(), 2);
-        assert_eq!(c[0], ("SID".to_string(), "abc".to_string()));
-        assert_eq!(c[1].0, "VISITOR_INFO1_LIVE");
     }
 
     #[test]

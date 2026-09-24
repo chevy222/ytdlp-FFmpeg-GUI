@@ -408,12 +408,17 @@ pub fn stream_lines(
         }
     }
 
-    let status = guard.wait()?;
+    let status = guard.wait();
+    // 必须先置 done + join 再处理 wait() 的错误：wait() 失败时若直接 `?`
+    // 提前返回，看门狗线程（deadline=None 时只在 done 上退出）与 stderr
+    // 排空线程都会永久泄漏、子进程写端句柄不回收。这条路径只在"管道读错 /
+    // 进程状态异常"时走，正是故障时更不能漏。
     done.store(true, Ordering::Relaxed);
     let _ = err_thread.join();
     if let Some(w) = watchdog {
         let _ = w.join();
     }
+    let status = status?;
     let stderr = err_buf.lock().clone();
     Ok(StreamOutcome {
         status,
@@ -570,14 +575,32 @@ pub fn tool_version(resolver: &ToolResolver, tool: Tool) -> Option<String> {
 pub fn display_command(program: &str, args: &[String]) -> String {
     let mut s = program.to_string();
     for a in args {
-        if a.is_empty() || a.chars().any(|c| c.is_whitespace() || c == '"') {
-            s.push_str(&format!(" \"{}\"", a.replace('"', "\\\"")));
+        // 代理地址带凭据时对 `user:pass@` 脱敏（否则明文进日志/history.json）。
+        // 仅作用于"看起来是带凭据的 URL/参数"（含 `://` 且主机段含 `@`），
+        // 不影响普通路径参数的展示。
+        let shown = redact_proxy_credentials(a);
+        if shown.is_empty() || shown.chars().any(|c| c.is_whitespace() || c == '"') {
+            s.push_str(&format!(" \"{}\"", shown.replace('"', "\\\"")));
         } else {
             s.push(' ');
-            s.push_str(a);
+            s.push_str(&shown);
         }
     }
     s
+}
+
+/// 把 `scheme://user:pass@host/...` 的凭据段替换为 `***:***@`。
+/// 非 URL、或 URL 无凭据段时原样返回。
+fn redact_proxy_credentials(arg: &str) -> String {
+    let Some((scheme, rest)) = arg.split_once("://") else {
+        return arg.to_string();
+    };
+    // 主机段是 rest 里第一个 '/' 之前的部分；凭据 `user:pass@` 必须落在这段内
+    let host_seg = &rest[..rest.find('/').unwrap_or(rest.len())];
+    if let Some(at) = host_seg.find('@') {
+        return format!("{}://***:***@{}", scheme, &rest[at + 1..]);
+    }
+    arg.to_string()
 }
 
 /// Windows 下隐藏子进程控制台窗口（CREATE_NO_WINDOW），避免 GUI 程序

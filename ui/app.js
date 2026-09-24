@@ -17,7 +17,10 @@ const ST_LABEL = { Probing:'解析中', Ready:'已就绪', Downloading:'下载�
 // 进行中的状态：后端会拒绝删除这类条目（"请先取消再删除"），兜底轮询与批量删除也按这份清单判断
 const BUSY_STATUS = ['Probing','Downloading','PostProcessing','Transcoding','Merging'];
 
-function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+// esc() 转义所有会破坏 HTML 的字符，含单引号：属性/事件处理器里用单引号包住
+// 插值即可形成注入面，叠加 withGlobalTauri 就等于拿到全部命令。规范：所有属性
+// 一律双引号包裹，单引号也一并转义，双保险。
+function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
 
 // 画质/格式列：12 项源元数据（容器·分辨率·编码·视频码率·帧率·音频编码·采样率·音频码率·音轨数·最大音量·时长·大小）
 // 画质列由前端渲染（P1-6 定案：后端不产出）。
@@ -755,7 +758,7 @@ function renderSetPage(){
       '<div class="set-row"><div class="k">说明<small>未登录也能解析的站点（如 B 站低码率）用上面的内置登录换高清晰度</small></div><div class="v"><button class="btn sm" data-act="refresh-cookie">刷新</button></div></div>';
   } else if(curPage==='download'){
     h+=row('画质上限（短边，超限自动降分辨率转码）',num('download.max_h',d.max_h,0,4320));
-    h+=row('下载高度硬上限',num('download.max_dl_h',d.max_dl_h,0,4320).replace('<input ','<input disabled '),'【暂未生效】该配置项后端尚未读取，改动不生效。');
+    h+=row('下载高度硬上限',num('download.max_dl_h',d.max_dl_h,0,4320),'超过此高度的源在下载阶段直接跳过超清格式（0 = 不限制）');
     h+=row('并发分片数',num('download.fragments',d.fragments,1,16));
     h+=row('重试次数',num('download.retries',d.retries,0,10));
     h+=row('仅音频默认',chk('download.audio_only',d.audio_only,''));
@@ -781,7 +784,6 @@ function renderSetPage(){
     h+=row('并发任务数（全局：下载/转码/合并共享）',num('general.concurrency',g.concurrency,1,16));
     h+=row('启动时检查更新',chk('general.check_update',g.check_update,''),'启动时查询 GitHub 最新 Release，有新版弹提示（不自动安装，需手动下载替换）');
     h+=row('历史上限（条，默认 100、上限 200）',num('general.history_limit',g.history_limit,1,200),'超出上限时优先裁剪最旧的终态条目（进行中的任务不会被裁掉）。');
-    h+=row('清理解析缓存','<button class="btn sm" data-act="clear-cache">清理解析缓存</button>','解析缓存存于 config/cache.json + config/cache/（P1 接入）');
   }
   page.innerHTML=h;
   bindSetEvents();
@@ -899,8 +901,6 @@ function bindSetEvents(){
       INVOKE('open_login_site',{host:u.hostname}).catch(err=>toast(err));
     }catch(e){toast('URL 格式不正确');}
   });
-  const clearCache=page.querySelector('[data-act="clear-cache"]');
-  if(clearCache)clearCache.addEventListener('click',()=>toast('解析缓存清除（P1 接入）'));
 }
 function setCfg(path,val){
   const parts=path.split('.');
@@ -993,6 +993,11 @@ async function init(){
       // 真正触发重解析：NeedLogin 条目逐个 retry（后端 retry_item 允许该状态）
       S.items.filter(i=>i.status==='NeedLogin')
         .forEach(i=>INVOKE('retry_item',{id:i.id}).catch(()=>{}));
+    }).then(un=>unlisteners.push(un)).catch(()=>{});
+    // 登录失败（未捕获到 cookie / 读取失败）：明确提示，不再静默当"已保存"
+    LISTEN('login:failed', e=>{
+      const d=e.payload||{};
+      toast('登录失败：'+(d.reason||'未知原因')+'（'+(d.host||'')+'）');
     }).then(un=>unlisteners.push(un)).catch(()=>{});
     LISTEN('cookies:changed', ()=>{ if(curPage==='cookie')loadCookieList(); }).then(un=>unlisteners.push(un)).catch(()=>{});
     LISTEN('tool:progress', e=>{

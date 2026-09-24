@@ -654,9 +654,12 @@ pub(crate) fn parse_out_time_us(line: &str) -> Option<u64> {
     if let Some(v) = line.strip_prefix("out_time_us=") {
         return v.trim().parse().ok();
     }
-    if let Some(v) = line.strip_prefix("out_time_ms=") {
-        return v.trim().parse::<u64>().ok().map(|ms| ms * 1000);
-    }
+    // 注意：**不处理 `out_time_ms=`**。ffmpeg 各版本的 -progress 块按
+    // out_time_us → out_time_ms → out_time= 顺序输出，且 `out_time_ms`
+    // 的值实际是微秒（实测 ffmpeg 9.0.1：out_time_us=2000000 与
+    // out_time_ms=2000000 相同）。若按字段名当成毫秒 ×1000，同一进度块
+    // 会产生"正确值 → 1000×错误值 → 正确值"，进度条每秒闪一次 100%。
+    // `out_time_us` 与 `out_time=` 已覆盖所有版本，无需此分支。
     // 新版 ffmpeg 输出 out_time=HH:MM:SS.xx 格式
     if let Some(v) = line.strip_prefix("out_time=") {
         let v = v.trim();
@@ -1076,7 +1079,9 @@ mod tests {
     #[test]
     fn parse_us() {
         assert_eq!(parse_out_time_us("out_time_us=1234567"), Some(1234567));
-        assert_eq!(parse_out_time_us("out_time_ms=999"), Some(999000));
+        // out_time_ms 的值实为微秒（见 parse_out_time_us 注释），不应处理：
+        // 喂真实 ffmpeg 片段，确认该行不会产生 ×1000 的错误值。
+        assert_eq!(parse_out_time_us("out_time_ms=999"), None);
         assert_eq!(parse_out_time_us("progress=end"), None);
     }
 

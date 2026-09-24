@@ -162,9 +162,13 @@ fn netscape_format(cookies: &[CookieEntry]) -> String {
             None => String::new(),
         };
         let value = c.value.replace(['\t', '\n'], " ");
+        // HttpOnly 用 `#HttpOnly_` 前缀标记（curl / yt-dlp / MozillaCookieJar
+        // 的通行写法），与 netscape_parse 的识别对称，否则 http_only 标志在
+        // 第一次保存后永久丢失
+        let prefix = if c.http_only { "#HttpOnly_" } else { "" };
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-            domain, include_sub, c.path, secure, expires, c.name, value
+            "{}{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            prefix, domain, include_sub, c.path, secure, expires, c.name, value
         ));
     }
     out
@@ -234,11 +238,20 @@ fn has_cjk(s: &str) -> bool {
 /// 从 Netscape 文本解析 cookie 列表。
 fn netscape_parse(s: &str) -> Vec<CookieEntry> {
     let mut out = Vec::new();
-    for line in s.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
+    for raw in s.lines() {
+        // 真注释行（以 # 开头且非 HttpOnly 标记）跳过。curl / Python
+        // MozillaCookieJar / yt-dlp 用 `#HttpOnly_` 前缀标记 HttpOnly cookie，
+        // 浏览器导出的会话 cookie（YouTube SID/HSID、B 站 SESSDATA）恰恰全是
+        // HttpOnly —— 若当注释整条丢弃，导入后就只剩 JS 可见的几条，
+        // "有 N 条 cookie"却仍然未登录。
+        let raw = raw.trim();
+        let (line, http_only) = if let Some(rest) = raw.strip_prefix("#HttpOnly_") {
+            (rest.trim(), true)
+        } else if raw.is_empty() || raw.starts_with('#') {
             continue;
-        }
+        } else {
+            (raw, false)
+        };
         let parts: Vec<&str> = line.split('\t').collect();
         if parts.len() < 7 {
             continue;
@@ -254,7 +267,6 @@ fn netscape_parse(s: &str) -> Vec<CookieEntry> {
         };
         let name = parts[5].to_string();
         let value = parts[6].to_string();
-        let http_only = false; // Netscape 格式不区分 HttpOnly
         let same_site = String::new();
         out.push(CookieEntry {
             name,

@@ -402,7 +402,16 @@ impl ToolDownloader {
 
         on_progress("校验".into(), 0.0);
         let digest = sha256_hex(&raw).map_err(|e| format!("计算 SHA-256 失败：{e}"))?;
-        let want = self.remote_sha(kind).unwrap_or_default();
+        // 期望值：有 `.sha256` 旁路文件的工具（yt-dlp / deno），取不到期望值 = 硬失败，
+        // 绝不"空即放行"——否则攻击者只要让那一次 .sha256 请求失败（403 限流 / DNS /
+        // 404）就能让整步校验静默跳过。ffmpeg/ffprobe 的 sha_url() 本身为 None（设计如此，
+        // 由 release-version feed 兜底），不在此列。
+        let want = match kind.sha_url() {
+            Some(_) => self
+                .remote_sha(kind)
+                .ok_or_else(|| "SHA-256 校验：无法获取远端期望值（网络失败/限流），拒绝安装".to_string())?,
+            None => String::new(),
+        };
         if !want.is_empty() && !digest.eq_ignore_ascii_case(&want) {
             let _ = std::fs::remove_file(&raw);
             return Err(format!(

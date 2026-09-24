@@ -106,12 +106,16 @@ impl AppState {
     }
 
     /// 注册取消标志并返回。
+    ///
+    /// 用 `entry().or_insert_with` 而非无条件 insert：cancel_item 可能在任务线程
+    /// register_cancel **之前** 就被调用（"已排队/刚启动"窗口），若这里无条件新建
+    /// flag 会覆盖掉取消意图；复用已存在的 flag 则取消请求不会因注册顺序蒸发。
     pub fn register_cancel(&self, id: &str) -> Arc<AtomicBool> {
-        let flag = Arc::new(AtomicBool::new(false));
         self.cancels
             .lock()
-            .insert(id.to_string(), flag.clone());
-        flag
+            .entry(id.to_string())
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+            .clone()
     }
 
     pub fn cancel_flag(&self, id: &str) -> Option<Arc<AtomicBool>> {

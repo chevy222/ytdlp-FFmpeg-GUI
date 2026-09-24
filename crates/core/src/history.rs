@@ -24,6 +24,45 @@ fn default_limit() -> usize {
     100
 }
 
+/// 逐条容错的恢复结果。
+struct PartialRecovery {
+    history: History,
+    kept: usize,
+    skipped: usize,
+}
+
+/// 从"整份反序列化失败"的 history.json 文本里逐条恢复可解析的条目。
+///
+/// 外层结构解析为 JSON Value，`items` 若存在则逐条 `from_value::<MediaItem>()`；
+/// 好条目保留，坏条目跳过（不因单条坏字段丢弃整份列表）。结构与
+/// `History` 不一致（如 items 缺失/非数组）时返回 None，由调用方走备份分支。
+fn recover_partial_history(text: &str) -> Option<PartialRecovery> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    let items = v.get("items")?.as_array()?;
+    let mut kept = Vec::new();
+    let mut skipped = 0usize;
+    for entry in items {
+        match serde_json::from_value::<MediaItem>(entry.clone()) {
+            Ok(it) => kept.push(it),
+            Err(_) => skipped += 1,
+        }
+    }
+    let kept_count = kept.len();
+    let limit = v
+        .get("limit")
+        .and_then(|l| l.as_u64())
+        .map(|l| l as usize)
+        .unwrap_or(100);
+    Some(PartialRecovery {
+        history: History {
+            items: kept,
+            limit: limit.clamp(1, crate::config::GeneralConfig::HISTORY_LIMIT_MAX),
+        },
+        kept: kept_count,
+        skipped,
+    })
+}
+
 impl Default for History {
     fn default() -> Self {
         Self {
@@ -78,7 +117,15 @@ impl History {
             if let Some(pos) = self.items.iter().position(|i| i.status.is_terminal()) {
                 self.items.remove(pos);
             } else {
-                self.items.remove(0);
+                // 全部都是非终态（运行中/待命）：**宁可临时超限也不裁**。
+                // 否则正在下载/转码/合并的条目会被挤出列表 → update_item 返回
+                // None 静默 no-op → 产物路径永久丢失、取消按钮消失，而子进程
+                // 还在写盘。等有任务变终态后下次 upsert 自然裁剪。
+                crate::log::warn(format!(
+                    "历史上限 {} 触发时无终态条目可裁，临时保留 {} 条运行中条目（不裁剪，避免丢失活跃任务）",
+                    self.limit, self.items.len()
+                ));
+                break;
             }
         }
     }
@@ -115,7 +162,28 @@ impl History {
                     .clamp(1, crate::config::GeneralConfig::HISTORY_LIMIT_MAX);
                 Ok(h)
             }
-            Err(e) => {
+            Err(_) => {
+                // D2：**不要一遇到单条坏字段就回退空列表**。history.json 是唯一持久层，
+                // 任何一条条目坏（如 percent 被手改成 null、未来新增字段、某条 NaN）
+                // 都让整份 JSON 反序列化失败 → 回退空 → 下一次 persist 覆盖真文件，
+                // 用户全部历史与运行中任务状态消失。这里降级为逐条容错：
+                // 坏条目跳过并计数，好条目保留。
+                let recovered = recover_partial_history(&text);
+                if let Some(partial) = recovered {
+                    crate::log::warn(format!(
+                        "history.json 存在无法解析的条目，已跳过 {} 条、保留 {} 条（其余字段损坏部分已尽力恢复）",
+                        partial.skipped, partial.kept
+                    ));
+                    let mut h = partial.history;
+                    h.limit = h
+                        .limit
+                        .clamp(1, crate::config::GeneralConfig::HISTORY_LIMIT_MAX);
+                    // 备份原文件，让用户能找回被跳过条目的数据
+                    if let Some(backup) = crate::paths::corrupt_backup_path(path).into() {
+                        let _ = std::fs::copy(path, &backup);
+                    }
+                    return Ok(h);
+                }
                 let backup = crate::paths::corrupt_backup_path(path);
                 // 备份成败要如实说：文案写"已备份"而实际没备份，会把用户引向不存在的文件
                 let note = match std::fs::copy(path, &backup) {
@@ -124,7 +192,8 @@ impl History {
                 };
                 Err(CoreError::ConfigCorrupt(format!(
                     "history.json 损坏（{}）：{}",
-                    note, e
+                    note,
+                    "无法恢复任何条目"
                 )))
             }
         }
@@ -179,14 +248,17 @@ mod tests {
     }
 
     #[test]
-    fn upsert_trims_oldest_when_all_active() {
+    fn upsert_keeps_active_when_all_nonterminal() {
+        // 全部是运行中/待命（非终态）时：宁可临时超限也不裁 —— 裁掉运行中条目
+        // 会让 update_item 返回 None、产物路径永久丢失、取消按钮消失，而子进程
+        // 还在写盘。等有任务变终态后自然裁剪。
         let mut h = History::new(2);
         for i in 0..3 {
             let mut it = item(i);
             it.status = Status::Downloading;
             h.upsert(it);
         }
-        assert_eq!(h.len(), 2);
+        assert_eq!(h.len(), 3);
         assert!(h.items.iter().all(|i| i.status == Status::Downloading));
     }
 

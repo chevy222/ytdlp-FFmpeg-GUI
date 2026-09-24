@@ -61,7 +61,17 @@ fn same_parameters(metas: &[MediaMeta]) -> bool {
             m.extradata.clone(),
         )
     };
-    let a = |m: &MediaMeta| (m.acodec.clone(), m.sample_rate);
+    let a = |m: &MediaMeta| {
+        (
+            m.acodec.clone(),
+            m.sample_rate,
+            // 声道数/音轨数必须参与判定：2.0 与 5.1 混拼、或双音轨段与单音轨段
+            // 直拼，concat demuxer 不会报错但产物音轨/声道会错乱，且后续
+            // 提取/增益只按主音轨处理，静默丢数据。
+            m.audio_channels,
+            m.audio_tracks,
+        )
+    };
     let ref_v = v(first);
     let ref_a = a(first);
     metas

@@ -2071,17 +2071,17 @@ pub fn cancel_item(app: AppHandle, id: String) -> CmdResult<()> {
         return Ok(());
     }
     // 运行中（含解析中）：置取消标志，进程树由任务线程/看门狗终止
-    if let Some(flag) = state.cancel_flag(&id) {
-        flag.store(true, Ordering::Relaxed);
-        update_item(&app, &id, |it| {
-            transition_in(it, Status::Canceled);
-            it.push_log("正在取消…".to_string());
-        });
-        persist(&app);
-        Ok(())
-    } else {
-        Err("该任务未在运行中".into())
-    }
+    // 用 register_cancel（复用已有 flag / 预建新 flag）：任务线程可能还没执行到
+    // register_cancel（"已排队/刚启动"窗口），此时若只查不建就会丢失取消意图。
+    // 任务线程随后 entry().or_insert_with 复用同一 flag，取消不会因注册顺序蒸发。
+    let flag = state.register_cancel(&id);
+    flag.store(true, Ordering::Relaxed);
+    update_item(&app, &id, |it| {
+        transition_in(it, Status::Canceled);
+        it.push_log("正在取消…".to_string());
+    });
+    persist(&app);
+    Ok(())
 }
 
 #[tauri::command(async)]
