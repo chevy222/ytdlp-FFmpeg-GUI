@@ -31,8 +31,24 @@ impl TaskQueue {
         }
     }
 
-    pub fn set_concurrency(&mut self, c: usize) {
-        self.concurrency = c.max(1);
+    /// 更新并发上限。返回本次提升后应**立即启动**的等待任务（A4：调高并发时，
+    /// 若已有任务排队，必须马上放行，而不是等某个任务自然结束才弹队）。
+    pub fn set_concurrency(&mut self, c: usize) -> Vec<String> {
+        let new = c.max(1);
+        let grown = new > self.concurrency;
+        self.concurrency = new;
+        if !grown {
+            return Vec::new();
+        }
+        let mut to_launch = Vec::new();
+        while self.running.len() < self.concurrency {
+            let Some(next) = self.waiting.pop_front() else {
+                break;
+            };
+            self.running.insert(next.clone());
+            to_launch.push(next);
+        }
+        to_launch
     }
 
     /// 提交任务。返回 StartNow 时该任务已占用 slot。
@@ -147,12 +163,29 @@ mod tests {
         let mut q = TaskQueue::new(1);
         q.submit("a");
         q.submit("b");
-        q.set_concurrency(2);
-        // 更新并发不自动放行（下次 finish 时生效），账本一致即可
-        assert_eq!(q.running_count(), 1);
+        q.submit("c");
+        // 调到 2：应放行 1 个等待任务（b），c 继续排队
+        let launched = q.set_concurrency(2);
+        assert_eq!(launched, vec!["b".to_string()]);
+        assert_eq!(q.running_count(), 2);
         assert_eq!(q.waiting_count(), 1);
-        let next = q.finish("a");
-        assert_eq!(next.as_deref(), Some("b"));
+        assert!(q.is_running("b"));
+        // 再调到 3：放行 c
+        let launched = q.set_concurrency(3);
+        assert_eq!(launched, vec!["c".to_string()]);
+        assert_eq!(q.running_count(), 3);
+        assert_eq!(q.waiting_count(), 0);
+    }
+
+    #[test]
+    fn concurrency_shrink_no_launch() {
+        let mut q = TaskQueue::new(4);
+        q.submit("a");
+        q.submit("b");
+        // 调低/持平：不放行任何任务
+        assert!(q.set_concurrency(2).is_empty());
+        assert!(q.set_concurrency(3).is_empty());
+        assert_eq!(q.running_count(), 2);
     }
 
     #[test]

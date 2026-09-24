@@ -1,10 +1,10 @@
 {
   "identifier": "default",
-  "description": "主窗口默认能力",
+  "description": "主窗口默认能力（最小权限：只监听事件、打开文件对话框）",
   "windows": ["main"],
   "permissions": [
-    "core:event:default",
-    "core:webview:default",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
     "dialog:allow-open"
   ]
 }

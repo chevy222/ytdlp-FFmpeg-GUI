@@ -9,6 +9,7 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "影栈（ytdlp-FFmpeg-GUI）",
         "width": 1280,
         "height": 800,

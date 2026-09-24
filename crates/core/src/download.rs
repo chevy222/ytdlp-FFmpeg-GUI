@@ -620,6 +620,9 @@ pub fn post_process(
     let probe = probe::probe_local(resolver, input, &mut on_log)
         .map_err(|e| CoreError::Io(std::io::Error::other(format!("产物解析失败：{}", e))))?;
     let meta = &probe.meta;
+    // C4：纯音频产物（`-x` 的 mp3/m4a/aac 等）无视频流，`video_stream_index` 为 None。
+    // 用产物自身判定比外部传 audio_only 更可靠（不依赖调用方传值，防漏传/错传）。
+    let audio_only = meta.video_stream_index.is_none();
     if meta.audio_tracks.unwrap_or(0) > 1 {
         // 多音轨是静默丢数据的场景：-map 0:a:0? 只保留第一条，用户应当知情
         on_log(format!(
@@ -642,7 +645,13 @@ pub fn post_process(
         return Ok((input.to_path_buf(), meta.clone()));
     }
 
-    let out = input.with_extension("processed.mp4");
+    let out = if audio_only {
+        // C4：纯音频产物沿用 .m4a（原 mp3 转成 aac 后不可能再叫 .mp3；用 m4a 承载
+        // aac + 增益，保证"音量归一化"在纯音频下载上真正生效，而不是被视频流校验删掉）
+        input.with_extension("processed.m4a")
+    } else {
+        input.with_extension("processed.mp4")
+    };
     // 宽高各自取偶（trunc */2*2）；短边超上限时等比缩小且不放大
     let vf = if need_downscale {
         Some(format!(
@@ -660,6 +669,13 @@ pub fn post_process(
         "-i".into(),
         input.to_string_lossy().into_owned(),
     ];
+    if audio_only {
+        // C4：纯音频产物只映射主音轨，不碰任何视频流参数（-map 0:v / -c:v /
+        // -vf / -movflags 等对无视频流的输入要么报错要么无意义）。音量增益由
+        // 后面的 -af volume 统一处理，输出 .m4a 承载 aac。
+        args.push("-map".into());
+        args.push("0:a:0?".into());
+    } else {
     match (&vf, cover_idx) {
         // 主视频需要滤镜 + 存在封面流：简单滤镜 `-vf` 与第二条视频流的 `copy`
         // 不能共存（ffmpeg：Filtering and streamcopy cannot be used together），
@@ -720,6 +736,7 @@ pub fn post_process(
                 args.push("hvc1".into());
             }
         }
+    }
     }
     // 音频（增益到峰值 0dBFS，MAXGAIN 封顶 24dB，TC-07 语义）
     if need_gain {
@@ -786,8 +803,9 @@ pub fn post_process(
         let _ = std::fs::remove_file(&out);
         return Ok((input.to_path_buf(), meta.clone()));
     }
-    // 产物校验（§1.3：校验成功后才原子替换）——能读出主视频流才算成功
-    if !verify_video(resolver, &out) {
+    // 产物校验（§1.3：校验成功后才原子替换）——视频产物检查主视频流，
+    // 纯音频产物（C4）检查主音频流，否则纯音频归一化产物会被误判失败、删掉。
+    if !verify_media(resolver, &out, audio_only) {
         on_log("后处理产物校验失败（保留原文件）".to_string());
         let _ = std::fs::remove_file(&out);
         return Ok((input.to_path_buf(), meta.clone()));
@@ -802,14 +820,15 @@ pub fn post_process(
     Ok((input.to_path_buf(), meta.clone()))
 }
 
-/// 产物校验：ffprobe 能解析且存在主视频流。
-fn verify_video(resolver: &ToolResolver, path: &Path) -> bool {
+/// 产物校验：ffprobe 能解析且存在主流（视频产物查 v:0，纯音频产物查 a:0）。
+fn verify_media(resolver: &ToolResolver, path: &Path, audio_only: bool) -> bool {
     let p = path.to_string_lossy().into_owned();
+    let stream = if audio_only { "a:0" } else { "v:0" };
     let args: Vec<&str> = vec![
         "-v",
         "error",
         "-select_streams",
-        "v:0",
+        stream,
         "-show_entries",
         "stream=codec_name",
         "-of",

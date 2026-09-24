@@ -13,9 +13,15 @@
 //! 2. 需要 `.await` 拿结果的命令：`#[tauri::command] pub async fn`（注意宏**不带** `(async)`），
 //!    阻塞操作包在 `spawn_blocking(...).await` 里，期间不占用 async worker。
 //!
+//! **硬性约定（A6）**：`#[tauri::command(async)] pub fn` 的函数体内**不得出现** fs / 子进程 /
+//! persist / remove_dir_all 等分钟级阻塞调用——`(async)` 只把命令移出主线程，仍可能占住
+//! tokio 的 async worker（worker 数 ≈ CPU 核数），分钟级阻塞会饿死同文件里真正异步的其它
+//! 命令。凡含 IO / 子进程 / 大序列化 / persist 的命令，统一用「范式 2」：
+//! `pub async fn` + `spawn_blocking(...).await`。已收敛的命令见 `probe_dependencies`、
+//! `probe_hw_encoders`、`clear_temp`、`download_tool`、`add_local`、三处缩略图。
+//!
 //! 常见错误：给同步 `pub fn` 加了 `#[tauri::command(async)]` 却又在函数体里 `.await`
-//! （`(async)` 不会把函数变成 async），会直接 E0728 编译失败。参见 `download_tool`、
-//! `add_local`（范式 2）与 `add_url`、`start_download`（范式 1）。
+//! （`(async)` 不会把函数变成 async），会直接 E0728 编译失败。
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -43,6 +49,21 @@ use crate::state::AppState;
 /// ——打满本机资源，也必然触发站点风控。播放列表展开（DL-09）本就是顺序解析，
 /// 这里把"多条 URL 同时入列"收进同一条约束。
 const PROBE_CONCURRENCY: u64 = 3;
+
+/// A1：敏感命令的调用方守卫。自定义命令不受 capability 的 `windows` 白名单约束，
+/// 任何窗口/webview（含登录窗里承载的第三方页面）都能 `invoke`。当前 capability 未声明
+/// `remote.urls`（登录窗加载的是远程站点，本就不能用 IPC），但为防未来误加 remote / 误建
+/// 可执行窗口，给真正敏感的命令加一层"仅主窗口可调用"的硬校验。
+///
+/// 只对需要从主窗口触发的命令用；`save_cookies` 等由 login.rs 内部 Rust 直接调用
+/// （不走 IPC）的命令**不加**，避免误伤登录流程。
+fn ensure_main_window(win: &tauri::WebviewWindow) -> Result<(), String> {
+    if win.label() == "main" {
+        Ok(())
+    } else {
+        Err("该操作仅允许从主窗口发起".into())
+    }
+}
 
 /// 解析闸门：计数信号量（条件变量实现）。
 ///
@@ -100,13 +121,18 @@ impl Drop for SlotGuard {
 }
 
 /// 硬件编码器探测（TC-16）：QSV/NVENC/AMF 可用性，供设置页标注。
-#[tauri::command(async)]
-pub fn probe_hw_encoders(app: AppHandle) -> CmdResult<serde_json::Value> {
+/// 探测要起 ffmpeg 子进程（秒级），用 `spawn_blocking` 避免占住 async worker（A6）。
+#[tauri::command]
+pub async fn probe_hw_encoders(app: AppHandle) -> CmdResult<serde_json::Value> {
     let state = app.state::<AppState>();
     let resolver = state.resolver();
-    let hw =
-        transcode::detect_hw_encoders(&resolver).map_err(|e| format!("探测编码器失败：{}", e))?;
-    Ok(serde_json::json!({ "qsv": hw.qsv, "nvenc": hw.nvenc, "amf": hw.amf }))
+    tauri::async_runtime::spawn_blocking(move || {
+        transcode::detect_hw_encoders(&resolver)
+            .map_err(|e| format!("探测编码器失败：{}", e))
+            .map(|hw| serde_json::json!({ "qsv": hw.qsv, "nvenc": hw.nvenc, "amf": hw.amf }))
+    })
+    .await
+    .map_err(|e| format!("探测编码器任务异常：{e}"))?
 }
 
 /// 依赖页「下载 / 更新」结果。
@@ -173,9 +199,11 @@ pub fn tool_urls() -> CmdResult<Vec<ToolUrlInfo>> {
 pub async fn download_tool(
     app: AppHandle,
     state: State<'_, AppState>,
+    win: tauri::WebviewWindow,
     tool: String,
     update: bool,
 ) -> CmdResult<ToolInstallResult> {
+    ensure_main_window(&win)?;
     let kind = ToolKind::from_config_key(&tool).ok_or_else(|| format!("未知工具键：{tool}"))?;
     // 注册取消标志（前端点"取消"置 true）。同一工具不允许并发下载：
     // 重复注册会覆盖旧标志，导致第一次下载的"取消"指向失效
@@ -2012,7 +2040,8 @@ fn now_str() -> String {
 }
 
 #[tauri::command(async)]
-pub fn cancel_item(app: AppHandle, id: String) -> CmdResult<()> {
+pub fn cancel_item(app: AppHandle, win: tauri::WebviewWindow, id: String) -> CmdResult<()> {
+    ensure_main_window(&win)?;
     let state = app.state::<AppState>();
 
     // 合并作业要整批处理：一次合并只把**锚点条目**提交给队列，其余参与条目既不在
@@ -2085,7 +2114,8 @@ pub fn cancel_item(app: AppHandle, id: String) -> CmdResult<()> {
 }
 
 #[tauri::command(async)]
-pub fn remove_item(app: AppHandle, id: String) -> CmdResult<()> {
+pub fn remove_item(app: AppHandle, win: tauri::WebviewWindow, id: String) -> CmdResult<()> {
+    ensure_main_window(&win)?;
     let state = app.state::<AppState>();
     // 运行中的条目不允许直接删：任务线程还在跑、产物还在往输出目录写，
     // 删掉条目只会让用户以为"已经删干净了"。先取消、等状态落到终态再删。
@@ -2226,7 +2256,8 @@ pub fn get_config(state: State<'_, AppState>) -> CmdResult<AppConfig> {
 }
 
 #[tauri::command(async)]
-pub fn save_config(app: AppHandle, mut config: AppConfig) -> CmdResult<()> {
+pub fn save_config(app: AppHandle, win: tauri::WebviewWindow, mut config: AppConfig) -> CmdResult<()> {
+    ensure_main_window(&win)?;
     let state = app.state::<AppState>();
     // 后端必须自己校验：前端只有 UI 层限制（number 输入的 min/max 拦不住手输/粘贴），
     // 越界值会一路流到任务线程里（例如负的 max_gain_db 会让 f32::clamp 直接 panic，
@@ -2239,8 +2270,9 @@ pub fn save_config(app: AppHandle, mut config: AppConfig) -> CmdResult<()> {
     let path = state.paths.config_file();
     let _ = std::fs::create_dir_all(state.paths.config_dir());
     config.save(&path).map_err(err_string)?;
-    // 并发上限即时生效
-    state
+    // 并发上限即时生效：调高并发时若有任务在排队，立刻放行（A4）。
+    // 返回本次提升释放出的、应马上启动的等待任务 id 列表。
+    let to_launch = state
         .queue
         .lock()
         .set_concurrency(config.general.concurrency as usize);
@@ -2249,6 +2281,10 @@ pub fn save_config(app: AppHandle, mut config: AppConfig) -> CmdResult<()> {
         .history
         .lock()
         .set_limit(config.general.history_limit);
+    // 必须在释放队列锁之后再逐个启动：launch_next 会读 history + queue 的锁
+    for id in to_launch {
+        launch_next(&app, id);
+    }
     Ok(())
 }
 
@@ -2295,7 +2331,8 @@ fn normalize_cookie_host(host: &str) -> String {
 }
 
 #[tauri::command(async)]
-pub fn delete_cookie(app: AppHandle, host: String) -> CmdResult<()> {
+pub fn delete_cookie(app: AppHandle, win: tauri::WebviewWindow, host: String) -> CmdResult<()> {
+    ensure_main_window(&win)?;
     let state = app.state::<AppState>();
     // 与 save_cookies 同口径：库文件存的是规范化后的 host（www.youtube.com.txt），
     // 传站点级域名（youtube.com）来删也必须命中 —— 否则 delete_host 见文件不存在
@@ -2309,33 +2346,39 @@ pub fn delete_cookie(app: AppHandle, host: String) -> CmdResult<()> {
 
 // ---------- 依赖自检 ----------
 
-#[tauri::command(async)]
-pub fn probe_dependencies(app: AppHandle) -> CmdResult<Vec<ToolStatus>> {
+#[tauri::command]
+pub async fn probe_dependencies(app: AppHandle) -> CmdResult<Vec<ToolStatus>> {
     let state = app.state::<AppState>();
     let resolver = state.resolver();
-    let mut out = Vec::new();
-    for tool in [
-        ytdlp_core::exec::Tool::YtDlp,
-        ytdlp_core::exec::Tool::Ffmpeg,
-        ytdlp_core::exec::Tool::Ffprobe,
-        ytdlp_core::exec::Tool::Deno,
-    ] {
-        let resolved = resolver.resolve(tool);
-        let (path, version, ok) = match &resolved {
-            Ok(p) => {
-                let v = ytdlp_core::exec::tool_version(&resolver, tool);
-                (Some(p.to_string_lossy().into_owned()), v, true)
-            }
-            Err(_) => (None, None, false),
-        };
-        out.push(ToolStatus {
-            tool: tool.name().to_string(),
-            path,
-            version,
-            ok,
-        });
-    }
-    Ok(out)
+    // 每个工具要起子进程取版本（yt-dlp --version / ffmpeg -version …，秒级 × 4），
+    // 放 blocking 线程，避免占住 async worker（A6）。
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut out = Vec::new();
+        for tool in [
+            ytdlp_core::exec::Tool::YtDlp,
+            ytdlp_core::exec::Tool::Ffmpeg,
+            ytdlp_core::exec::Tool::Ffprobe,
+            ytdlp_core::exec::Tool::Deno,
+        ] {
+            let resolved = resolver.resolve(tool);
+            let (path, version, ok) = match &resolved {
+                Ok(p) => {
+                    let v = ytdlp_core::exec::tool_version(&resolver, tool);
+                    (Some(p.to_string_lossy().into_owned()), v, true)
+                }
+                Err(_) => (None, None, false),
+            };
+            out.push(ToolStatus {
+                tool: tool.name().to_string(),
+                path,
+                version,
+                ok,
+            });
+        }
+        Ok(out)
+    })
+    .await
+    .map_err(|e| format!("依赖自检任务异常：{e}"))?
 }
 
 // ---------- 其他 ----------
@@ -2445,10 +2488,17 @@ pub fn clear_temp_inner(state: &AppState) -> std::io::Result<usize> {
     Ok(removed)
 }
 
-#[tauri::command(async)]
-pub fn clear_temp(app: AppHandle) -> CmdResult<()> {
-    let state = app.state::<AppState>();
-    clear_temp_inner(&state).map_err(err_string)?;
+#[tauri::command]
+pub async fn clear_temp(app: AppHandle, win: tauri::WebviewWindow) -> CmdResult<()> {
+    ensure_main_window(&win)?;
+    let _state = app.state::<AppState>();
+    // 大临时目录 remove_dir_all 是秒级阻塞，放 blocking 线程（A6）
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        clear_temp_inner(&st).map_err(err_string)
+    })
+    .await
+    .map_err(|e| format!("清理临时文件任务异常：{e}"))??;
     Ok(())
 }
 
