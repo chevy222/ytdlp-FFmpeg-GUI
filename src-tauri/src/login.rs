@@ -101,7 +101,7 @@ fn build_login_window(app: &AppHandle, host: &str, url: &str) -> Result<(), Stri
             Some(MagicNav::Close) => {
                 let app = app_for_nav.clone();
                 std::thread::spawn(move || close_login_window(&app));
-                return false;
+                false
             }
             Some(MagicNav::Done) => {
                 let app = app_for_nav.clone();
@@ -113,7 +113,7 @@ fn build_login_window(app: &AppHandle, host: &str, url: &str) -> Result<(), Stri
                         handle_login_done(&win, &host, &done);
                     }
                 });
-                return false;
+                false
             }
             None => true,
         }
@@ -129,8 +129,14 @@ fn close_login_window(app: &AppHandle) {
     }
 }
 
-/// 注入脚本使用的两个"魔法 URL"（关窗 / 登录完成）。
+/// 注入脚本中两个"魔法 URL"的测试基准值（关窗 / 登录完成）。
+///
+/// 注入脚本是含大量花括号的 `r#"…"#` 原始字符串（不宜用 `format!` 插值），URL 在
+/// 脚本里以字面量书写；这两个常量仅在 `#[cfg(test)]` 下编译，供测试断言注入脚本确实
+/// 包含正确 URL，防止脚本字面量与判定逻辑两处不同步。
+#[cfg(test)]
 const CLOSE_URL: &str = "http://127.0.0.1/ytdlp-login-close";
+#[cfg(test)]
 const DONE_URL: &str = "http://127.0.0.1/ytdlp-login-done";
 
 /// 魔法 URL 的判定结果。

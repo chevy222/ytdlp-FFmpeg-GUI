@@ -5,8 +5,17 @@
 //!
 //! **命令的线程语义**：Tauri 的同步 `#[tauri::command]` 在**主线程**执行
 //! （`login.rs` 里建窗死锁的教训同源），因此凡是会做 IO / 起子进程 / 序列化大对象
-//! 的命令一律标 `#[tauri::command(async)]`（等价于丢到阻塞线程池执行），
-//! 否则窗口会卡在"点按钮没反应"。
+//! 的命令都必须离开主线程，否则窗口会卡在"点按钮没反应"。两种范式二选一、不可混用：
+//!
+//! 1. 同步阻塞命令：`#[tauri::command(async)] pub fn`（Tauri 把整个函数丢到阻塞线程池）。
+//!    函数体仍是同步的，**内部不能出现 `.await`**；要跑后台任务就 `std::thread::spawn`
+//!    或 `spawn_blocking(...)` 后不 await（fire-and-forget）。
+//! 2. 需要 `.await` 拿结果的命令：`#[tauri::command] pub async fn`（注意宏**不带** `(async)`），
+//!    阻塞操作包在 `spawn_blocking(...).await` 里，期间不占用 async worker。
+//!
+//! 常见错误：给同步 `pub fn` 加了 `#[tauri::command(async)]` 却又在函数体里 `.await`
+//! （`(async)` 不会把函数变成 async），会直接 E0728 编译失败。参见 `download_tool`、
+//! `add_local`（范式 2）与 `add_url`、`start_download`（范式 1）。
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -490,9 +499,9 @@ pub fn add_url(app: AppHandle, urls: Vec<String>) -> CmdResult<()> {
     Ok(())
 }
 
-#[tauri::command(async)]
-pub fn add_local(app: AppHandle, paths: Vec<String>, recursive: bool) -> CmdResult<()> {
-    // 目录扫描放阻塞线程：递归遍历上万个文件足以让主线程肉眼可见地卡住
+#[tauri::command]
+pub async fn add_local(app: AppHandle, paths: Vec<String>, recursive: bool) -> CmdResult<()> {
+    // 目录扫描放阻塞线程：递归遍历上万个文件足以让 async worker 肉眼可见地卡住
     let files = tauri::async_runtime::spawn_blocking(move || {
         let mut files: Vec<PathBuf> = Vec::new();
         for p in paths {

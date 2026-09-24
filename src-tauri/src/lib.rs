@@ -68,7 +68,6 @@ fn apply_cli_args(app: &tauri::AppHandle, args: Vec<String>) {
             cur.deno_path = from.deno_path;
         }
     }
-    drop(st);
     if !cli.urls.is_empty() {
         // add_url 内部要原子写落盘（含 fsync）并为每条 URL 起解析线程，而本函数
         // 在 setup 与单实例回调里都由主线程执行 —— 放后台跑，避免启动/转发时
