@@ -139,6 +139,7 @@ pub fn run() {
             commands::rot_item,
             commands::set_sections,
             commands::queue_status,
+            commands::check_update,
         ])
         .setup(|app| {
             // 确保绿色便携目录结构（exe 同级）

@@ -779,7 +779,7 @@ function renderSetPage(){
     h+=row('音量归一化（下载后处理与转码共用）',chk('general.normalize_audio',g.normalize_audio,''),'按解析音量增益至峰值 0dBFS，接近满度不处理');
     h+=row('音量增益上限 dB',num('general.max_gain_db',g.max_gain_db,0,48));
     h+=row('并发任务数（全局：下载/转码/合并共享）',num('general.concurrency',g.concurrency,1,16));
-    h+=row('启动时检查更新',chk('general.check_update',g.check_update,'').replace('<input ','<input disabled '),'【暂未生效】该配置项后端尚未读取，改动不生效。');
+    h+=row('启动时检查更新',chk('general.check_update',g.check_update,''),'启动时查询 GitHub 最新 Release，有新版弹提示（不自动安装，需手动下载替换）');
     h+=row('历史上限（条，默认 100、上限 200）',num('general.history_limit',g.history_limit,1,200),'超出上限时优先裁剪最旧的终态条目（进行中的任务不会被裁掉）。');
     h+=row('清理解析缓存','<button class="btn sm" data-act="clear-cache">清理解析缓存</button>','解析缓存存于 config/cache.json + config/cache/（P1 接入）');
   }
@@ -1031,6 +1031,14 @@ async function init(){
     try{ S.config=await INVOKE('get_config'); }catch(_){}
     render();
     refreshDeps();
+    // 启动时检查更新（轻量"检查+通知"，不自动下载安装）
+    // 异步不阻塞启动；失败静默忽略（网络不通/GitHub 限流都不应影响使用）
+    INVOKE('check_update').then(info => {
+      if (!info) return;
+      if (window.confirm('发现新版本 v' + info.latest_version + '\n当前版本 v' + info.current_version + '\n\n是否前往 GitHub 下载？')) {
+        window.open(info.url, '_blank');
+      }
+    }).catch(() => {});
   }catch(err){ console.error(err); toast('初始化失败：'+err); }
 }
 init();

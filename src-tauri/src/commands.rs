@@ -2463,3 +2463,93 @@ pub fn rot_item(app: AppHandle, id: String, degrees: u16) -> CmdResult<()> {
     persist(&app);
     Ok(())
 }
+
+// ---------- 检查更新（轻量"检查+通知"，不自动下载安装） ----------
+
+/// 检查更新结果：有新版时返回，无新版返回 None。
+#[derive(serde::Serialize)]
+pub struct UpdateInfo {
+    pub current_version: String,
+    pub latest_version: String,
+    pub url: String,
+}
+
+/// 检查更新：请求 GitHub API 获取最新 release tag，与当前版本比较。
+///
+/// - 配置 `general.check_update` 为 false 时直接返回 None；
+/// - 用系统 curl 发请求（与 tool_download 一致，避免 TLS 交叉编译问题）；
+/// - 失败时返回错误，前端静默忽略（检查更新是可选增强，不应阻塞启动）。
+#[tauri::command(async)]
+pub fn check_update(app: AppHandle) -> CmdResult<Option<UpdateInfo>> {
+    let state = app.state::<AppState>();
+    if !state.config.lock().general.check_update {
+        return Ok(None);
+    }
+    let current = env!("CARGO_PKG_VERSION").to_string();
+    // GitHub API：未认证 60 次/小时，桌面应用启动频率足够
+    let api_url = "https://api.github.com/repos/chevy222/ytdlp-FFmpeg-GUI/releases/latest";
+    let output = std::process::Command::new("curl")
+        .args([
+            "-sS",
+            "-L",
+            "--max-time",
+            "10",
+            "-H",
+            "Accept: application/vnd.github+json",
+            "-H",
+            "User-Agent: ytdlp-FFmpeg-GUI",
+            api_url,
+        ])
+        .output()
+        .map_err(|e| format!("无法调用 curl：{e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "GitHub API 请求失败（{}）：{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let body = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("解析 GitHub API 响应失败：{e}"))?;
+    let tag = v["tag_name"]
+        .as_str()
+        .unwrap_or("")
+        .trim_start_matches('v')
+        .to_string();
+    if tag.is_empty() {
+        return Err("GitHub API 响应中无 tag_name（可能尚未发布过 release）".into());
+    }
+    let release_url = v["html_url"]
+        .as_str()
+        .unwrap_or("https://github.com/chevy222/ytdlp-FFmpeg-GUI/releases")
+        .to_string();
+    if version_greater(&tag, &current) {
+        Ok(Some(UpdateInfo {
+            current_version: current,
+            latest_version: tag,
+            url: release_url,
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+/// 简单语义化版本比较：`a > b` 返回 true。缺失段按 0 处理。
+fn version_greater(a: &str, b: &str) -> bool {
+    let parse = |s: &str| -> Vec<u64> {
+        s.split('.')
+            .filter_map(|x| x.parse::<u64>().ok())
+            .collect()
+    };
+    let va = parse(a);
+    let vb = parse(b);
+    for i in 0..va.len().max(vb.len()) {
+        let na = va.get(i).copied().unwrap_or(0);
+        let nb = vb.get(i).copied().unwrap_or(0);
+        if na != nb {
+            return na > nb;
+        }
+    }
+    false
+}
