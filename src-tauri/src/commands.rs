@@ -2547,19 +2547,11 @@ pub struct UpdateInfo {
     pub url: String,
 }
 
-/// 检查更新：请求 GitHub API 获取最新 release tag，与当前版本比较。
+/// 查询 GitHub 最新 release：返回 (tag, html_url)。
 ///
-/// - 配置 `general.check_update` 为 false 时直接返回 None；
-/// - 用系统 curl 发请求（与 tool_download 一致，避免 TLS 交叉编译问题）；
-/// - 失败时返回错误，前端静默忽略（检查更新是可选增强，不应阻塞启动）。
-#[tauri::command(async)]
-pub fn check_update(app: AppHandle) -> CmdResult<Option<UpdateInfo>> {
-    let state = app.state::<AppState>();
-    if !state.config.lock().general.check_update {
-        return Ok(None);
-    }
-    let current = env!("CARGO_PKG_VERSION").to_string();
-    // GitHub API：未认证 60 次/小时，桌面应用启动频率足够
+/// 用系统 curl 发请求（与 tool_download 一致，避免 TLS 交叉编译问题）；
+/// 调用方负责隐藏控制台窗口（hide_console）。
+fn fetch_latest_release() -> CmdResult<(String, String)> {
     let api_url = "https://api.github.com/repos/chevy222/ytdlp-FFmpeg-GUI/releases/latest";
     let mut cmd = std::process::Command::new("curl");
     cmd.args([
@@ -2573,7 +2565,6 @@ pub fn check_update(app: AppHandle) -> CmdResult<Option<UpdateInfo>> {
         "User-Agent: ytdlp-FFmpeg-GUI",
         api_url,
     ]);
-    // Windows 下隐藏 curl 控制台窗口，否则启动检查更新时会闪一个黑框
     ytdlp_core::exec::hide_console(&mut cmd);
     let output = cmd
         .output()
@@ -2600,6 +2591,22 @@ pub fn check_update(app: AppHandle) -> CmdResult<Option<UpdateInfo>> {
         .as_str()
         .unwrap_or("https://github.com/chevy222/ytdlp-FFmpeg-GUI/releases")
         .to_string();
+    Ok((tag, release_url))
+}
+
+/// 检查更新：请求 GitHub API 获取最新 release tag，与当前版本比较。
+///
+/// - 配置 `general.check_update` 为 false 时直接返回 None；
+/// - 有新版时返回 Some(UpdateInfo)，无新版返回 None；
+/// - 失败时返回错误，前端静默忽略（检查更新是可选增强，不应阻塞启动）。
+#[tauri::command(async)]
+pub fn check_update(app: AppHandle) -> CmdResult<Option<UpdateInfo>> {
+    let state = app.state::<AppState>();
+    if !state.config.lock().general.check_update {
+        return Ok(None);
+    }
+    let current = env!("CARGO_PKG_VERSION").to_string();
+    let (tag, release_url) = fetch_latest_release()?;
     if version_greater(&tag, &current) {
         Ok(Some(UpdateInfo {
             current_version: current,
@@ -2608,6 +2615,27 @@ pub fn check_update(app: AppHandle) -> CmdResult<Option<UpdateInfo>> {
         }))
     } else {
         Ok(None)
+    }
+}
+
+/// 设置页用：总是返回当前版本与最新 release 版本（不受 check_update 配置控制）。
+///
+/// 前端在"启动时检查更新"旁边展示"当前 vX.Y.Z / 最新 vA.B.C"，让用户在
+/// 关闭自动检查时也能手动看到版本状态。查询失败时 latest_version 为空串。
+#[tauri::command(async)]
+pub fn get_version_info() -> CmdResult<UpdateInfo> {
+    let current = env!("CARGO_PKG_VERSION").to_string();
+    match fetch_latest_release() {
+        Ok((tag, url)) => Ok(UpdateInfo {
+            current_version: current,
+            latest_version: tag,
+            url,
+        }),
+        Err(_) => Ok(UpdateInfo {
+            current_version: current,
+            latest_version: String::new(),
+            url: "https://github.com/chevy222/ytdlp-FFmpeg-GUI/releases".into(),
+        }),
     }
 }
 

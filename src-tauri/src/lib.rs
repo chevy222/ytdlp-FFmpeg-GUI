@@ -140,6 +140,7 @@ pub fn run() {
             commands::set_sections,
             commands::queue_status,
             commands::check_update,
+            commands::get_version_info,
         ])
         .setup(|app| {
             // 确保绿色便携目录结构（exe 同级）

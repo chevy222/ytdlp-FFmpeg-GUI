@@ -782,12 +782,23 @@ function renderSetPage(){
     h+=row('音量归一化（下载后处理与转码共用）',chk('general.normalize_audio',g.normalize_audio,''),'按解析音量增益至峰值 0dBFS，接近满度不处理');
     h+=row('音量增益上限 dB',num('general.max_gain_db',g.max_gain_db,0,48));
     h+=row('并发任务数（全局：下载/转码/合并共享）',num('general.concurrency',g.concurrency,1,16));
-    h+=row('启动时检查更新',chk('general.check_update',g.check_update,''),'启动时查询 GitHub 最新 Release，有新版弹提示（不自动安装，需手动下载替换）');
+    h+=row('启动时检查更新',chk('general.check_update',g.check_update,'')+' <span id="versionInfo" class="hint">正在查询最新版本…</span>','启动时查询 GitHub 最新 Release，有新版弹提示（不自动安装，需手动下载替换）');
     h+=row('历史上限（条，默认 100、上限 200）',num('general.history_limit',g.history_limit,1,200),'超出上限时优先裁剪最旧的终态条目（进行中的任务不会被裁掉）。');
   }
   page.innerHTML=h;
   bindSetEvents();
   if(curPage==='cookie')loadCookieList();
+  // 设置-通用页：异步查询最新版本，显示在"启动时检查更新"旁边
+  if(curPage==='general'){
+    INVOKE('get_version_info').then(info=>{
+      const el=document.getElementById('versionInfo'); if(!el)return;
+      if(!info.latest_version){ el.textContent='当前 v'+info.current_version+'（最新版本查询失败）'; return; }
+      const hasNew=info.latest_version!==info.current_version;
+      el.innerHTML='当前 v'+info.current_version+' / 最新 <a href="'+info.url+'" target="_blank" class="'+(hasNew?'ver-new':'ver-ok')+'">v'+info.latest_version+'</a>'+(hasNew?' ← 有新版本':'');
+    }).catch(()=>{
+      const el=document.getElementById('versionInfo'); if(el)el.textContent='';
+    });
+  }
 }
 
 function renderSiteList(map){
