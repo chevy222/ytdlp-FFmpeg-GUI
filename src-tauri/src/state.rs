@@ -86,24 +86,23 @@ impl AppState {
     }
 
     /// 当前工具解析器（按 config 依赖段构造；CLI 覆盖优先）。
+    ///
+    /// 只 clone `dependencies` 段（四个路径 + 一个开关）而不是整份 AppConfig：
+    /// 本函数在任务收尾等路径上会被反复调用，而整份 AppConfig 还带着
+    /// `network.site_proxy` 的 HashMap，白付一次堆分配。exe 同级 `tools/` 目录
+    /// 直接取自 `Paths`（与 `current_exe().parent()` 同源），省掉一次系统调用。
     pub fn resolver(&self) -> ToolResolver {
-        let mut cfg = self.config.lock().clone();
+        let mut deps = self.config.lock().dependencies.clone();
         {
             let cli = self.cli.lock();
             if let Some(p) = &cli.yt_dlp_path {
-                cfg.dependencies.yt_dlp_path = Some(p.clone());
+                deps.yt_dlp_path = Some(p.clone());
             }
             if let Some(p) = &cli.deno_path {
-                cfg.dependencies.deno_path = Some(p.clone());
+                deps.deno_path = Some(p.clone());
             }
         }
-        let mut r = ToolResolver::from_config(&cfg.dependencies);
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                r = r.with_tools_dir(dir.join("tools"));
-            }
-        }
-        r
+        ToolResolver::from_config(&deps).with_tools_dir(self.paths.tools_dir())
     }
 
     /// 注册取消标志并返回。

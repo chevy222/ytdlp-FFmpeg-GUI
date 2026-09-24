@@ -2,5 +2,9 @@
   "identifier": "default",
   "description": "主窗口默认能力",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:allow-open"]
+  "permissions": [
+    "core:event:default",
+    "core:webview:default",
+    "dialog:allow-open"
+  ]
 }

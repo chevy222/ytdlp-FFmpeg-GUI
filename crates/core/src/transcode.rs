@@ -29,7 +29,12 @@ fn locked_tier() -> Option<TranscodeTier> {
 }
 
 fn set_locked_tier(tier: TranscodeTier) {
-    *LOCKED_TIER.get_or_init(|| Mutex::new(None)).lock() = Some(tier);
+    let mut cur = LOCKED_TIER.get_or_init(|| Mutex::new(None)).lock();
+    // 只由第一个成功的层级写入：并发任务各自"先读后写"时，后来的写入者不得
+    // 覆盖已有结论（两者通常相同，但确定性比"最后写入者胜"更可解释）
+    if cur.is_none() {
+        *cur = Some(tier);
+    }
 }
 
 /// 转码参数（来自 设置-转码/通用/下载 + 条目 rot_angle，TC-05）。
@@ -718,7 +723,7 @@ pub fn run_transcode(
         );
         match r {
             Ok(p) => {
-                if !explicit && auto_qsv && locked_tier().is_none() {
+                if !explicit && auto_qsv {
                     set_locked_tier(*tier);
                 }
                 return Ok(p);

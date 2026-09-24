@@ -69,7 +69,7 @@ ytdlp-FFmpeg-GUI --url <URL> [--url <URL> ...] [--cookies <path>] [--dir <path>]
 | 层 | 选型 |
 | --- | --- |
 | 桌面框架 | Rust + Tauri v2（单窗口） |
-| 前端 | 原生 HTML / CSS / JS（浅色 Soft UI + 磨砂玻璃），`ui/index.html` 单文件 |
+| 前端 | 原生 HTML / CSS / JS（浅色 Soft UI + 磨砂玻璃），`ui/index.html`（结构+样式）+ `ui/app.js`（逻辑），无构建步骤 |
 | 下载引擎 | yt-dlp（外部子进程，JSON 输出 + 进度行解析） |
 | 处理引擎 | ffmpeg / ffprobe（转码 / 合并 / 探测 / 封面 / 音量） |
 | JS 运行时 | deno（yt-dlp YouTube 组件必需，通过 `--js-runtimes deno:<路径>` 显式传入） |
@@ -81,7 +81,7 @@ ytdlp-FFmpeg-GUI --url <URL> [--url <URL> ...] [--cookies <path>] [--dir <path>]
 ```
 crates/core/   平台无关核心层（模型/状态机/配置原子写/历史持久化/探测/下载/转码/合并/工具链，可单测）
 src-tauri/     Tauri v2 应用壳（命令桥接、后台任务、登录窗、CLI 入口）
-ui/            前端静态资源（单页原生 JS）
+ui/            前端静态资源（index.html 结构+样式、app.js 逻辑，无构建步骤）
 scripts/       build.ps1（本地构建，与 CI 同构）、cross-build/（Linux 交叉编译）
 .github/       windows CI（build.yml 门禁 + release.yml 打包发布）
 docs/          实现说明 / 工程与构建说明 / 效果图 / 架构总览图 / 主要功能流程图

@@ -70,7 +70,13 @@ fn apply_cli_args(app: &tauri::AppHandle, args: Vec<String>) {
     }
     drop(st);
     if !cli.urls.is_empty() {
-        let _ = commands::add_url(app.clone(), cli.urls);
+        // add_url 内部要原子写落盘（含 fsync）并为每条 URL 起解析线程，而本函数
+        // 在 setup 与单实例回调里都由主线程执行 —— 放后台跑，避免启动/转发时
+        // 出现一次同步磁盘写把窗口卡住。
+        let app2 = app.clone();
+        std::thread::spawn(move || {
+            let _ = commands::add_url(app2, cli.urls);
+        });
     }
 }
 
@@ -108,6 +114,8 @@ pub fn run() {
             commands::add_url,
             commands::add_local,
             commands::list_items,
+            commands::list_items_lite,
+            commands::get_item_log,
             commands::start_download,
             commands::start_transcode,
             commands::start_merge,
@@ -145,6 +153,14 @@ pub fn run() {
                          不要放在 Program Files 等需要管理员权限的位置。"
                     ),
                 );
+            }
+            // 启动清理 temp/：上次崩溃/被强杀留下的任务目录、合并中间产物、工具
+            // 下载半成品都不该跨实例累积（此时还没有任何任务在跑，豁免表为空，
+            // 整目录都是可清的残留；判定与「清空临时文件」按钮共用同一份实现）。
+            match commands::clear_temp_inner(&state) {
+                Ok(n) if n > 0 => ytdlp_core::log::info(format!("启动清理 temp/：{n} 项残留")),
+                Ok(_) => {}
+                Err(e) => ytdlp_core::log::warn(format!("启动清理 temp/ 失败：{e}")),
             }
             // 预热本地时区偏移：否则首次创建条目会在"纯数据构造"里起一次 reg query
             ytdlp_core::timefmt::warm_up();

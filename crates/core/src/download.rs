@@ -606,18 +606,27 @@ pub fn run_download(
 
 /// 后处理（DL-04 M1 基础版）：超画质上限降分辨率 + 音量归一化。
 /// 返回最终产物路径（处理失败时返回原路径并附告警日志）。
+/// `on_progress`：按探测到的源时长换算的百分比（0~100）。
 pub fn post_process(
     resolver: &ToolResolver,
     input: &Path,
     cfg: &DownloadConfig,
     general: &GeneralConfig,
     cancel: &Arc<AtomicBool>,
+    mut on_progress: impl FnMut(f32),
     mut on_log: impl FnMut(String),
 ) -> Result<(PathBuf, MediaMeta)> {
     // 先解析产物（MD-06 与后处理共用一次探测）
     let probe = probe::probe_local(resolver, input, &mut on_log)
         .map_err(|e| CoreError::Io(std::io::Error::other(format!("产物解析失败：{}", e))))?;
     let meta = &probe.meta;
+    if meta.audio_tracks.unwrap_or(0) > 1 {
+        // 多音轨是静默丢数据的场景：-map 0:a:0? 只保留第一条，用户应当知情
+        on_log(format!(
+            "源含 {} 条音轨，后处理只保留第 1 条（其余音轨不进入产物）",
+            meta.audio_tracks.unwrap_or(0)
+        ));
+    }
 
     // 画质上限按**短边**（§6 max_h 语义；竖屏源依赖 width 采集，MD-02/P0-2），
     // 缩放表达式用旋转不变量 min(iw,ih)（与 TC-05 同源），竖屏源不再被砍短边
@@ -740,35 +749,40 @@ pub fn post_process(
     }
     args.push("-movflags".into());
     args.push("+faststart".into());
+    // 进度走 stdout（与转码链路同口径），日志压到 error 级。
+    // 默认 info 级会持续向 stderr 写进度行：管道缓冲区（各平台 64KiB 量级）写满后
+    // 子进程阻塞在 write 上，父进程若只 try_wait 而不排空管道，就会无限等下去
+    // （任一 4 分钟以上的素材都能写满）。因此这里既压低输出量，也改用
+    // exec::stream_lines（内置 stderr 排空线程 + 取消看门狗）。
+    args.push("-progress".into());
+    args.push("pipe:1".into());
+    args.push("-nostats".into());
+    args.push("-loglevel".into());
+    args.push("error".into());
     args.push("-y".into());
     args.push(out.to_string_lossy().into_owned());
     on_log(crate::exec::display_command("ffmpeg", &args));
 
     let mut cmd = resolver.command(Tool::Ffmpeg)?;
     cmd.args(&args);
-    cmd.stdout(Stdio::null()).stderr(Stdio::piped());
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut guard = ChildGuard::spawn(&mut cmd)?;
-    // 简单等待（后处理通常较快；取消支持）
-    loop {
-        match guard.try_wait()? {
-            Some(_) => break,
-            None => {
-                if cancel.load(Ordering::Relaxed) {
-                    guard.kill_tree();
-                    let _ = std::fs::remove_file(&out);
-                    return Err(CoreError::Cancelled);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(200));
+    let duration = meta.duration_secs.unwrap_or(0.0);
+    let outcome = crate::exec::stream_lines(&mut guard, cancel, None, |line| {
+        if let Some(us) = crate::transcode::parse_out_time_us(line) {
+            if duration > 0.0 {
+                let pct = ((us as f64 / 1e6) / duration * 100.0).clamp(0.0, 100.0) as f32;
+                on_progress(pct);
             }
         }
+    })?;
+    if outcome.killed || cancel.load(Ordering::Relaxed) {
+        let _ = std::fs::remove_file(&out);
+        return Err(CoreError::Cancelled);
     }
-    let status = guard.wait()?;
-    if !status.success() {
-        let err = guard
-            .stderr()
-            .map(|mut e| crate::exec::drain_stderr(&mut e))
-            .unwrap_or_default();
-        on_log(format!("后处理失败（保留原文件）：{}", err));
+    if !outcome.status.success() {
+        let err = outcome.stderr;
+        on_log(format!("后处理失败（保留原文件）：{}", err.trim()));
         let _ = std::fs::remove_file(&out);
         return Ok((input.to_path_buf(), meta.clone()));
     }

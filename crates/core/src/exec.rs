@@ -477,7 +477,11 @@ pub fn run_capture(mut cmd: Command) -> crate::Result<Output> {
     Ok(out)
 }
 
-/// 运行并捕获输出的便捷封装（工具版本查询等）。
+/// 运行并捕获输出的便捷封装（工具版本查询、产物校验等短命令）。
+///
+/// 走 [`run_capture_deadline`] 而不是无超时的 [`run_capture`]：调用点散落在解析/
+/// 任务线程里，任一处的"短命令"挂住都会连带占死一条链路（被安全软件扫描的 exe、
+/// 网络盘上的探测都真实发生过）。
 pub fn run_tool_capture(
     resolver: &ToolResolver,
     tool: Tool,
@@ -485,7 +489,7 @@ pub fn run_tool_capture(
 ) -> crate::Result<Output> {
     let mut cmd = resolver.command(tool)?;
     cmd.args(args);
-    run_capture(cmd)
+    run_capture_deadline(cmd, Duration::from_secs(60))
 }
 
 /// 版本探测参数：ffmpeg/ffprobe 用 `-version`，其余用 `--version`。

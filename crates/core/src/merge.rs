@@ -262,6 +262,114 @@ fn run_piped_progress(
     Ok(())
 }
 
+/// 合并主体：参数一致走模式 A 直拼，直拼失败（非取消）自动回落模式 B；
+/// 参数不一致直接走模式 B。
+#[allow(clippy::too_many_arguments)]
+fn run_merge_inner(
+    resolver: &ToolResolver,
+    params: &MergeParams,
+    metas: &[MediaMeta],
+    tmp: &Path,
+    out: &Path,
+    same: bool,
+    total: f64,
+    cancel: &Arc<AtomicBool>,
+    on_progress: &mut dyn FnMut(f32),
+    on_log: &mut dyn FnMut(String),
+) -> Result<()> {
+    if same {
+        let list = tmp.join("list.txt");
+        write_concat_list(&list, &params.inputs)?;
+        // 先把结果落到局部变量再 match：避免在 match 的 scrutinee 里同时借用
+        // on_progress / on_log（后续 arm 里还要再用它们，重借用语义容易踩坑）
+        let direct = concat_copy(
+            resolver,
+            &list,
+            out,
+            &params.container,
+            cancel,
+            total,
+            on_progress,
+            on_log,
+        );
+        match direct {
+            Ok(()) => return Ok(()),
+            // 取消不是"失败"，绝不能回落重试：用户已经不想做了
+            Err(CoreError::Cancelled) => return Err(CoreError::Cancelled),
+            Err(e) => {
+                // 参数一致只是直拼的**必要**条件：容器、时间基、编码标签仍可能让
+                // `-c copy` 失败（MKV 源写 MP4、时间基差异过大等）。此时自动降级到
+                // 模式 B（统一转码后拼接），而不是把整次合并判死 —— 与转码的
+                // 层级回落（GpuQsv → HybridQsv → Software）同一思路。
+                on_log(format!("直拼失败（{e}），自动改为统一参数转码后拼接…"));
+            }
+        }
+    }
+    merge_unified(resolver, params, metas, tmp, out, cancel, on_progress, on_log)
+}
+
+/// 模式 B：逐段统一转码（分辨率统一为各段最大值）后 concat 直拼。
+#[allow(clippy::too_many_arguments)]
+fn merge_unified(
+    resolver: &ToolResolver,
+    params: &MergeParams,
+    metas: &[MediaMeta],
+    tmp: &Path,
+    out: &Path,
+    cancel: &Arc<AtomicBool>,
+    on_progress: &mut dyn FnMut(f32),
+    on_log: &mut dyn FnMut(String),
+) -> Result<()> {
+    let seg_total = total_duration(metas);
+    let target_h = metas.iter().filter_map(|m| m.height).max().unwrap_or(1080);
+    let segs: Vec<PathBuf> = (0..params.inputs.len())
+        .map(|i| tmp.join(format!("seg_{:02}.mp4", i)))
+        .collect();
+    let mut acc = 0.0f64;
+    for (i, (p, seg)) in params.inputs.iter().zip(&segs).enumerate() {
+        let d = metas[i].duration_secs.unwrap_or(0.0);
+        let seg_dur = if seg_total > 0.0 { d } else { 1.0 };
+        let base = if seg_total > 0.0 {
+            (acc / seg_total * 85.0) as f32
+        } else {
+            (i as f32 / params.inputs.len() as f32) * 85.0
+        };
+        let span = if seg_total > 0.0 {
+            (seg_dur / seg_total * 85.0) as f32
+        } else {
+            85.0 / params.inputs.len() as f32
+        };
+        let seg_base = base;
+        let seg_span = span.max(0.5);
+        let mut prog = |pct: f32| on_progress(seg_base + pct * 0.01 * seg_span);
+        transcode_segment(
+            resolver,
+            p,
+            seg,
+            metas[i].video_stream_index,
+            &params.encoder_mode,
+            target_h,
+            cancel,
+            &mut prog,
+            on_log,
+        )?;
+        acc += d;
+    }
+    let list = tmp.join("list.txt");
+    write_concat_list(&list, &segs)?;
+    let mut prog = |pct: f32| on_progress(85.0 + pct * 0.01 * 15.0);
+    concat_copy(
+        resolver,
+        &list,
+        out,
+        &params.container,
+        cancel,
+        seg_total,
+        &mut prog,
+        on_log,
+    )
+}
+
 /// 执行合并，返回输出路径；取消清理临时目录与输出残留（UL-06 适用合并）。
 pub fn run_merge(
     resolver: &ToolResolver,
@@ -300,85 +408,22 @@ pub fn run_merge(
         let _ = std::fs::remove_dir_all(t);
         let _ = std::fs::remove_file(out);
     };
-    let result = (|| -> Result<PathBuf> {
-        if params.normalize_audio {
-            on_log("合并完成前做音量归一化…".into());
-        }
-        if same {
-            // 模式 A：concat 直拼
-            let list = tmp.join("list.txt");
-            write_concat_list(&list, &params.inputs)?;
-            let mut prog = on_progress;
-            concat_copy(
-                resolver,
-                &list,
-                &out,
-                &params.container,
-                cancel,
-                total,
-                &mut prog,
-                &mut on_log,
-            )?;
-        } else {
-            // 模式 B：逐段统一转码 + concat 直拼
-            let target_h = metas.iter().filter_map(|m| m.height).max().unwrap_or(1080);
-            let segs: Vec<PathBuf> = params
-                .inputs
-                .iter()
-                .enumerate()
-                .map(|(i, _p)| tmp.join(format!("seg_{:02}.mp4", i)))
-                .collect();
-            let seg_total = total;
-            let mut acc = 0.0f64;
-            for (i, (p, seg)) in params.inputs.iter().zip(&segs).enumerate() {
-                let d = metas[i].duration_secs.unwrap_or(0.0);
-                let seg_dur = if seg_total > 0.0 { d } else { 1.0 };
-                let base = if seg_total > 0.0 {
-                    (acc / seg_total * 85.0) as f32
-                } else {
-                    (i as f32 / params.inputs.len() as f32) * 85.0
-                };
-                let span = if seg_total > 0.0 {
-                    (seg_dur / seg_total * 85.0) as f32
-                } else {
-                    85.0 / params.inputs.len() as f32
-                };
-                let seg_base = base;
-                let seg_span = span.max(0.5);
-                let mut prog = |pct: f32| {
-                    on_progress(seg_base + pct * 0.01 * seg_span);
-                };
-                transcode_segment(
-                    resolver,
-                    p,
-                    seg,
-                    metas[i].video_stream_index,
-                    &params.encoder_mode,
-                    target_h,
-                    cancel,
-                    &mut prog,
-                    &mut on_log,
-                )?;
-                acc += d;
-            }
-            let list = tmp.join("list.txt");
-            write_concat_list(&list, &segs)?;
-            let mut prog = |pct: f32| {
-                on_progress(85.0 + pct * 0.01 * 15.0);
-            };
-            concat_copy(
-                resolver,
-                &list,
-                &out,
-                &params.container,
-                cancel,
-                seg_total,
-                &mut prog,
-                &mut on_log,
-            )?;
-        }
-        Ok(out.clone())
-    })();
+    if params.normalize_audio {
+        on_log("合并完成前做音量归一化…".into());
+    }
+    let result = run_merge_inner(
+        resolver,
+        params,
+        &metas,
+        &tmp,
+        &out,
+        same,
+        total,
+        cancel,
+        &mut on_progress,
+        &mut on_log,
+    )
+    .map(|()| out.clone());
 
     match result {
         Ok(mut o) => {

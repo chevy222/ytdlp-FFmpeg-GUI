@@ -43,10 +43,16 @@ impl CookieStore {
 
     /// 保存/覆盖某站点 cookie（Netscape 格式，原子写）。
     /// 临时名带 UUID：并发保存（多个站点同时登录）不会互踩同一个 .tmp 文件。
+    /// 形态与 `paths::atomic_write_json` 保持同口径（`<正式名>.<随机>.tmp`）：
+    /// 不加隐藏名前缀（Windows 上无意义），残留文件一眼能认出归属。
     pub fn save_host(&self, host: &str, cookies: Vec<CookieEntry>) -> Result<()> {
         std::fs::create_dir_all(&self.dir)?;
         let f = self.host_file(host);
-        let tmp = f.with_file_name(format!(".cookies-{}.tmp", uuid::Uuid::new_v4()));
+        let tmp = f.with_file_name(format!(
+            "{}.{}.tmp",
+            sanitize_host(host),
+            uuid::Uuid::new_v4()
+        ));
         std::fs::write(&tmp, netscape_format(&cookies))?;
         std::fs::rename(&tmp, &f)?;
         Ok(())

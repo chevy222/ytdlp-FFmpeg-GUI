@@ -265,6 +265,13 @@ pub fn probe_url(
     })
 }
 
+/// 本地探测（ffprobe / volumedetect）的墙钟上限。
+///
+/// 这类"看着一定很快"的命令在损坏容器、网络盘、被安全软件拦截的文件上会永久
+/// 挂住，而它们跑在解析线程里、还占着全局解析闸位 —— 挂一次就少一路解析能力。
+/// 60 秒对本地探测是极宽松的上限（正常是毫秒级）。
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// 本地文件解析（ffprobe + volumedetect）。
 pub fn probe_local(
     resolver: &ToolResolver,
@@ -298,23 +305,13 @@ pub fn probe_local(
         kind: ProbeErrorKind::Failed,
         message: e.to_string(),
     })?;
-    cmd.args(&args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let guard = ChildGuard::spawn(&mut cmd).map_err(|e| ProbeFailure {
-        kind: ProbeErrorKind::Failed,
-        message: format!("启动 ffprobe 失败：{}", e),
+    cmd.args(&args);
+    // run_capture_deadline 自带"到点杀进程树"的看门狗，并在非零退出时把
+    // stderr 带进错误信息（不再需要手动 drain_stderr）
+    let out = crate::exec::run_capture_deadline(cmd, PROBE_TIMEOUT).map_err(|e| ProbeFailure {
+        kind: ProbeErrorKind::NotVideo,
+        message: format!("ffprobe 探测失败：{e}"),
     })?;
-    let out = guard.wait_with_output().map_err(|e| ProbeFailure {
-        kind: ProbeErrorKind::Failed,
-        message: format!("ffprobe 退出异常：{}", e),
-    })?;
-    if !out.status.success() {
-        return Err(ProbeFailure {
-            kind: ProbeErrorKind::NotVideo,
-            message: format!("ffprobe 探测失败：{}", decode_text(&out.stderr).trim()),
-        });
-    }
     let text = decode_text(&out.stdout);
     let mut meta = parse_ffprobe_json(&text);
     meta.size_bytes = std::fs::metadata(path).ok().map(|m| m.len());
@@ -355,18 +352,11 @@ pub fn probe_volume(
     on_log(crate::exec::display_command("ffmpeg", &args));
     let mut cmd = resolver.command(Tool::Ffmpeg)?;
     cmd.args(&args);
-    cmd.stdout(Stdio::null()).stderr(Stdio::piped());
-    let guard = ChildGuard::spawn(&mut cmd)?;
-    let out = guard.wait_with_output()?;
-    let stderr = decode_text(&out.stderr);
-    if !out.status.success() {
-        return Err(crate::CoreError::ProcessFailed {
-            program: "ffmpeg".into(),
-            code: out.status.code(),
-            stderr: stderr.trim().to_string(),
-        });
-    }
-    Ok(parse_volumedetect(&stderr))
+    // 带截止时间：volumedetect 是统计型滤镜，要解完采样才有结果；坏文件/网络盘上
+    // 可能长期不出结果，而本函数在解析线程里同步执行，没有兜底会把解析链路一起占死。
+    // 非零退出时 run_capture_deadline 会把 stderr 一并带进错误信息。
+    let out = crate::exec::run_capture_deadline(cmd, PROBE_TIMEOUT)?;
+    Ok(parse_volumedetect(&decode_text(&out.stderr)))
 }
 
 /// 解析 yt-dlp `-J` JSON → UrlProbe（纯函数）。

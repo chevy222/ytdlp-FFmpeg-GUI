@@ -8,8 +8,9 @@
 //! 的命令一律标 `#[tauri::command(async)]`（等价于丢到阻塞线程池执行），
 //! 否则窗口会卡在"点按钮没反应"。
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -34,31 +35,42 @@ use crate::state::AppState;
 /// 这里把"多条 URL 同时入列"收进同一条约束。
 const PROBE_CONCURRENCY: u64 = 3;
 
-/// 当前占用中的解析闸位。
-static PROBE_SLOTS: AtomicU64 = AtomicU64::new(0);
+/// 解析闸门：计数信号量（条件变量实现）。
+///
+/// 旧实现是「原子自旋 + 50ms sleep」抢闸位：粘贴 100 条链接会起 100 条线程，
+/// 其中 97 条在自旋等 3 个闸位，等待时间和线程数成正比、还白烧 CPU。
+/// 换条件变量后等待者在内核里休眠，归还时唤醒一个。
+struct ProbeGate {
+    in_use: parking_lot::Mutex<u64>,
+    free: parking_lot::Condvar,
+}
 
-/// 解析闸位守卫：`Drop` 归还，任何早退/panic 路径都不会漏。
+static PROBE_GATE: std::sync::LazyLock<ProbeGate> = std::sync::LazyLock::new(|| ProbeGate {
+    in_use: parking_lot::Mutex::new(0),
+    free: parking_lot::Condvar::new(),
+});
+
+/// 解析闸位守卫：`Drop` 归还并唤醒等待者，任何早退/panic 路径都不会漏。
 struct ProbeSlot;
 
 impl ProbeSlot {
     fn acquire() -> Self {
-        loop {
-            let n = PROBE_SLOTS.load(Ordering::Relaxed);
-            if n < PROBE_CONCURRENCY
-                && PROBE_SLOTS
-                    .compare_exchange_weak(n, n + 1, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_ok()
-            {
-                return Self;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut n = PROBE_GATE.in_use.lock();
+        while *n >= PROBE_CONCURRENCY {
+            PROBE_GATE.free.wait(&mut n);
         }
+        *n += 1;
+        Self
     }
 }
 
 impl Drop for ProbeSlot {
     fn drop(&mut self) {
-        PROBE_SLOTS.fetch_sub(1, Ordering::Relaxed);
+        let mut n = PROBE_GATE.in_use.lock();
+        let left = n.saturating_sub(1);
+        *n = left;
+        drop(n);
+        PROBE_GATE.free.notify_one();
     }
 }
 
@@ -516,18 +528,36 @@ pub fn add_local(app: AppHandle, paths: Vec<String>, recursive: bool) -> CmdResu
     Ok(())
 }
 
+/// 目录扫描的最大递归深度。
+///
+/// Windows 的 junction / 目录符号链接让"目录树"可以成环（用户目录下就有系统
+/// 预置的兼容链接），无界递归会栈溢出或把整个盘扫进来。32 层对素材目录足够。
+const MAX_SCAN_DEPTH: usize = 32;
+
 fn scan_dir(dir: &Path, recursive: bool, out: &mut Vec<PathBuf>) {
+    scan_dir_inner(dir, recursive, 0, out);
+}
+
+fn scan_dir_inner(dir: &Path, recursive: bool, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth >= MAX_SCAN_DEPTH {
+        return;
+    }
     let rd = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(_) => return,
     };
     for e in rd.flatten() {
+        // DirEntry::file_type() 不跟随符号链接：junction / 目录符号链接一律跳过
+        let Ok(ft) = e.file_type() else { continue };
+        if ft.is_symlink() {
+            continue;
+        }
         let p = e.path();
-        if p.is_dir() {
-            if recursive {
-                scan_dir(&p, true, out);
-            }
-        } else if download::is_media_file(&p) {
+        // 写成"单层 if + else if"，避免嵌套 if（collapsible_if 是 CI 的
+        // -D warnings 门禁之一）
+        if ft.is_dir() && recursive {
+            scan_dir_inner(&p, true, depth + 1, out);
+        } else if !ft.is_dir() && download::is_media_file(&p) {
             out.push(p);
         }
     }
@@ -618,7 +648,6 @@ fn run_probe(app: AppHandle, id: String) {
                     it.push_log(format!("可用格式：{} 项（高度：{}）", it.meta.download_formats.len(), heights.join(", ")));
                 }
             });
-            state.persist();
                 // 封面缩略图（异步生成，不阻塞就绪）。
                 // spawn_blocking：里面是 curl 网络下载 + ffmpeg 子进程，全是阻塞调用，
                 // 放在 async 执行器的 worker 上会占住线程（执行器线程数 ≈ CPU 核数）
@@ -701,7 +730,6 @@ fn run_probe(app: AppHandle, id: String) {
                     }
                 }
             });
-            state.persist();
         }
     }
     // 解析阶段临时目录清理（cookie 导出在本任务私有目录下，库文件本身不删）
@@ -709,6 +737,8 @@ fn run_probe(app: AppHandle, id: String) {
     // 清掉取消标志注册表条目（否则随条目数累积，也让后续 cancel_item 的
     // "在不在运行中"判断失真）
     state.cancels.lock().remove(&id);
+    // 落盘只做一次：上面两个分支里的 persist 都与这一次重复（每次都是
+    // clone + 序列化 + fsync 整份 history，批量粘贴时按条数线性放大）
     persist(&app);
 }
 
@@ -717,10 +747,40 @@ fn run_probe(app: AppHandle, id: String) {
 /// 列表全量返回（含每条最多 300 行日志）。
 /// `(async)`：克隆 + 序列化整份历史是"MB 级"操作，前端在活动任务期间每 1.5s
 /// 轮询一次，留在主线程会周期性卡住窗口。
+/// 轮询请用 [`list_items_lite`]：这一份只用于首次加载（日志弹窗需要历史）。
 #[tauri::command(async)]
 pub fn list_items(state: State<'_, AppState>) -> CmdResult<Vec<MediaItem>> {
     let hist = state.history.lock();
     Ok(hist.items.clone())
+}
+
+/// 列表轻量快照：**不含**日志。
+///
+/// 列表渲染只需要状态/进度/元数据；每条最多 300 行的日志（100 条时可达 MB 级）
+/// 让每次轮询的 IPC 与 JSON 解析成本凭空翻几倍。日志有两条正式通路：
+/// `item:log` 增量事件 + 打开弹窗时的 [`get_item_log`]。
+#[tauri::command(async)]
+pub fn list_items_lite(state: State<'_, AppState>) -> CmdResult<Vec<MediaItem>> {
+    let hist = state.history.lock();
+    Ok(hist
+        .items
+        .iter()
+        .map(|i| {
+            let mut c = i.clone();
+            c.log = VecDeque::new();
+            c
+        })
+        .collect())
+}
+
+/// 取某条目的完整日志（打开日志弹窗时按需拉取的权威副本）。
+#[tauri::command(async)]
+pub fn get_item_log(state: State<'_, AppState>, id: String) -> CmdResult<Vec<String>> {
+    let hist = state.history.lock();
+    Ok(hist
+        .get(&id)
+        .map(|i| i.log.iter().cloned().collect())
+        .unwrap_or_default())
 }
 
 // ---------- 动作 ----------
@@ -946,16 +1006,35 @@ fn run_download_task(app: AppHandle, id: String, format_id: Option<String>, audi
         let cfg2 = cfg.clone();
         let general2 = general.clone();
         let cancel2 = cancel.clone();
-        let pp = post_process(&resolver, path, &cfg2, &general2, &cancel2, |line| {
-            log_item(&app2, &id, line);
-        });
+        let pp = post_process(
+            &resolver,
+            path,
+            &cfg2,
+            &general2,
+            &cancel2,
+            |pct| {
+                // 后处理是整片重编码，没有进度就是"卡在 100% 不动"的观感
+                update_progress(
+                    &app,
+                    ProgressPayload {
+                        id: id.clone(),
+                        percent: Some(pct),
+                        speed: None,
+                        eta: None,
+                        file: None,
+                    },
+                );
+            },
+            |line| log_item(&app2, &id, line),
+        );
         match pp {
             Ok((final_path, meta)) => {
                 outcome.output_paths = vec![final_path];
                 update_item(&app, &id, |it| {
                     it.meta = meta;
                 });
-                state.persist();
+                // 不在这里落盘：finish_download 收尾时会写一次（同样的快照），
+                // 每次 persist 都是 clone + 序列化 + fsync 整份 history
             }
             Err(e) => {
                 finish_download(&app, &id, Err(e));
@@ -1431,7 +1510,14 @@ fn finish_merge(
         });
     }
     if let Ok(out) = &result {
-        let meta = download::probe_output(&state.resolver(), out, |_| {}).unwrap_or_default();
+        // 探测失败不再静默吞掉：产物元数据（画质列）会空着，必须让用户看到原因
+        let meta = match download::probe_output(&state.resolver(), out, |l| log_item(app, id, l)) {
+            Ok(m) => m,
+            Err(e) => {
+                log_item(app, id, format!("产物解析失败（画质列为空）：{e}"));
+                Default::default()
+            }
+        };
         let title = out
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
@@ -1661,32 +1747,35 @@ fn run_transcode_task(app: AppHandle, id: String) {
         id: id.clone(),
     };
     // 锁纪律（§11.15）：history 锁内只 clone 条目，config/cli/default_output_dir
-    // 一律出锁后再取（P1-3：持 history 锁期间嵌套取 config/cli 锁会让 update_item 卡顿）
-    let (item, path) = {
+    // 一律出锁后再取（P1-3：持 history 锁期间嵌套取 config/cli 锁会让 update_item 卡顿）。
+    //
+    // 同一把锁更不能重入：`parking_lot::Mutex` 不可重入，守卫还活着时调用
+    // `update_item` / `persist`（内部都要再取 history 锁）会当场自锁 —— 任务线程
+    // 永久持锁 → 此后所有列表操作一起冻死，并发额度也随 SlotGuard 永不归还而少一格。
+    // 因此把「取数据」与「改数据」分到两个作用域：守卫在块结束时必定释放。
+    let loaded = {
         let hist = state.history.lock();
-        let item = match hist.get(&id) {
-            Some(i) => i.clone(),
-            None => {
-                // 条目在排队期间被删除：清取消标志即可（slot 由守卫释放）
-                state.cancels.lock().remove(&id);
-                return;
-            }
-        };
-        let path = match &item.path {
-            Some(p) => std::path::PathBuf::from(p),
-            None => {
-                // 无本地文件（start_transcode 已校验过，此处为兜底）：
-                // 出锁后判失败并释放，不能把条目永远留在 Transcoding 状态
-                update_item(&app, &id, |it| {
-                    transition_in(it, Status::Failed);
-                    it.error = Some("无本地输入文件".into());
-                });
-                state.cancels.lock().remove(&id);
-                persist(&app);
-                return;
-            }
-        };
-        (item, path)
+        hist.get(&id).map(|i| (i.clone(), i.path.clone()))
+    };
+    let (item, path) = match loaded {
+        None => {
+            // 条目在排队期间被删除：清取消标志即可（slot 由守卫释放）
+            state.cancels.lock().remove(&id);
+            return;
+        }
+        Some((item, Some(p))) => (item, std::path::PathBuf::from(p)),
+        Some((_, None)) => {
+            // 无本地文件（start_transcode 已校验过，此处为兜底）：判失败并释放，
+            // 不能把条目永远留在 Transcoding 状态。此处 history 锁已释放，
+            // update_item / persist 可以安全调用。
+            update_item(&app, &id, |it| {
+                transition_in(it, Status::Failed);
+                it.error = Some("无本地输入文件".into());
+            });
+            state.cancels.lock().remove(&id);
+            persist(&app);
+            return;
+        }
     };
     let cfg = state.config.lock().clone();
     let out_dir = default_output_dir(&state);
@@ -1706,6 +1795,18 @@ fn run_transcode_task(app: AppHandle, id: String) {
         }
     };
     let meta = item.meta.clone();
+    if meta.audio_tracks.unwrap_or(0) > 1 {
+        // 转码固定 `-map 0:a:0?`（只保留第一条音轨）：多音轨是静默丢数据的场景，
+        // 不能让它无声发生 —— 用户至少要在日志里看到这件事。
+        log_item(
+            &app,
+            &id,
+            format!(
+                "源含 {} 条音轨，转码只保留第 1 条（其余音轨不进入产物）",
+                meta.audio_tracks.unwrap_or(0)
+            ),
+        );
+    }
     let params = TranscodeParams {
         input: path.clone(),
         out_dir,
@@ -1793,7 +1894,14 @@ fn finish_transcode(app: &AppHandle, id: &str, result: Result<std::path::PathBuf
     });
     // 成功：产物作为新条目回到列表（TC-11）
     if let Ok(out) = &result {
-        let meta = probe_output(&state.resolver(), out, |_| {}).unwrap_or_default();
+        // 探测失败不再静默吞掉：产物元数据（画质列）会空着，必须让用户看到原因
+        let meta = match probe_output(&state.resolver(), out, |l| log_item(app, id, l)) {
+            Ok(m) => m,
+            Err(e) => {
+                log_item(app, id, format!("产物解析失败（画质列为空）：{e}"));
+                Default::default()
+            }
+        };
         let title = out
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
@@ -2174,9 +2282,13 @@ fn normalize_cookie_host(host: &str) -> String {
 #[tauri::command(async)]
 pub fn delete_cookie(app: AppHandle, host: String) -> CmdResult<()> {
     let state = app.state::<AppState>();
+    // 与 save_cookies 同口径：库文件存的是规范化后的 host（www.youtube.com.txt），
+    // 传站点级域名（youtube.com）来删也必须命中 —— 否则 delete_host 见文件不存在
+    // 直接返回 Ok，用户以为删掉了、实际还在，下次下载仍带着旧 Cookie。
+    let normalized = normalize_cookie_host(&host);
     let store = CookieStore::new(state.paths.cookies_dir());
-    store.delete_host(&host).map_err(err_string)?;
-    let _ = app.emit("cookies:changed", host);
+    store.delete_host(&normalized).map_err(err_string)?;
+    let _ = app.emit("cookies:changed", normalized);
     Ok(())
 }
 
@@ -2237,65 +2349,91 @@ pub fn open_item_dir(state: State<'_, AppState>, id: String) -> CmdResult<()> {
         .map(PathBuf::from)
         .or_else(|| item.path.clone().map(PathBuf::from))
         .ok_or("该条目没有本地文件")?;
-    let dir = if target.is_dir() {
-        target
-    } else {
-        target.parent().map(Path::to_path_buf).unwrap_or(target)
-    };
-    open_in_explorer(&dir)
+    if target.is_dir() {
+        return open_in_explorer(&target, None);
+    }
+    // `unwrap_or_else(|| target.clone())`：target 后面还要作为 /select 的目标用，
+    // 不能在这里被 move 走
+    let dir = target
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| target.clone());
+    // 目标是文件时让资源管理器直接选中它：对含空格/逗号的路径，
+    // 「只开目录」会让用户自己再找一遍，而 /select 能精确定位
+    open_in_explorer(&dir, Some(&target))
 }
 
 #[cfg(windows)]
-fn open_in_explorer(dir: &Path) -> CmdResult<()> {
-    std::process::Command::new("explorer")
-        .arg(dir)
-        .spawn()
-        .map_err(err_string)?;
+fn open_in_explorer(dir: &Path, select: Option<&Path>) -> CmdResult<()> {
+    let mut cmd = std::process::Command::new("explorer");
+    match select {
+        // `/select,<path>` 是 explorer 的保留参数：路径必须紧跟逗号且作为**同一个**
+        // 参数传入（Rust 不经过 shell，这里正好可控），带引号反而会被当成字面量
+        Some(file) if file.is_file() => {
+            cmd.arg(format!("/select,{}", file.display()));
+        }
+        _ => {
+            cmd.arg(dir);
+        }
+    }
+    cmd.spawn().map_err(err_string)?;
     Ok(())
 }
 
 #[cfg(not(windows))]
-fn open_in_explorer(_dir: &Path) -> CmdResult<()> {
+fn open_in_explorer(_dir: &Path, _select: Option<&Path>) -> CmdResult<()> {
     Err("仅 Windows 支持打开目录".into())
+}
+
+/// 清理 temp/ 下的残留（任务私有目录、合并中间目录、工具下载半成品）。
+///
+/// 跳过运行中任务的私有目录与在跑的工具下载；只清历史残留，避免把进行中的任务搞坏。
+/// 豁免清单必须覆盖 temp 下**所有**非任务 id 命名的活跃产物：
+/// - `merge_<uuid>/`、`norm_<uuid>.mp4`：进行中的合并与音量归一化
+/// - `tool_dl/`：进行中的工具下载
+/// - `ytdlp-*.txt`：进行中的下载产物定位文件（下载中）
+///
+/// 返回实际清理掉的条目数。启动时（此时豁免表为空）也调它清上次崩溃留下的垃圾。
+pub fn clear_temp_inner(state: &AppState) -> std::io::Result<usize> {
+    let dir = state.paths.temp_dir();
+    if !dir.is_dir() {
+        return Ok(0);
+    }
+    let active: Vec<String> = state.cancels.lock().keys().cloned().collect();
+    let busy = !active.is_empty();
+    let tool_dl_busy = active.iter().any(|k| k.starts_with("tool-dl-"));
+    let mut removed = 0usize;
+    for e in std::fs::read_dir(&dir)? {
+        let e = e?;
+        let name = e.file_name().to_string_lossy().into_owned();
+        let skip = active.contains(&name)
+            || (tool_dl_busy && name == "tool_dl")
+            || (busy && name.starts_with("merge_"))
+            || (busy && name.starts_with("norm_"))
+            || (busy && name.starts_with("ytdlp-"));
+        if skip {
+            continue;
+        }
+        let path = e.path();
+        // 目录与普通文件都要清：旧实现一律用 remove_dir_all，对散落的
+        // 临时文件必然失败且被 `let _` 吞掉 —— "清理临时文件"其实一直清不掉它们
+        let result = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        match result {
+            Ok(()) => removed += 1,
+            Err(err) => log::warn(format!("清理临时文件失败 {}：{err}", path.display())),
+        }
+    }
+    Ok(removed)
 }
 
 #[tauri::command(async)]
 pub fn clear_temp(app: AppHandle) -> CmdResult<()> {
     let state = app.state::<AppState>();
-    let dir = state.paths.temp_dir();
-    if dir.is_dir() {
-        // 跳过运行中任务的私有目录与工具下载目录；只清历史残留，避免把进行中的任务搞坏。
-        // 豁免清单必须覆盖 temp 下**所有**非任务 id 命名的活跃产物：
-        // - `merge_<uuid>/`、`norm_<uuid>.mp4`：进行中的合并与音量归一化
-        // - `tool_dl/`：进行中的工具下载
-        // - `ytdlp-*.txt`：进行中的下载产物定位文件（下载中）
-        let active: Vec<String> = state.cancels.lock().keys().cloned().collect();
-        let busy = !active.is_empty();
-        let tool_dl_busy = active.iter().any(|k| k.starts_with("tool-dl-"));
-        for e in std::fs::read_dir(&dir).map_err(err_string)? {
-            let e = e.map_err(err_string)?;
-            let name = e.file_name().to_string_lossy().into_owned();
-            let skip = active.contains(&name)
-                || (tool_dl_busy && name == "tool_dl")
-                || (busy && name.starts_with("merge_"))
-                || (busy && name.starts_with("norm_"))
-                || (busy && name.starts_with("ytdlp-"));
-            if skip {
-                continue;
-            }
-            let path = e.path();
-            // 目录与普通文件都要清：旧实现一律用 remove_dir_all，对散落的
-            // 临时文件必然失败且被 `let _` 吞掉 —— "清理临时文件"其实一直清不掉它们
-            let removed = if path.is_dir() {
-                std::fs::remove_dir_all(&path)
-            } else {
-                std::fs::remove_file(&path)
-            };
-            if let Err(err) = removed {
-                log::warn(format!("清理临时文件失败 {}：{err}", path.display()));
-            }
-        }
-    }
+    clear_temp_inner(&state).map_err(err_string)?;
     Ok(())
 }
 
