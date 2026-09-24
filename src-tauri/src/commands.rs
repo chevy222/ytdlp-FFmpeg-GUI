@@ -2538,18 +2538,21 @@ pub fn check_update(app: AppHandle) -> CmdResult<Option<UpdateInfo>> {
     let current = env!("CARGO_PKG_VERSION").to_string();
     // GitHub API：未认证 60 次/小时，桌面应用启动频率足够
     let api_url = "https://api.github.com/repos/chevy222/ytdlp-FFmpeg-GUI/releases/latest";
-    let output = std::process::Command::new("curl")
-        .args([
-            "-sS",
-            "-L",
-            "--max-time",
-            "10",
-            "-H",
-            "Accept: application/vnd.github+json",
-            "-H",
-            "User-Agent: ytdlp-FFmpeg-GUI",
-            api_url,
-        ])
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args([
+        "-sS",
+        "-L",
+        "--max-time",
+        "10",
+        "-H",
+        "Accept: application/vnd.github+json",
+        "-H",
+        "User-Agent: ytdlp-FFmpeg-GUI",
+        api_url,
+    ]);
+    // Windows 下隐藏 curl 控制台窗口，否则启动检查更新时会闪一个黑框
+    ytdlp_core::exec::hide_console(&mut cmd);
+    let output = cmd
         .output()
         .map_err(|e| format!("无法调用 curl：{e}"))?;
     if !output.status.success() {
