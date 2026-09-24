@@ -802,7 +802,11 @@ pub fn start_download(
     audio_only: bool,
 ) -> CmdResult<()> {
     let state = app.state::<AppState>();
-    {
+    // 状态切换必须出锁后 emit item:update：前端 1.5s 轮询有"有 busy 条目才
+    // 刷新列表"的优化，若不主动通知，前端永远认为状态是 Ready、永不拉列表，
+    // 进度条也不显示（progressCell 仅在 Downloading 等状态渲染）——yt-dlp
+    // 实际在跑但 UI 完全无感知。
+    let updated = {
         let mut hist = state.history.lock();
         let mut item = hist.get(&id).cloned().ok_or("条目不存在")?;
         if item.status != Status::Ready {
@@ -817,8 +821,10 @@ pub fn start_download(
         // 否则排队任务会丢失用户选择的格式/仅音频选项
         item.format_id = format_id.clone();
         item.audio_only = audio_only;
-        hist.upsert(item);
-    }
+        hist.upsert(item.clone());
+        item
+    };
+    let _ = app.emit("item:update", &updated);
     // 提交并发队列
     let outcome = {
         let mut q = state.queue.lock();

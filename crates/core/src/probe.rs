@@ -339,12 +339,15 @@ pub fn probe_volume(
     path: &Path,
     on_log: &mut dyn FnMut(String),
 ) -> Result<AudioVolume> {
-    let args: Vec<String> = ["-vn", "-map", "0:a:0", "-t", "600", "-i"]
+    // ffmpeg 选项分输入/输出两段：-i 之前是输入选项，之后是输出选项。
+    // -map / -vn / -af / -f 都是输出选项，必须放在 -i 之后；否则 ffmpeg 报
+    // "Option map cannot be applied to input url"（退出码 -22/EINVAL）。
+    let args: Vec<String> = ["-i"]
         .iter()
         .map(|s| s.to_string())
         .chain(std::iter::once(path.to_string_lossy().into_owned()))
         .chain(
-            ["-af", "volumedetect", "-f", "null", "-"]
+            ["-vn", "-map", "0:a:0", "-t", "600", "-af", "volumedetect", "-f", "null", "-"]
                 .iter()
                 .map(|s| s.to_string()),
         )
