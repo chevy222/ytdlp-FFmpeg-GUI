@@ -898,7 +898,8 @@ function bindSetEvents(){
     if(!url)return;
     try{
       const u=new URL(url);
-      INVOKE('open_login_site',{host:u.hostname}).catch(err=>toast(err));
+      // 自定义站点传完整 URL：后端不再查硬编码列表，直接用该 URL 打开登录窗
+      INVOKE('open_login_site',{host:u.hostname,url:url.trim()}).catch(err=>toast(err));
     }catch(e){toast('URL 格式不正确');}
   });
 }

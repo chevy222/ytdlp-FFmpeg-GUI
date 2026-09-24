@@ -2252,14 +2252,23 @@ pub async fn relogin_item(app: AppHandle, id: String) -> CmdResult<()> {
 ///
 /// 传站点级域名（如 `bilibili.com`）即可：`cookie_candidates` 会按
 /// "精确 host → 父域 → www 子域" 回退，条目侧的 `www.bilibili.com` 一样命中。
+///
+/// `url` 为自定义站点的登录页完整 URL（如 `https://www.example.com/login`）；
+/// 预设站点只传 host，由 `login_url_for_host` 映射到固定登录页。自定义站点
+/// 传 url 时不再查硬编码列表，任何站点都能登录。
 #[tauri::command]
-pub async fn open_login_site(app: AppHandle, host: String) -> CmdResult<()> {
-    open_login_off_main_thread(
-        app,
-        host,
-        "站点 {host} 不支持内置登录：请在下方的 Cookie 列表中直接导入".into(),
-    )
+pub async fn open_login_site(app: AppHandle, host: String, url: Option<String>) -> CmdResult<()> {
+    let login_url = match url {
+        Some(u) if !u.trim().is_empty() => u.trim().to_string(),
+        _ => login::login_url_for_host(&host)
+            .ok_or_else(|| format!("站点 {host} 不支持内置登录：请在下方的 Cookie 列表中直接导入"))?,
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        login::open_login(&app, &host, &login_url).map_err(err_string)
+    })
     .await
+    .map_err(|e| format!("登录窗口启动失败：{e}"))??;
+    Ok(())
 }
 
 // ---------- 配置 ----------
