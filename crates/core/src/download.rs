@@ -739,6 +739,9 @@ pub fn post_process(
     }
     }
     // 音频（增益到峰值 0dBFS，MAXGAIN 封顶 24dB，TC-07 语义）
+    // applied_gain 记录实际写入 ffmpeg 的增益值，成功后回写到 meta.audio_volume，
+    // 否则用户再点转码时会用旧探测值再放大一次（音量翻倍）。
+    let mut applied_gain: f32 = 0.0;
     if need_gain {
         let max_v = meta.audio_volume.max_volume_db.unwrap_or(0.0);
         // `max_gain_db` 理论上已被 AppConfig::sanitize 收进 >=0，这里再夹一次下限：
@@ -752,6 +755,7 @@ pub fn post_process(
             ));
             args.push("-af".into());
             args.push(format!("volume={:.2}dB", gain));
+            applied_gain = gain;
         }
     }
     args.push("-c:a".into());
@@ -817,7 +821,16 @@ pub fn post_process(
         let _ = std::fs::remove_file(&out);
         return Ok((input.to_path_buf(), meta.clone()));
     }
-    Ok((input.to_path_buf(), meta.clone()))
+    // 成功路径：把实际应用的增益回写到 meta.audio_volume，否则条目里存的还是
+    // 放大前的探测值，用户再点转码会重复放大（音量翻倍）。
+    let mut final_meta = meta.clone();
+    if applied_gain > 0.0 {
+        if let Some(v) = final_meta.audio_volume.max_volume_db {
+            // 增益目标是峰值 0dBFS，clamp 到 0.0 避免浮点误差产生正值
+            final_meta.audio_volume.max_volume_db = Some((v + applied_gain).min(0.0));
+        }
+    }
+    Ok((input.to_path_buf(), final_meta))
 }
 
 /// 产物校验：ffprobe 能解析且存在主流（视频产物查 v:0，纯音频产物查 a:0）。
