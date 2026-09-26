@@ -115,6 +115,7 @@ pub fn run() {
             commands::list_items,
             commands::list_items_lite,
             commands::get_item_log,
+            commands::get_item_formats,
             commands::start_download,
             commands::start_transcode,
             commands::start_merge,
@@ -141,6 +142,7 @@ pub fn run() {
             commands::queue_status,
             commands::check_update,
             commands::get_version_info,
+            commands::open_url,
         ])
         .setup(|app| {
             // 确保绿色便携目录结构（exe 同级）

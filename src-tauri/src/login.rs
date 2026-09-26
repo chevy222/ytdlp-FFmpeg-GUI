@@ -24,8 +24,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
-use crate::commands::save_cookies;
-
 /// 登录窗使用的 UA：桌面 Chrome。
 ///
 /// WebView2 的默认 UA 带 `Edg/` 等标识，部分站点会据此返回空白页或进入重定向
@@ -189,7 +187,7 @@ fn handle_login_done(win: &tauri::WebviewWindow, host: &str, _url: &str) {
                 );
                 return;
             }
-            if let Err(e) = save_cookies(app.clone(), host.to_string(), cookies) {
+            if let Err(e) = crate::commands::save_cookies_inner(&app, host, cookies) {
                 let _ = app.emit(
                     "login:failed",
                     serde_json::json!({ "host": host, "reason": format!("保存 cookie 失败：{e}") }),

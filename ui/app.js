@@ -549,12 +549,17 @@ function stopCountdown(id){
 
 // ===== 格式选择 =====
 let fmtId=null;
-function openFmt(id){
+async function openFmt(id){
   const it=S.items.find(i=>i.id===id); if(!it)return;
   fmtId=id; stopCountdown(id);
   document.getElementById('fmtTitle').textContent='选择下载格式 - '+(it.title||'');
   const list=document.getElementById('fmtList');
-  list.innerHTML=(it.meta.download_formats||[]).map(f=>
+  list.innerHTML='<li>加载格式中…</li>';
+  document.getElementById('fmtModal').classList.add('show');
+  // list_items_lite 已清空 download_formats（压缩轮询体积），弹窗打开时按需拉取
+  let formats=[];
+  try{ formats=await INVOKE('get_item_formats',{id}); }catch(e){ toast('获取格式失败：'+e); }
+  list.innerHTML=(formats||[]).map(f=>
     '<li data-fid="'+esc(f.format_id)+'" data-aonly="'+(f.audio_only?'1':'0')+'">'+
     '<span>'+esc(f.label)+(f.note?' <span class="s">'+esc(f.note)+'</span>':'')+'</span>'+
     '<span class="s">'+esc(f.format_id)+'</span></li>'
@@ -562,7 +567,6 @@ function openFmt(id){
   list.querySelectorAll('li[data-fid]').forEach(li=>{
     li.addEventListener('click',()=>{list.querySelectorAll('li').forEach(x=>x.classList.remove('on'));li.classList.add('on');});
   });
-  document.getElementById('fmtModal').classList.add('show');
 }
 function fmtOk(){
   const on=document.querySelector('#fmtList li.on');
@@ -794,7 +798,11 @@ function renderSetPage(){
       const el=document.getElementById('versionInfo'); if(!el)return;
       if(!info.latest_version){ el.textContent='当前 v'+info.current_version+'（最新版本查询失败）'; return; }
       const hasNew=info.latest_version!==info.current_version;
-      el.innerHTML='当前 v'+info.current_version+' / 最新 <a href="'+info.url+'" target="_blank" class="'+(hasNew?'ver-new':'ver-ok')+'">v'+info.latest_version+'</a>'+(hasNew?' ← 有新版本':'');
+      // 点击版本号在系统浏览器打开 Release 页（Tauri webview 内 <a target=_blank> 不生效）
+      el.innerHTML='当前 v'+info.current_version+' / 最新 <span class="ver-link '+ (hasNew?'ver-new':'ver-ok') +'" data-url="'+esc(info.url)+'">v'+info.latest_version+'</span>'+(hasNew?' ← 有新版本':'');
+      el.querySelectorAll('.ver-link').forEach(s=>{
+        s.addEventListener('click',()=>{ INVOKE('open_url',{url:s.dataset.url}).catch(e=>toast('打开链接失败：'+e)); });
+      });
     }).catch(()=>{
       const el=document.getElementById('versionInfo'); if(el)el.textContent='';
     });

@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 
@@ -11,6 +12,13 @@ use ytdlp_core::exec::ToolResolver;
 use ytdlp_core::history::History;
 use ytdlp_core::paths::Paths;
 use ytdlp_core::worker::TaskQueue;
+
+fn epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// 应用全局状态（Tauri State）。
 /// 本次调用级覆盖（CLI 传入，不写 config.json，§UL-09）。
@@ -50,6 +58,10 @@ pub struct AppState {
     persist_req: AtomicU64,
     /// 已完成写盘的请求序号（写盘时取"当时最高的请求序号"）
     persist_done: AtomicU64,
+    /// 上次写盘的 epoch 毫秒（用于去抖窗口判断）
+    last_persist_ms: AtomicU64,
+    /// 已有一个延迟 flush 任务在等（防止重复 spawn）
+    pending_flush: AtomicBool,
 }
 
 impl AppState {
@@ -82,6 +94,8 @@ impl AppState {
             persist_lock: Mutex::new(()),
             persist_req: AtomicU64::new(0),
             persist_done: AtomicU64::new(0),
+            last_persist_ms: AtomicU64::new(0),
+            pending_flush: AtomicBool::new(false),
         }
     }
 
@@ -122,28 +136,39 @@ impl AppState {
         self.cancels.lock().get(id).cloned()
     }
 
-    /// 持久化历史（变更即原子写，写失败降级为内存态并告警）。
+    /// 持久化历史（立即写盘 + 写合并，写失败降级为内存态并告警）。
     ///
     /// §11.15 锁纪律：锁内只取快照，序列化 + 写盘在锁外——
     /// 持锁写盘（满载 100 条 × 300 行日志时毫秒到百毫秒级）会阻塞所有 update_item。
     ///
-    /// 但"锁外写"意味着多个任务线程可能同时写（每个任务收尾都 persist）：
-    /// - 临时文件名已按 `pid + 序号` 隔离，互相不会截断（见 `paths::atomic_write_json`）；
-    /// - 这里再把写入者串行化，并做**写合并**：同时刻多个请求只需最后那一次写盘
-    ///   （写盘者取的是"当时最高请求号"对应的最新快照，被覆盖的请求直接返回）。
-    ///   批量任务（播放列表展开、批量转码）收尾时的 N 次多 MB 写盘会收敛成 1 次。
+    /// 写合并（并发到达）：同时刻多个请求只需最后那一次写盘。
+    ///
+    /// P1-5 去抖在 [`crate::commands::persist`] 层做：500ms 内的多次调用合并为
+    /// 一次 `persist()`。本函数只负责真正写盘，并更新 `last_persist_ms`。
     pub fn persist(&self) {
         let my_seq = self.persist_req.fetch_add(1, Ordering::SeqCst) + 1;
         let _writer = self.persist_lock.lock();
         let highest = self.persist_req.load(Ordering::SeqCst);
         if self.persist_done.load(Ordering::SeqCst) >= my_seq {
-            // 已有写入者用不早于我这轮的快照写过盘了
             return;
         }
         let snapshot = self.history.lock().clone();
         match snapshot.save(&self.paths.history_file()) {
-            Ok(()) => self.persist_done.store(highest, Ordering::SeqCst),
+            Ok(()) => {
+                self.persist_done.store(highest, Ordering::SeqCst);
+                self.last_persist_ms.store(epoch_ms(), Ordering::SeqCst);
+            }
             Err(e) => ytdlp_core::log::error(format!("history 持久化失败（保持内存态）：{e}")),
         }
+    }
+
+    /// 距上次写盘的毫秒数（去抖判断用）。
+    pub(crate) fn ms_since_last_persist(&self) -> u64 {
+        epoch_ms().saturating_sub(self.last_persist_ms.load(Ordering::SeqCst))
+    }
+
+    /// 是否已有延迟 flush 任务在等（防止重复 spawn）。
+    pub(crate) fn pending_flush(&self) -> &AtomicBool {
+        &self.pending_flush
     }
 }

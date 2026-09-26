@@ -486,9 +486,32 @@ fn log_item(app: &AppHandle, id: &str, line: impl Into<String>) {
     let _ = app.emit("item:log", serde_json::json!({ "id": id, "line": line }));
 }
 
+/// persist 去抖窗口：500ms 内的多次变更合并为一次写盘。
+///
+/// P1-5：批量转码 50 条 = 每条收尾调一次 persist，此前是 50 次全量
+/// clone + 序列化 + fsync。去抖后收敛为 ~1 次写盘。
+const PERSIST_DEBOUNCE_MS: u64 = 500;
+
 /// 持久化（状态迁移后调用）。
+///
+/// 去抖：距上次写盘 >= 500ms 立即写；< 500ms 则 spawn 一个延迟任务，
+/// 500ms 后合并写。`pending_flush` 保证同一窗口内只有一个延迟任务。
 fn persist(app: &AppHandle) {
-    app.state::<AppState>().persist();
+    let state = app.state::<AppState>();
+    if state.ms_since_last_persist() >= PERSIST_DEBOUNCE_MS {
+        state.persist();
+        return;
+    }
+    // 去抖窗口内：确保有且仅有一个延迟 flush 任务
+    if !state.pending_flush().swap(true, Ordering::SeqCst) {
+        let app = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(PERSIST_DEBOUNCE_MS));
+            let state = app.state::<AppState>();
+            state.pending_flush().store(false, Ordering::SeqCst);
+            state.persist();
+        });
+    }
 }
 
 // ---------- 添加与解析 ----------
@@ -791,11 +814,15 @@ pub fn list_items(state: State<'_, AppState>) -> CmdResult<Vec<MediaItem>> {
     Ok(hist.items.clone())
 }
 
-/// 列表轻量快照：**不含**日志。
+/// 列表轻量快照：**不含**日志与下载格式列表。
 ///
 /// 列表渲染只需要状态/进度/元数据；每条最多 300 行的日志（100 条时可达 MB 级）
 /// 让每次轮询的 IPC 与 JSON 解析成本凭空翻几倍。日志有两条正式通路：
 /// `item:log` 增量事件 + 打开弹窗时的 [`get_item_log`]。
+///
+/// `download_formats` 同理：YouTube 单条 40~60 个 format ≈ 6KB，200 条满列表
+/// ≈ 1.2MB，每 1.5s 轮询一次就是 1MB IPC。它只被"格式选择"弹窗使用，
+/// 打开时通过 [`get_item_formats`] 按需拉取。
 #[tauri::command(async)]
 pub fn list_items_lite(state: State<'_, AppState>) -> CmdResult<Vec<MediaItem>> {
     let hist = state.history.lock();
@@ -805,14 +832,33 @@ pub fn list_items_lite(state: State<'_, AppState>) -> CmdResult<Vec<MediaItem>> 
         .map(|i| {
             let mut c = i.clone();
             c.log = VecDeque::new();
+            c.meta.download_formats.clear();
             c
         })
         .collect())
 }
 
+/// 取某条目的下载格式列表（格式选择弹窗打开时按需拉取）。
+///
+/// `list_items_lite` 已清空 `download_formats` 以压缩轮询体积，弹窗打开时
+/// 调此命令取回完整格式列表。
+#[tauri::command(async)]
+pub fn get_item_formats(
+    state: State<'_, AppState>,
+    id: String,
+) -> CmdResult<Vec<ytdlp_core::model::DownloadFormat>> {
+    let hist = state.history.lock();
+    Ok(hist
+        .get(&id)
+        .map(|i| i.meta.download_formats.clone())
+        .unwrap_or_default())
+}
+
 /// 取某条目的完整日志（打开日志弹窗时按需拉取的权威副本）。
 #[tauri::command(async)]
-pub fn get_item_log(state: State<'_, AppState>, id: String) -> CmdResult<Vec<String>> {
+pub fn get_item_log(app: AppHandle, win: tauri::WebviewWindow, id: String) -> CmdResult<Vec<String>> {
+    ensure_main_window(&win)?;
+    let state = app.state::<AppState>();
     let hist = state.history.lock();
     Ok(hist
         .get(&id)
@@ -1121,7 +1167,15 @@ fn finish_download(app: &AppHandle, id: &str, result: Result<download::DownloadO
         }
     };
     update_item(app, id, |it| {
-        transition_in(it, final_status);
+        // P1-3：cancel_item 抢先把状态写成 Canceled，但任务线程此时已跑完、
+        // 实际成功。transition(Canceled → Done) 不在白名单内会被静默拒绝，
+        // 条目就永久停在"已取消"但产物已落地。显式覆盖，不依赖状态机。
+        if it.status == Status::Canceled && final_status == Status::Done {
+            it.status = Status::Done;
+            it.push_log("取消请求到达时下载已完成".to_string());
+        } else {
+            transition_in(it, final_status);
+        }
         it.percent = if final_status == Status::Done {
             100.0
         } else {
@@ -1333,19 +1387,29 @@ pub fn start_merge(
     // 跳过原因出锁后再写日志：log_item → update_item 会再次 lock history，
     // std::sync::Mutex 不可重入，锁内调用会当场死锁（UI 永久冻结）
     let mut skipped: Vec<(String, String)> = Vec::new();
+    // 锁内分两段：先做存在性预检（收集条目），全部通过后再改状态。
+    // 旧写法在循环内"边校验边改状态"，第 N 个 id 不存在时直接 return，
+    // 前 N-1 个已被写成 Merging 并 emit，既没进队列也没执行体，永久卡死。
+    let mut updated_items: Vec<MediaItem> = Vec::new();
     {
         let mut hist = state.history.lock();
+        // 第一段：存在性预检 + 收集（不改任何状态）
+        let mut items: Vec<(String, MediaItem)> = Vec::with_capacity(ids.len());
         for id in &ids {
             let Some(item) = hist.get(id).cloned() else {
                 return Err(format!("条目不存在：{id}"));
             };
+            items.push((id.clone(), item));
+        }
+        // 第二段：统一改状态
+        for (id, item) in items {
             let has_file = item
                 .path
                 .as_deref()
                 .map(|p| std::path::Path::new(p).is_file())
                 .unwrap_or(false);
             if !has_file {
-                skipped.push((id.clone(), "合并被跳过：无本地输入文件".into()));
+                skipped.push((id, "合并被跳过：无本地输入文件".into()));
                 continue;
             }
             match transition(item.status, Status::Merging) {
@@ -1357,16 +1421,16 @@ pub fn start_merge(
                         ..item
                     };
                     hist.upsert(updated.clone());
-                    // 出锁再 emit：避免在主线程外持着 history 锁做事件派发
-                    // （与 start_transcode 同一套写法）
-                    drop(hist);
-                    let _ = app.emit("item:update", &updated);
-                    hist = state.history.lock();
-                    jobs.push(id.clone());
+                    updated_items.push(updated);
+                    jobs.push(id);
                 }
-                Err(e) => skipped.push((id.clone(), format!("合并被跳过：{e}"))),
+                Err(e) => skipped.push((id, format!("合并被跳过：{e}"))),
             }
         }
+    }
+    // 出锁后统一 emit
+    for updated in &updated_items {
+        let _ = app.emit("item:update", updated);
     }
     for (id, msg) in skipped {
         log_item(&app, &id, msg);
@@ -1557,7 +1621,17 @@ fn finish_merge(
         let err = err_text.clone();
         let pct = final_status == Status::Done;
         update_item(app, jid, |it| {
-            transition_in(it, orig);
+            // P1-3：cancel_item 抢先写成 Canceled，但合并实际已完成。
+            // transition(Canceled → Ready/Done) 不在白名单，静默拒绝后条目
+            // 永久停在"已取消"，而产物已作为新条目回列表。显式覆盖为恢复状态。
+            if it.status == Status::Canceled && final_status == Status::Done {
+                it.status = orig;
+                if is_anchor {
+                    it.push_log("取消请求到达时合并已完成".to_string());
+                }
+            } else {
+                transition_in(it, orig);
+            }
             if is_anchor && pct {
                 it.percent = 100.0;
             }
@@ -1682,12 +1756,23 @@ pub fn start_transcode(app: AppHandle, ids: Vec<String>) -> CmdResult<()> {
     let mut to_run = Vec::new();
     // 同 start_merge：跳过日志出锁后再写，避免 history 锁重入死锁
     let mut skipped: Vec<(String, String)> = Vec::new();
+    // 锁内分两段：先做存在性预检（收集条目），全部通过后再改状态。
+    // 旧写法在循环内"边校验边改状态"，第 N 个 id 不存在时直接 return，
+    // 前 N-1 个已被写成 Transcoding 并 emit，既没进队列也没执行体，
+    // 永久卡死（remove/retry 都不接受非终态）。
+    let mut updated_items: Vec<MediaItem> = Vec::new();
     {
         let mut hist = state.history.lock();
+        // 第一段：存在性预检 + 收集（不改任何状态）
+        let mut items: Vec<(String, MediaItem)> = Vec::with_capacity(ids.len());
         for id in &ids {
             let Some(item) = hist.get(id).cloned() else {
                 return Err(format!("条目不存在：{id}"));
             };
+            items.push((id.clone(), item));
+        }
+        // 第二段：统一改状态
+        for (id, item) in items {
             let has_file = item
                 .path
                 .as_deref()
@@ -1695,7 +1780,7 @@ pub fn start_transcode(app: AppHandle, ids: Vec<String>) -> CmdResult<()> {
                 .unwrap_or(false);
             if !has_file {
                 skipped.push((
-                    id.clone(),
+                    id,
                     "转码被跳过：无本地输入文件（先下载或添加本地文件）".into(),
                 ));
                 continue;
@@ -1709,14 +1794,17 @@ pub fn start_transcode(app: AppHandle, ids: Vec<String>) -> CmdResult<()> {
                         ..item
                     };
                     hist.upsert(updated.clone());
-                    drop(hist);
-                    let _ = app.emit("item:update", &updated);
-                    hist = state.history.lock();
-                    to_run.push(id.clone());
+                    updated_items.push(updated);
+                    to_run.push(id);
                 }
-                Err(e) => skipped.push((id.clone(), format!("转码被跳过：{e}"))),
+                Err(e) => skipped.push((id, format!("转码被跳过：{e}"))),
             }
         }
+    }
+    // 出锁后统一 emit：避免持锁派发事件，也消除了旧写法每条一次
+    // drop(hist)→emit→re-lock 的抖动（批量 50 条 = 50 轮锁释放+获取）
+    for updated in &updated_items {
+        let _ = app.emit("item:update", updated);
     }
     for (id, msg) in skipped {
         log_item(&app, &id, msg);
@@ -1939,7 +2027,15 @@ fn finish_transcode(app: &AppHandle, id: &str, result: Result<std::path::PathBuf
         }
     };
     update_item(app, id, |it| {
-        transition_in(it, orig_status);
+        // P1-3：cancel_item 抢先写成 Canceled，但转码实际已完成。
+        // transition(Canceled → Ready/Done) 不在白名单，静默拒绝后条目永久停在
+        // "已取消"，而产物已作为新条目回列表。显式覆盖为恢复状态。
+        if it.status == Status::Canceled && final_status == Status::Done {
+            it.status = orig_status;
+            it.push_log("取消请求到达时转码已完成".to_string());
+        } else {
+            transition_in(it, orig_status);
+        }
         it.percent = if final_status == Status::Done {
             100.0
         } else {
@@ -2224,7 +2320,8 @@ async fn open_login_off_main_thread(
 }
 
 #[tauri::command]
-pub async fn relogin_item(app: AppHandle, id: String) -> CmdResult<()> {
+pub async fn relogin_item(app: AppHandle, win: tauri::WebviewWindow, id: String) -> CmdResult<()> {
+    ensure_main_window(&win)?;
     let host = {
         let state = app.state::<AppState>();
         let hist = state.history.lock();
@@ -2257,9 +2354,23 @@ pub async fn relogin_item(app: AppHandle, id: String) -> CmdResult<()> {
 /// 预设站点只传 host，由 `login_url_for_host` 映射到固定登录页。自定义站点
 /// 传 url 时不再查硬编码列表，任何站点都能登录。
 #[tauri::command]
-pub async fn open_login_site(app: AppHandle, host: String, url: Option<String>) -> CmdResult<()> {
+pub async fn open_login_site(
+    app: AppHandle,
+    win: tauri::WebviewWindow,
+    host: String,
+    url: Option<String>,
+) -> CmdResult<()> {
+    ensure_main_window(&win)?;
     let login_url = match url {
-        Some(u) if !u.trim().is_empty() => u.trim().to_string(),
+        Some(u) if !u.trim().is_empty() => {
+            let u = u.trim().to_string();
+            // P1-4：自定义 URL 仅允许 https，防止登录窗被引导到 http/恶意 scheme
+            let parsed = url::Url::parse(&u).map_err(|_| "自定义登录 URL 格式不正确".to_string())?;
+            if parsed.scheme() != "https" {
+                return Err("自定义登录 URL 仅支持 https".into());
+            }
+            u
+        }
         _ => login::login_url_for_host(&host)
             .ok_or_else(|| format!("站点 {host} 不支持内置登录：请在下方的 Cookie 列表中直接导入"))?,
     };
@@ -2274,8 +2385,11 @@ pub async fn open_login_site(app: AppHandle, host: String, url: Option<String>) 
 // ---------- 配置 ----------
 
 #[tauri::command]
-pub fn get_config(state: State<'_, AppState>) -> CmdResult<AppConfig> {
-    Ok(state.config.lock().clone())
+pub fn get_config(app: AppHandle, win: tauri::WebviewWindow) -> CmdResult<AppConfig> {
+    ensure_main_window(&win)?;
+    let state = app.state::<AppState>();
+    let config = state.config.lock().clone();
+    Ok(config)
 }
 
 #[tauri::command(async)]
@@ -2314,7 +2428,9 @@ pub fn save_config(app: AppHandle, win: tauri::WebviewWindow, mut config: AppCon
 // ---------- Cookie ----------
 
 #[tauri::command(async)]
-pub fn list_cookies(state: State<'_, AppState>) -> CmdResult<Vec<serde_json::Value>> {
+pub fn list_cookies(app: AppHandle, win: tauri::WebviewWindow) -> CmdResult<Vec<serde_json::Value>> {
+    ensure_main_window(&win)?;
+    let state = app.state::<AppState>();
     let store = CookieStore::new(state.paths.cookies_dir());
     let mut out = Vec::new();
     for host in store.list_hosts().map_err(err_string)? {
@@ -2328,18 +2444,34 @@ pub fn list_cookies(state: State<'_, AppState>) -> CmdResult<Vec<serde_json::Val
     Ok(out)
 }
 
-#[tauri::command(async)]
-pub fn save_cookies(
-    app: AppHandle,
-    host: String,
+/// 保存 cookie 的核心逻辑（无窗口守卫，供 Rust 内部直接调用）。
+///
+/// `handle_login_done` 从登录窗上下文调用此函数——登录窗的 webview label
+/// 不是 `main`，不能走命令层的 `ensure_main_window` 守卫。命令层
+/// [`save_cookies`] 加守卫后只允许主窗口调用，防止登录窗内的第三方页面
+/// 通过 `window.__TAURI__.invoke('save_cookies')` 覆写任意 host 的 cookie。
+pub(crate) fn save_cookies_inner(
+    app: &AppHandle,
+    host: &str,
     cookies: Vec<ytdlp_core::cookies::CookieEntry>,
 ) -> CmdResult<()> {
     let state = app.state::<AppState>();
-    let normalized = normalize_cookie_host(&host);
+    let normalized = normalize_cookie_host(host);
     let store = CookieStore::new(state.paths.cookies_dir());
     store.save_host(&normalized, cookies).map_err(err_string)?;
     let _ = app.emit("cookies:changed", normalized);
     Ok(())
+}
+
+#[tauri::command(async)]
+pub fn save_cookies(
+    app: AppHandle,
+    win: tauri::WebviewWindow,
+    host: String,
+    cookies: Vec<ytdlp_core::cookies::CookieEntry>,
+) -> CmdResult<()> {
+    ensure_main_window(&win)?;
+    save_cookies_inner(&app, &host, cookies)
 }
 
 /// 规范化 cookie 存储 host：YouTube 相关域名统一存 www.youtube.com.txt
@@ -2637,6 +2769,21 @@ pub fn get_version_info() -> CmdResult<UpdateInfo> {
             url: "https://github.com/chevy222/ytdlp-FFmpeg-GUI/releases".into(),
         }),
     }
+}
+
+/// 在系统默认浏览器中打开外部 URL。
+///
+/// Tauri webview 内的 `<a target="_blank">` 不会自动打开系统浏览器（默认被
+/// 拦截或在新 webview 打开），设置页的"最新版本"链接需要走这个命令。
+/// 仅允许 https/http scheme，防止 `file://` / `javascript:` 等注入。
+#[tauri::command(async)]
+pub fn open_url(win: tauri::WebviewWindow, url: String) -> CmdResult<()> {
+    ensure_main_window(&win)?;
+    let parsed = url::Url::parse(&url).map_err(|_| "URL 格式不正确".to_string())?;
+    if !matches!(parsed.scheme(), "https" | "http") {
+        return Err("仅支持 http/https 链接".into());
+    }
+    open::that(&url).map_err(|e| format!("打开浏览器失败：{e}"))
 }
 
 /// 简单语义化版本比较：`a > b` 返回 true。缺失段按 0 处理。
