@@ -4992,7 +4992,7 @@ dependencies = [
 
 [[package]]
 name = "ytdlp-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "encoding_rs",
  "parking_lot",
@@ -5009,7 +5009,7 @@ dependencies = [
 
 [[package]]
 name = "ytdlp-gui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "parking_lot",
  "serde",
