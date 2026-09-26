@@ -67,9 +67,16 @@ pub fn open_login(app: &AppHandle, host: &str, url: &str) -> Result<(), String> 
     if LOGIN_OPENING.swap(true, Ordering::SeqCst) {
         return Ok(());
     }
-    let result = build_login_window(app, host, url);
-    LOGIN_OPENING.store(false, Ordering::SeqCst);
-    result
+    // Drop guard：build_login_window 内部若 panic（Tauri 内部极端情况、
+    // 注入脚本构造失败等），也能复位标志，否则后续所有登录尝试永久静默失败。
+    struct ResetFlag;
+    impl Drop for ResetFlag {
+        fn drop(&mut self) {
+            LOGIN_OPENING.store(false, Ordering::SeqCst);
+        }
+    }
+    let _guard = ResetFlag;
+    build_login_window(app, host, url)
 }
 
 fn build_login_window(app: &AppHandle, host: &str, url: &str) -> Result<(), String> {

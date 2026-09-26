@@ -1061,7 +1061,8 @@ async function init(){
     INVOKE('check_update').then(info => {
       if (!info) return;
       if (window.confirm('发现新版本 v' + info.latest_version + '\n当前版本 v' + info.current_version + '\n\n是否前往 GitHub 下载？')) {
-        window.open(info.url, '_blank');
+        // Tauri webview 内 window.open 无效，走 open_url 命令调起系统浏览器
+        INVOKE('open_url',{url:info.url}).catch(e=>toast('打开链接失败：'+e));
       }
     }).catch(() => {});
   }catch(err){ console.error(err); toast('初始化失败：'+err); }
