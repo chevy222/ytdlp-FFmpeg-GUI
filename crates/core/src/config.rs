@@ -55,14 +55,10 @@ impl Default for DownloadConfig {
 pub struct TranscodeConfig {
     pub max_w: u32,
     pub max_h: u32,
-    /// 码率封顶 kbps
+    /// 码率封顶 kbps（None 时 sanitize 自动回填默认 5000）
     pub brcap_kbps: Option<u32>,
-    /// 兜底码率 kbps：封顶留空时的 maxrate 兜底（0 = 不兜底）
-    pub br_default_kbps: u32,
     /// 编码器模式：auto | libx265 | nvenc | amf
     pub force_encoder_mode: String,
-    /// QSV low_power
-    pub low_power: bool,
     /// 保留封面
     pub keep_cover: bool,
 }
@@ -73,9 +69,7 @@ impl Default for TranscodeConfig {
             max_w: 1920,
             max_h: 1080,
             brcap_kbps: Some(5000),
-            br_default_kbps: 8000,
             force_encoder_mode: "auto".into(),
-            low_power: true,
             keep_cover: true,
         }
     }
@@ -265,11 +259,12 @@ impl AppConfig {
 
         self.transcode.max_w = self.transcode.max_w.min(MAX_EDGE);
         self.transcode.max_h = self.transcode.max_h.min(MAX_EDGE);
-        self.transcode.brcap_kbps = self
-            .transcode
-            .brcap_kbps
-            .map(|k| k.clamp(1, MAX_BITRATE_KBPS));
-        self.transcode.br_default_kbps = self.transcode.br_default_kbps.min(MAX_BITRATE_KBPS);
+        self.transcode.brcap_kbps = match self.transcode.brcap_kbps {
+            Some(k) => Some(k.clamp(1, MAX_BITRATE_KBPS)),
+            // 用户清空输入框保存时自动回填默认值，避免 config.json 存 null
+            // 导致下次打开显示空（用户期望"留空 = 默认 5000"）
+            None => Some(5000),
+        };
         match self.transcode.force_encoder_mode.as_str() {
             "auto" | "libx265" | "nvenc" | "amf" => {}
             _ => self.transcode.force_encoder_mode = "auto".into(),
@@ -303,7 +298,6 @@ mod tests {
         assert!(!c.download.playlist);
         assert!(c.download.embed_cover);
         assert_eq!(c.transcode.force_encoder_mode, "auto");
-        assert!(c.transcode.low_power);
         assert_eq!(c.general.concurrency, 3);
         assert_eq!(c.general.max_gain_db, 24.0);
         assert!(c.general.check_update);

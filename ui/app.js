@@ -774,11 +774,10 @@ function renderSetPage(){
     h+=row('长边上限 MAXW',num('transcode.max_w',t.max_w,0,7680));
     h+=row('短边上限 MAXH',num('transcode.max_h',t.max_h,0,4320));
     // 后端是 Option<u32>：用文本框会把 "5000" 当字符串发过去，serde 类型不匹配会让整份设置保存失败
-    h+=row('码率封顶 kbps（留空 = 自动）',num('transcode.brcap_kbps',t.brcap_kbps,1,200000));
-    h+=row('兜底码率 kbps',num('transcode.br_default_kbps',t.br_default_kbps,0,100000));
+    // 留空保存时后端 sanitize 自动回填 5000，placeholder 提示默认值
+    h+=row('码率封顶 kbps（留空 = 默认 5000）','<input type="number" data-cfg="transcode.brcap_kbps" value="'+esc(t.brcap_kbps==null?'':t.brcap_kbps)+'" placeholder="5000" min="1" max="200000">');
     const encOpts=[['auto','自动'],['libx265','libx265'],['nvenc','NVENC H.265'+(S.hw&&!S.hw.nvenc?'（未检测到）':'')],['amf','AMF H.265'+(S.hw&&!S.hw.amf?'（未检测到）':'')]];
     h+=row('默认编码器（自动 = QSV → libx265 兜底）',sel('transcode.force_encoder_mode',t.force_encoder_mode,encOpts),'硬件编码器运行失败自动回退 libx265；未检测到的选项仍可选用');
-    h+=row('QSV low_power',chk('transcode.low_power',t.low_power,''));
     h+=row('保留封面',chk('transcode.keep_cover',t.keep_cover,''));
   } else if(curPage==='general'){
     h+=row('默认输出目录（留空 = 桌面）',txt('general.default_output_dir',g.default_output_dir,'桌面'));

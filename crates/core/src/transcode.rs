@@ -50,13 +50,9 @@ pub struct TranscodeParams {
     pub container: String,
     /// 编码器模式：auto | libx265 | nvenc | amf（自动 = QSV → libx265 兜底）
     pub encoder_mode: String,
-    /// QSV low_power（仅 auto→QSV 时生效）
-    pub low_power: bool,
     pub max_w: u32,
     pub max_h: u32,
     pub brcap_kbps: Option<u32>,
-    /// 兜底码率 kbps：封顶留空时的 maxrate 兜底（0 = 不兜底）
-    pub br_default_kbps: u32,
     pub normalize_audio: bool,
     pub max_gain_db: f32,
     pub rot_angle: RotAngle,
@@ -174,7 +170,6 @@ pub fn explicit_encoder_args(mode: &str) -> (String, Vec<String>) {
 fn pick_encoder(
     resolver: &ToolResolver,
     mode: &str,
-    low_power: bool,
 ) -> Result<(String, Vec<String>)> {
     let (enc, args) = explicit_encoder_args(mode);
     match mode {
@@ -183,11 +178,8 @@ fn pick_encoder(
         "amf" => Ok((enc, args)),
         _ => {
             if qsv_available(resolver)? {
-                let mut args = sv(&["-global_quality", "23"]);
-                if low_power {
-                    args.push("-low_power".into());
-                    args.push("1".into());
-                }
+                // low_power 始终启用（原设置项已移除，默认开启）
+                let args = sv(&["-global_quality", "23", "-low_power", "1"]);
                 Ok(("hevc_qsv".into(), args))
             } else {
                 Ok(("libx265".into(), sv(&["-crf", "23", "-preset", "medium"])))
@@ -322,19 +314,18 @@ pub fn build_args_for_tier(
                 "nvenc" | "amf" => params.encoder_mode.as_str(),
                 _ => "libx265",
             };
-            pick_encoder(resolver, mode, params.low_power)?
+            pick_encoder(resolver, mode)?
         }
         _ => {
-            let mut a: Vec<String> = vec![
+            // low_power 始终启用（原设置项已移除，默认开启）
+            let a: Vec<String> = vec![
                 "-preset".into(),
                 "veryfast".into(),
                 "-extbrc".into(),
                 "1".into(),
+                "-low_power".into(),
+                "1".into(),
             ];
-            if tier == TranscodeTier::GpuQsv && params.low_power {
-                a.push("-low_power".into());
-                a.push("1".into());
-            }
             ("hevc_qsv".into(), a)
         }
     };
@@ -542,15 +533,11 @@ pub fn build_args_for_tier(
     args.push(encoder);
     args.extend(enc_args);
     if hw {
-        // QSV 层码率三件套：源码率（缺省用兜底码率），封顶截断；
-        // maxrate = 1.2×、bufsize = 2×（bat 同款）
+        // QSV 层码率三件套：源码率（缺省用兜底码率 3500，原设置项已移除），
+        // 封顶截断；maxrate = 1.2×、bufsize = 2×（bat 同款）
         let src = meta
             .vbitrate_kbps
-            .or(if params.br_default_kbps > 0 {
-                Some(params.br_default_kbps)
-            } else {
-                None
-            })
+            .or(Some(3500))
             .map(|src| match params.brcap_kbps.filter(|c| *c > 0) {
                 Some(cap) => src.min(cap),
                 None => src,
@@ -905,11 +892,9 @@ mod tests {
             filename_template: "纯标题".into(),
             container: "mp4".into(),
             encoder_mode: "libx265".into(),
-            low_power: false,
             max_w: 0,
             max_h: 0,
             brcap_kbps: None,
-            br_default_kbps: 0,
             normalize_audio: false,
             max_gain_db: 24.0,
             rot_angle: RotAngle::ZERO,
@@ -947,11 +932,9 @@ mod tests {
             filename_template: "纯标题".into(),
             container: "mp4".into(),
             encoder_mode: "libx265".into(),
-            low_power: false,
             max_w: 0,
             max_h: 0,
             brcap_kbps: None,
-            br_default_kbps: 0,
             normalize_audio: false,
             max_gain_db: 24.0,
             rot_angle: RotAngle::ZERO,
