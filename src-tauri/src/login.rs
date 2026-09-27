@@ -175,8 +175,17 @@ fn handle_login_done(win: &tauri::WebviewWindow, host: &str, _url: &str) {
     // 因此只从 COM 取、失败就明确报错，绝不写页面提供的载荷。
     #[cfg(windows)]
     {
+        // COM 抓取必须用登录页**实际加载的域名**：列表条目 host 可能是短链
+        // 域名（如 youtu.be），但登录窗加载的是 www.youtube.com，cookie 的
+        // domain 是 .youtube.com，用 https://youtu.be/ 抓不到。
+        // 用 login_url_for_host 映射到实际登录页 URL，取其 host 作为抓取目标。
+        // 自定义站点（login_url_for_host 返回 None）直接用原 host。
+        let fetch_host = login_url_for_host(host)
+            .and_then(|u| url::Url::parse(&u).ok())
+            .and_then(|u| u.host_str().map(|h| h.to_string()))
+            .unwrap_or_else(|| host.to_string());
         let (tx, rx) = std::sync::mpsc::channel::<Option<Vec<ytdlp_core::cookies::CookieEntry>>>();
-        let host_owned = host.to_string();
+        let host_owned = fetch_host;
         let _ = win.with_webview(move |webview| {
             let _ = tx.send(crate::login_win::fetch_cookies_com(&webview, &host_owned));
         });
