@@ -516,6 +516,15 @@ fn persist(app: &AppHandle) {
 
 // ---------- 添加与解析 ----------
 
+/// 读取剪贴板文本。首页"添加"按钮在输入框为空时自动调用，
+/// 把剪贴板里的 URL 直接添加，省去手动粘贴步骤。
+#[tauri::command]
+pub fn read_clipboard() -> CmdResult<String> {
+    let mut clipboard = arboard::Clipboard::new().map_err(|e| format!("打开剪贴板失败：{e}"))?;
+    let text = clipboard.get_text().unwrap_or_default();
+    Ok(text)
+}
+
 #[tauri::command(async)]
 pub fn add_url(app: AppHandle, urls: Vec<String>) -> CmdResult<()> {
     let state = app.state::<AppState>();

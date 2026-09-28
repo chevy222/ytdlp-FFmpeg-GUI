@@ -416,8 +416,12 @@ document.getElementById('btnTranscode').addEventListener('click',()=>{
 });
 document.getElementById('btnMerge').addEventListener('click',openMerge);
 
-function addUrls(){
-  const raw=document.getElementById('urlInput').value;
+async function addUrls(){
+  let raw=document.getElementById('urlInput').value;
+  // 输入框为空时自动读取剪贴板：复制链接后直接点"添加"即可，不用手动粘贴
+  if(!raw.trim()){
+    try{ raw=await INVOKE('read_clipboard'); }catch(e){ toast('读取剪贴板失败：'+e); return; }
+  }
   const urls=raw.split(/\s+/).map(s=>s.trim()).filter(s=>/^https?:\/\//i.test(s));
   if(!urls.length){toast('请粘贴有效的视频链接');return;}
   INVOKE('add_url',{urls}).then(()=>{document.getElementById('urlInput').value='';}).catch(err=>toast(err));

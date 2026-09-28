@@ -110,6 +110,7 @@ pub fn run() {
         }))
         .manage(state::AppState::new())
         .invoke_handler(tauri::generate_handler![
+            commands::read_clipboard,
             commands::add_url,
             commands::add_local,
             commands::list_items,
