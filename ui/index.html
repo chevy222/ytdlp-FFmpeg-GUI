@@ -29,6 +29,7 @@
   html,body{height:100%}
   body{font-family:"Segoe UI Variable Text","Segoe UI","Microsoft YaHei UI","Microsoft YaHei","PingFang SC","Noto Sans SC",system-ui,sans-serif;font-size:13px;background:var(--parchment);color:var(--ink);display:flex;flex-direction:column;overflow:hidden;-webkit-font-smoothing:antialiased}
   body.drag-over::after{content:"松开以添加文件 / 文件夹";position:fixed;inset:8px;border:2px dashed var(--pri);border-radius:var(--r-lg);background:rgba(245,245,247,.94);display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:600;color:var(--pri);z-index:999;pointer-events:none}
+  body.drag-url::after{content:"松开以添加链接";position:fixed;inset:8px;border:2px dashed var(--pri);border-radius:var(--r-lg);background:rgba(232,242,252,.95);display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:600;color:var(--pri);z-index:999;pointer-events:none}
   .app{flex:1;display:flex;flex-direction:column;min-height:0;background:var(--parchment)}
 
   /* ===== 顶部工具栏（单行）===== */

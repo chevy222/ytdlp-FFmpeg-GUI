@@ -386,6 +386,42 @@ try{
     }
   });
 }catch(err){ console.warn('drag-drop unavailable:',err); }
+// URL 文本拖放（HTML5）：WebView2 拖入链接文本不触发 Tauri onDragDropEvent
+// （那只处理文件/文件夹路径）。用 dataTransfer.types 区分文本拖拽 vs 文件拖拽：
+// - 文本拖拽（text/plain 且非 Files）→ preventDefault + drag-url 高亮 + add_url
+// - 文件拖拽（含 Files）→ 不 preventDefault，交给上面的 Tauri onDragDropEvent
+// dataTransfer.getData 在 dragover 阶段受安全限制读不到，只能用 types 判断；
+// drop 阶段才能读 text/plain 内容。
+(function(){
+  function isTextDrag(e){
+    if(!e.dataTransfer)return false;
+    const types=Array.prototype.slice.call(e.dataTransfer.types||[]);
+    return types.indexOf('text/plain')!==-1 && types.indexOf('Files')===-1;
+  }
+  document.addEventListener('dragenter', e=>{
+    if(!isTextDrag(e))return;
+    e.preventDefault();
+    document.body.classList.add('drag-url');
+  });
+  document.addEventListener('dragover', e=>{
+    if(!isTextDrag(e))return;
+    e.preventDefault();
+    document.body.classList.add('drag-url');
+  });
+  document.addEventListener('dragleave', e=>{
+    if(!e.relatedTarget)document.body.classList.remove('drag-url');
+  });
+  document.addEventListener('drop', e=>{
+    document.body.classList.remove('drag-url');
+    if(!isTextDrag(e))return; // 文件拖放交给 Tauri
+    e.preventDefault();
+    const text=(e.dataTransfer&&e.dataTransfer.getData('text/plain'))||'';
+    const urls=text.split(/\s+/).map(s=>s.trim()).filter(s=>/^https?:\/\//i.test(s));
+    if(urls.length){
+      INVOKE('add_url',{urls}).then(()=>toast('已添加 '+urls.length+' 个链接')).catch(err=>toast(err));
+    }
+  });
+})();
 document.getElementById('btnClearList').addEventListener('click', ()=>{
   if(!S.items.length){toast('列表已是空的');return;}
   askConfirm('清空列表（已完成/失败/已取消的条目会被移除，进行中的保留）？').then(ok=>{
