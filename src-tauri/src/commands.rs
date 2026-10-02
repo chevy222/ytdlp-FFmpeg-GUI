@@ -2308,13 +2308,16 @@ pub fn clear_done(app: AppHandle) -> CmdResult<()> {
     let state = app.state::<AppState>();
     let removed: Vec<String> = {
         let mut hist = state.history.lock();
+        // 清除所有非活跃条目（Ready/Done/Failed/Canceled/NeedLogin），
+        // 保留解析中和处理中的。按钮叫"清空列表"，用户期望清掉本地添加的
+        // Ready 条目，而不是只清终态。
         let ids: Vec<String> = hist
             .items
             .iter()
-            .filter(|i| i.status.is_terminal())
+            .filter(|i| !i.status.is_active())
             .map(|i| i.id.clone())
             .collect();
-        hist.clear_terminal();
+        hist.clear_idle();
         ids
     };
     // 缩略图缓存同步清理（否则 config/cache/thumbs/ 随使用时长无限增长）

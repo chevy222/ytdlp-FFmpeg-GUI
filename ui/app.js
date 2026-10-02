@@ -424,10 +424,11 @@ try{
 })();
 document.getElementById('btnClearList').addEventListener('click', ()=>{
   if(!S.items.length){toast('列表已是空的');return;}
-  askConfirm('清空列表（已完成/失败/已取消的条目会被移除，进行中的保留）？').then(ok=>{
+  askConfirm('清空列表（已就绪/已完成/失败/已取消/需要登录的条目会被移除，解析中和处理中的保留）？').then(ok=>{
     if(!ok)return;
-    // 用 clear_done：后端只删终态条目，进行中的任务不会被"清"掉
-    // （旧实现对每个条目发 remove_item 并吞掉错误，进行中的条目静默留下、本地列表却清空了）
+    // clear_done 清除所有非活跃条目（Ready/Done/Failed/Canceled/NeedLogin），
+    // 保留解析中和处理中的（Probing/Downloading/PostProcessing/Transcoding/Merging）。
+    // 本地添加的文件是 Ready 状态，也能被清掉。
     INVOKE('clear_done').then(()=>refreshQueue()).catch(err=>toast(err));
   });
 });

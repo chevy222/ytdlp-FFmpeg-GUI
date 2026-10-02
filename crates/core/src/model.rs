@@ -43,6 +43,11 @@ impl Status {
         )
     }
 
+    /// 是否为活跃状态（解析中 + 处理中）：清空列表时保留，其余可清除。
+    pub fn is_active(self) -> bool {
+        matches!(self, Self::Probing) || self.is_processing()
+    }
+
     /// UI 文案（状态用颜色 + 文字双表达，见 §6.3）。
     pub fn label(self) -> &'static str {
         match self {

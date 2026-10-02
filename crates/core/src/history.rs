@@ -142,6 +142,14 @@ impl History {
         self.items.retain(|i| !i.status.is_terminal());
     }
 
+    /// 清除全部非活跃条目（Ready/Done/Failed/Canceled/NeedLogin），
+    /// 保留解析中和处理中的（Probing/Downloading/PostProcessing/Transcoding/Merging）。
+    /// "清空列表"按钮用这个，而不是 clear_terminal——后者只清终态，
+    /// 本地添加的 Ready 条目清不掉，与"清空列表"的用户预期不符。
+    pub fn clear_idle(&mut self) {
+        self.items.retain(|i| i.status.is_active());
+    }
+
     /// 加载；文件缺失返回空历史；JSON 损坏备份为 `<原名>.corrupt-<ts>.json`。
     pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
