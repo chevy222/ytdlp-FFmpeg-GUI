@@ -1,6 +1,6 @@
 //! 应用全局状态：路径、配置、历史列表、并发队列、取消注册表。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -50,6 +50,9 @@ pub struct AppState {
     pub cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// 合并面板参数（入队等待时保存；低频操作，仅面板内配置，不落 config）
     pub merge_jobs: Mutex<HashMap<String, crate::commands::MergeJob>>,
+    /// 放大到 1080P 的任务 id 集合：start_upscale 写入，run_transcode_task
+    /// 读取后设置 TranscodeParams.upscale_1080，执行完移除。
+    pub upscale_ids: Mutex<HashSet<String>>,
     /// CLI 本次调用级覆盖（--dir/--cookies/--yt-dlp-path/--deno-path）
     pub cli: Mutex<CliOverrides>,
     /// 历史写盘串行锁（同一时刻只有一个写入者）
@@ -90,6 +93,7 @@ impl AppState {
             queue: Mutex::new(TaskQueue::new(concurrency)),
             cancels: Mutex::new(HashMap::new()),
             merge_jobs: Mutex::new(HashMap::new()),
+            upscale_ids: Mutex::new(HashSet::new()),
             cli: Mutex::new(CliOverrides::default()),
             persist_lock: Mutex::new(()),
             persist_req: AtomicU64::new(0),

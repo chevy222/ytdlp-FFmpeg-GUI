@@ -119,6 +119,7 @@ pub fn run() {
             commands::get_item_formats,
             commands::start_download,
             commands::start_transcode,
+            commands::start_upscale,
             commands::start_merge,
             commands::cancel_item,
             commands::remove_item,

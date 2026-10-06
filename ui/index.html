@@ -104,10 +104,13 @@
   .rotbadge{position:absolute;top:-7px;right:-7px;background:var(--ink);color:#fff;font-size:10px;font-weight:600;line-height:16px;border-radius:8px;padding:0 6px;display:none;z-index:3}
   .rotbadge.show{display:block}
   .nmain{min-width:0;flex:1}
-  .trow{display:flex;align-items:center;gap:6px}
-  .rotbtn{width:20px;height:20px;border:none;background:transparent;border-radius:var(--r-xs);cursor:pointer;display:inline-flex;align-items:center;justify-content:center;color:var(--ink-20);padding:0;flex:none;transition:color .15s,background .15s}
+  .trow{display:flex;align-items:center;gap:4px}
+  .rotbtn{width:18px;height:18px;border:none;background:transparent;border-radius:var(--r-xs);cursor:pointer;display:inline-flex;align-items:center;justify-content:center;color:var(--ink-20);padding:0;flex:none;transition:color .15s,background .15s}
   .rotbtn:hover{color:var(--ink-2);background:var(--parchment)}
   .rotbtn svg{display:block}
+  .upbtn{width:18px;height:18px;border:none;background:transparent;border-radius:var(--r-xs);cursor:pointer;display:inline-flex;align-items:center;justify-content:center;color:var(--ink-20);padding:0;flex:none;transition:color .15s,background .15s}
+  .upbtn:hover{color:var(--pri);background:var(--pri-tint)}
+  .upbtn svg{display:block}
   .name{font-size:13.5px;font-weight:600;letter-spacing:-.2px;color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}
   .subline{font-size:11px;color:var(--ink-48);margin-top:5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .meta{font-size:11px;line-height:17px;overflow:hidden;color:var(--ink-48);word-break:break-word}
@@ -275,6 +278,7 @@
     <button id="btnRotCW" class="roticon" title="顺时针旋转 90°"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9"/><path d="M21 3v6h-6"/></svg></button>
     <button id="btnRotCCW" class="roticon" title="逆时针旋转 90°"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9"/><path d="M3 3v6h6"/></svg></button>
     <button id="btnTranscode" class="btn sm">转码</button>
+    <button id="btnUpscale" class="btn sm">放大</button>
     <button id="btnMerge" class="btn sm">合并…</button>
     <button id="btnDelSel" class="btn sm danger">删除</button>
   </div>

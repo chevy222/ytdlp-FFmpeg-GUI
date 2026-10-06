@@ -141,10 +141,16 @@ function rowHtml(it){
   const rots = (probing || !hasFile) ? '' :
       '<button class="rotbtn" data-act="rotcw" data-id="'+id+'" title="顺时针">'+rotSvg(true)+'</button>'+
       '<button class="rotbtn" data-act="rotccw" data-id="'+id+'" title="逆时针">'+rotSvg(false)+'</button>';
+  // 放大到 1080P：只对有本地文件且非忙碌状态的条目显示（和转码按钮同条件）
+  const canUpscale = hasFile && (it.status==='Ready'||it.status==='Done') && it.path;
+  const ups = canUpscale
+    ? '<button class="upbtn" data-act="upscale" data-id="'+id+'" title="放大到 1080P（小于 1080P 的视频等比放大）">'+
+      '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"/><path d="M9 21H3v-6"/><path d="M21 3l-7 7"/><path d="M3 21l7-7"/></svg></button>'
+    : '';
   return '<tr data-id="'+id+'">'+
     '<td><input type="checkbox" data-act="sel" data-id="'+id+'"'+(S.selected.has(it.id)?' checked':'')+'></td>'+
     '<td><div class="nrow">'+cv+
-      '<div class="nmain"><div class="trow">'+rots+
+      '<div class="nmain"><div class="trow">'+rots+ups+
         '<span class="name" title="'+esc(it.title)+'">'+esc(it.title)+'</span>'+
       '</div><div class="subline">'+subline(it)+'</div></div>'+
     '</div></td>'+
@@ -331,6 +337,7 @@ document.getElementById('tbody').addEventListener('click', e=>{
   const a=act.dataset.act, id=act.dataset.id;
   if(a==='dl')startDownload(id);
   else if(a==='tc')INVOKE('start_transcode',{ids:[id]}).then(refreshQueue).catch(err=>toast(err));
+  else if(a==='upscale')INVOKE('start_upscale',{ids:[id]}).then(refreshQueue).catch(err=>toast(err));
   else if(a==='cancel')INVOKE('cancel_item',{id}).then(refreshQueue).catch(err=>toast(err));
   else if(a==='retry')INVOKE('retry_item',{id}).then(()=>toast('已重新解析')).catch(err=>toast(err));
   else if(a==='relogin')INVOKE('relogin_item',{id}).catch(err=>toast(err));
@@ -450,6 +457,11 @@ document.getElementById('btnTranscode').addEventListener('click',()=>{
   if(!S.selected.size){toast('请先勾选条目');return;}
   const ids=[...S.selected];
   INVOKE('start_transcode',{ids}).then(()=>{S.selected.clear();render();refreshQueue();}).catch(err=>toast(err));
+});
+document.getElementById('btnUpscale').addEventListener('click',()=>{
+  if(!S.selected.size){toast('请先勾选条目');return;}
+  const ids=[...S.selected];
+  INVOKE('start_upscale',{ids}).then(()=>{S.selected.clear();render();refreshQueue();}).catch(err=>toast(err));
 });
 document.getElementById('btnMerge').addEventListener('click',openMerge);
 

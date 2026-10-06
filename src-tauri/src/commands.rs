@@ -1799,6 +1799,26 @@ pub fn set_sections(app: AppHandle, id: String, start: String, end: String) -> C
 /// 批量转码（TC-05：按 设置-转码/通用 默认参数执行，不弹确认窗）。
 #[tauri::command(async)]
 pub fn start_transcode(app: AppHandle, ids: Vec<String>) -> CmdResult<()> {
+    begin_transcode(app, ids, false)
+}
+
+/// 批量放大到 1080P：长边<1920 且 短边<1080 的视频等比放大到不超过 1920×1080，
+/// 已达 1080P 及以上不缩放。其余转码参数同 设置-转码/通用。
+#[tauri::command(async)]
+pub fn start_upscale(app: AppHandle, ids: Vec<String>) -> CmdResult<()> {
+    // 先登记 upscale_ids，run_transcode_task 执行时读取并设置 params.upscale_1080
+    {
+        let state = app.state::<AppState>();
+        let mut set = state.upscale_ids.lock();
+        for id in &ids {
+            set.insert(id.clone());
+        }
+    }
+    begin_transcode(app, ids, true)
+}
+
+/// 转码入口（start_transcode / start_upscale 共用）。
+fn begin_transcode(app: AppHandle, ids: Vec<String>, _upscale: bool) -> CmdResult<()> {
     let state = app.state::<AppState>();
     if ids.is_empty() {
         return Err("未选择条目".into());
@@ -2002,6 +2022,8 @@ fn run_transcode_task(app: AppHandle, id: String) {
             ),
         );
     }
+    // 放大到 1080P：从 upscale_ids 读取，读完即移除（即使后续失败也不留残留）
+    let upscale_1080 = state.upscale_ids.lock().remove(&id);
     let params = TranscodeParams {
         input: path.clone(),
         out_dir,
@@ -2017,6 +2039,7 @@ fn run_transcode_task(app: AppHandle, id: String) {
         rot_angle: item.rot_angle,
         keep_cover: cfg.transcode.keep_cover,
         collision_policy: cfg.general.collision_policy.clone(),
+        upscale_1080,
     };
     let app2 = app.clone();
     let id2 = id.clone();
