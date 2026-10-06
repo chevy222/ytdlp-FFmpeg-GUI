@@ -59,9 +59,11 @@ pub struct TranscodeParams {
     pub keep_cover: bool,
     /// auto_inc | skip（§TC-11 碰撞命名策略）
     pub collision_policy: String,
-    /// 放大到 1080P：长边<1920 且 短边<1080 时等比放大到不超过 1920×1080，
-    /// 已达 1080P 及以上不缩放。与 max_w/max_h 互斥（放大时忽略缩小上限）。
-    pub upscale_1080: bool,
+    /// 放大到 1080P 时由 Rust 侧计算的固定目标宽高（偶数对齐）。
+    /// Some 时 build_vf 直接用 scale=W:H（固定值，无 ffmpeg 表达式），
+    /// 避免表达式里 if()/min() 的逗号被 filtergraph 解析器误判为滤波器分隔符。
+    /// None 时走常规 max_w/max_h 缩小上限逻辑。
+    pub force_scale: Option<(u32, u32)>,
 }
 
 impl TranscodeParams {
@@ -237,7 +239,7 @@ pub fn detect_hw_encoders(resolver: &ToolResolver) -> Result<HwEncoders> {
 /// 因此用旋转不变量表达：短边 = `min(iw,ih)`、长边 = `max(iw,ih)`——无论转不转都成立。
 /// 缩放系数 s = min(1, max_h/短边, max_w/长边)，宽高各自 `trunc(*s/2)*2` 保偶数边长
 /// （奇数宽会让 libx265/QSV 直接报 chroma subsampling 错误）。
-fn build_vf(rot: RotAngle, max_w: u32, max_h: u32, upscale_1080: bool) -> Option<String> {
+fn build_vf(rot: RotAngle, max_w: u32, max_h: u32, force_scale: Option<(u32, u32)>) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     match rot.degrees() {
         90 => parts.push("transpose=1".into()),
@@ -245,13 +247,9 @@ fn build_vf(rot: RotAngle, max_w: u32, max_h: u32, upscale_1080: bool) -> Option
         270 => parts.push("transpose=2".into()),
         _ => {}
     }
-    if upscale_1080 {
-        // 放大系数：长边<1920 且 短边<1080 时，s = min(1920/长边, 1080/短边)（>1）；
-        // 否则 s=1（不缩放）。ffmpeg 表达式 min/max 只收两个参数，需嵌套。
-        // 放大操作忽略 max_w/max_h（用户明确要放大到 1080P，不应再被缩小上限限制）。
-        let s = "if(lt(max(iw,ih),1920)*lt(min(iw,ih),1080),\
-                 min(1920/max(iw,ih),1080/min(iw,ih)),1)";
-        parts.push(format!("scale='trunc(iw*{s}/2)*2':'trunc(ih*{s}/2)*2'"));
+    if let Some((w, h)) = force_scale {
+        // 固定目标分辨率（Rust 侧已计算，无 ffmpeg 表达式，无逗号）
+        parts.push(format!("scale={w}:{h}"));
     } else if max_w > 0 || max_h > 0 {
         // 缩放系数 s = min(1, MAXH/短边, MAXW/长边)。
         // 注意：ffmpeg 表达式求值器的 min()/max() **只接受两个参数**，三参数写法
@@ -361,24 +359,26 @@ pub fn build_args_for_tier(
     // —— 滤镜链 ——
     // CPU 链：旋转（transpose）→ 分辨率上限（旋转不变量 min(iw,ih)/max(iw,ih)，
     // min 两两嵌套——ffmpeg 求值器 min/max 只收两个参数）。
-    let cpu_vf = build_vf(params.rot_angle, params.max_w, params.max_h, params.upscale_1080);
-    // GPU 链：vpp_qsv 先缩放后转置（尺寸表达式取转置前的 iw/ih），180° 用两次
-    // transpose；scale_qsv 的 w/h 与 vpp_qsv 同式（表达式由 ffmpeg 求值）。
+    let cpu_vf = build_vf(params.rot_angle, params.max_w, params.max_h, params.force_scale);
+    // GPU 链：vpp_qsv 先缩放后转置；force_scale 用固定值（无表达式），
+    // 缩小上限用 ffmpeg 表达式（min() 嵌套，与 CPU 路径同式）。
     let gpu_vf: Option<String> = (tier == TranscodeTier::GpuQsv).then(|| {
-        let sc: String = if params.upscale_1080 {
-            // 放大到 1080P：与 CPU 路径同系数表达式
-            "if(lt(max(iw,ih),1920)*lt(min(iw,ih),1080),\
-             min(1920/max(iw,ih),1080/min(iw,ih)),1)".into()
-        } else {
-            let mut s = "1".to_string();
-            if params.max_h > 0 {
-                s = format!("min({},{}/min(iw,ih))", s, params.max_h);
-            }
-            if params.max_w > 0 {
-                s = format!("min({},{}/max(iw,ih))", s, params.max_w);
-            }
-            s
-        };
+        if let Some((w, h)) = params.force_scale {
+            // 固定目标分辨率（Rust 侧已计算）
+            return match params.rot_angle.degrees() {
+                90 => format!("vpp_qsv=transpose=clock:w={w}:h={h}"),
+                270 => format!("vpp_qsv=transpose=cclock:w={w}:h={h}"),
+                180 => format!("vpp_qsv=transpose=clock,vpp_qsv=transpose=clock,scale_qsv=w={w}:h={h}"),
+                _ => format!("scale_qsv=w={w}:h={h}"),
+            };
+        }
+        let mut sc = "1".to_string();
+        if params.max_h > 0 {
+            sc = format!("min({},{}/min(iw,ih))", sc, params.max_h);
+        }
+        if params.max_w > 0 {
+            sc = format!("min({},{}/max(iw,ih))", sc, params.max_w);
+        }
         let wsc = format!("floor(iw*{sc}/2)*2");
         let hsc = format!("floor(ih*{sc}/2)*2");
         match params.rot_angle.degrees() {
@@ -917,7 +917,7 @@ mod tests {
             rot_angle: RotAngle::ZERO,
             keep_cover: true,
             collision_policy: "auto_inc".into(),
-            upscale_1080: false,
+            force_scale: None,
         };
         let a = p.output_path().unwrap();
         assert_eq!(a.file_name().unwrap(), "t.mp4");
@@ -958,14 +958,14 @@ mod tests {
             rot_angle: RotAngle::ZERO,
             keep_cover: true,
             collision_policy: "auto_inc".into(),
-            upscale_1080: false,
+            force_scale: None,
         }
     }
 
     #[test]
     fn vf_rotate_and_scale() {
-        assert_eq!(build_vf(RotAngle::ZERO, 0, 0, false), None);
-        let vf = build_vf(RotAngle::from_degrees(90), 1920, 1080, false).unwrap();
+        assert_eq!(build_vf(RotAngle::ZERO, 0, 0, None), None);
+        let vf = build_vf(RotAngle::from_degrees(90), 1920, 1080, None).unwrap();
         assert!(vf.starts_with("transpose=1,"), "{}", vf);
         // 短边/长边上限必须用旋转不变量 min(iw,ih)/max(iw,ih)：
         // transpose 后 iw/ih 互换，写 min(ih,max_h) 会把原长边当短边砍
@@ -977,14 +977,14 @@ mod tests {
         assert_eq!(vf, format!("transpose=1,{}", expected), "{}", vf);
         // 旋转与不旋转时 scale 表达式完全一致（旋转不变性）
         assert_eq!(
-            build_vf(RotAngle::ZERO, 1920, 1080, false).unwrap(),
+            build_vf(RotAngle::ZERO, 1920, 1080, None).unwrap(),
             expected,
             "转 0° 与转 90° 的缩放上限表达式必须相同"
         );
-        let vf = build_vf(RotAngle::from_degrees(270), 0, 0, false).unwrap();
+        let vf = build_vf(RotAngle::from_degrees(270), 0, 0, None).unwrap();
         assert_eq!(vf, "transpose=2");
         // 只设一个上限时其余因子不出现（max_w=0 不参与 min()，避免除零）
-        let vf = build_vf(RotAngle::ZERO, 0, 1080, false).unwrap();
+        let vf = build_vf(RotAngle::ZERO, 0, 1080, None).unwrap();
         assert_eq!(
             vf,
             "scale='trunc(iw*min(1,1080/min(iw,ih))/2)*2':'trunc(ih*min(1,1080/min(iw,ih))/2)*2'"

@@ -1806,7 +1806,7 @@ pub fn start_transcode(app: AppHandle, ids: Vec<String>) -> CmdResult<()> {
 /// 已达 1080P 及以上不缩放。其余转码参数同 设置-转码/通用。
 #[tauri::command(async)]
 pub fn start_upscale(app: AppHandle, ids: Vec<String>) -> CmdResult<()> {
-    // 先登记 upscale_ids，run_transcode_task 执行时读取并设置 params.upscale_1080
+    // 先登记 upscale_ids，run_transcode_task 执行时读取并计算 params.force_scale
     {
         let state = app.state::<AppState>();
         let mut set = state.upscale_ids.lock();
@@ -2022,8 +2022,41 @@ fn run_transcode_task(app: AppHandle, id: String) {
             ),
         );
     }
-    // 放大到 1080P：从 upscale_ids 读取，读完即移除（即使后续失败也不留残留）
-    let upscale_1080 = state.upscale_ids.lock().remove(&id);
+    // 放大到 1080P：从 upscale_ids 读取标记，读完即移除。
+    // 在 Rust 侧用 ffprobe 已探测的分辨率计算固定目标宽高（偶数对齐），
+    // 不用 ffmpeg 表达式——表达式里 if()/min() 的逗号会被 filtergraph 解析器
+    // 误判为滤波器分隔符（scale_qsv 选项值的单引号不转义逗号），导致 EXIT=127。
+    let upscale = state.upscale_ids.lock().remove(&id);
+    let rot_deg = item.rot_angle.degrees();
+    let force_scale = if upscale {
+        match (meta.width, meta.height) {
+            (Some(w), Some(h)) if w > 0 && h > 0 => {
+                let long = w.max(h) as f32;
+                let short = w.min(h) as f32;
+                let s = (1920.0 / long).min(1080.0 / short);
+                if s > 1.0 {
+                    // 不旋转时的目标宽高（偶数对齐）
+                    let tw = ((w as f32 * s) / 2.0).floor() as u32 * 2;
+                    let th = ((h as f32 * s) / 2.0).floor() as u32 * 2;
+                    // 旋转 90/270° 时输出宽高互换（vpp_qsv/transpose 后方向相反）；
+                    // 0/180° 不互换。force_scale 存的是"旋转后的输出尺寸"。
+                    let (tw, th) = if rot_deg == 90 || rot_deg == 270 { (th, tw) } else { (tw, th) };
+                    if tw > 0 && th > 0 {
+                        log_item(&app, &id, format!("放大到 1080P：源 {w}×{h}{} → 输出 {tw}×{th}（缩放比 {:.2}x）",
+                            if rot_deg != 0 { format!("（旋转{rot_deg}°）") } else { String::new() }, s));
+                        Some((tw, th))
+                    } else { None }
+                } else {
+                    log_item(&app, &id, format!("放大到 1080P：源 {w}×{h} 已达 1080P 以上，跳过放大"));
+                    None
+                }
+            }
+            _ => {
+                log_item(&app, &id, "放大到 1080P：源分辨率未知，跳过放大");
+                None
+            }
+        }
+    } else { None };
     let params = TranscodeParams {
         input: path.clone(),
         out_dir,
@@ -2039,7 +2072,7 @@ fn run_transcode_task(app: AppHandle, id: String) {
         rot_angle: item.rot_angle,
         keep_cover: cfg.transcode.keep_cover,
         collision_policy: cfg.general.collision_policy.clone(),
-        upscale_1080,
+        force_scale,
     };
     let app2 = app.clone();
     let id2 = id.clone();
