@@ -156,10 +156,16 @@ impl NetworkConfig {
             return None;
         }
         let host = host_from_url(url)?;
+        // 短链接域名映射到主站：youtu.be → youtube.com（用户只需给主站勾代理，
+        // 短链接自动继承主站的代理设置）。
+        let canonical = match host.as_str() {
+            "youtu.be" => "youtube.com".to_string(),
+            _ => host.clone(),
+        };
         let best = self
             .site_proxy
             .iter()
-            .filter(|(site, _)| site_matches(site, &host))
+            .filter(|(site, _)| site_matches(site, &host) || site_matches(site, &canonical))
             .max_by_key(|(site, _)| site.trim().trim_start_matches('.').len());
         match best {
             Some((_, true)) => Some(self.proxy_url.clone()),
@@ -370,6 +376,28 @@ mod tests {
         );
         assert_eq!(n.resolve_proxy("https://vimeo.com/1"), None); // 未配置站点一律直连
         assert_eq!(n.resolve_proxy("https://api.bilibili.com/x"), None); // 子域命中 false
+    }
+
+    #[test]
+    fn resolve_proxy_short_link_maps_to_main_site() {
+        // youtu.be 短链接自动继承 youtube.com 的代理设置，用户无需单独勾选
+        let mut n = NetworkConfig {
+            proxy_url: "socks5://127.0.0.1:10808".into(),
+            ..Default::default()
+        };
+        n.site_proxy.insert("youtube.com".into(), true);
+        assert_eq!(
+            n.resolve_proxy("https://youtu.be/abc123"),
+            Some("socks5://127.0.0.1:10808".to_string()),
+            "youtu.be 应映射到 youtube.com 走代理"
+        );
+        // youtube.com 设为直连时，youtu.be 也应直连
+        n.site_proxy.insert("youtube.com".into(), false);
+        assert_eq!(
+            n.resolve_proxy("https://youtu.be/abc123"),
+            None,
+            "youtube.com 直连时 youtu.be 也应直连"
+        );
     }
 
     #[test]
