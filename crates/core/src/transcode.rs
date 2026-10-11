@@ -820,13 +820,7 @@ fn run_transcode_once(
     // 管道读取统一走 exec::stream_lines（独立线程排空 stderr + read_until + decode_text）：
     // ffmpeg 转码中往 stderr 输出 warning/info 时若不排空会写满 64KB 缓冲区，
     // 子进程阻塞在写 stderr 上、stdout 的进度行也不再产出。
-    let mut debug_lines = 0u8;
     let outcome = crate::exec::stream_lines(&mut guard, cancel, None, |line| {
-        // 前 5 行原始 progress 输出入日志，便于排查"进度为什么不动"
-        if debug_lines < 5 && !line.trim().is_empty() {
-            on_log(format!("[progress] {}", line.trim()));
-            debug_lines += 1;
-        }
         if line.trim() == "progress=end" {
             on_progress(100.0);
             return;
