@@ -499,6 +499,7 @@ fn fetch_thumb_ytdlp(
     resolver: &ToolResolver,
     video_url: &str,
     dest: &Path,
+    on_log: &mut dyn FnMut(String),
 ) -> Result<(), String> {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -507,18 +508,21 @@ fn fetch_thumb_ytdlp(
     let tmp_dir = std::env::temp_dir().join(format!("ytdlp-thumb-{ts}"));
     std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("创建临时目录失败：{e}"))?;
     let out_tmpl = tmp_dir.join("%(id)s.%(ext)s");
+    let out_tmpl_str = out_tmpl.to_string_lossy().into_owned();
+    let args: Vec<String> = vec![
+        "--write-thumbnail".into(),
+        "--skip-download".into(),
+        "--no-warnings".into(),
+        "--no-playlist".into(),
+        "--socket-timeout".into(),
+        "30".into(),
+        "-o".into(),
+        out_tmpl_str,
+        video_url.to_string(),
+    ];
+    on_log(ytdlp_core::exec::display_command("yt-dlp", &args));
     let mut cmd = resolver.command(ytdlp_core::exec::Tool::YtDlp).map_err(|e| e.to_string())?;
-    cmd.args([
-        "--write-thumbnail",
-        "--skip-download",
-        "--no-warnings",
-        "--no-playlist",
-        "--socket-timeout",
-        "30",
-        "-o",
-        out_tmpl.to_str().unwrap_or("thumb.%(ext)s"),
-        video_url,
-    ]);
+    cmd.args(&args);
     ytdlp_core::exec::hide_console(&mut cmd);
     let output = cmd.output().map_err(|e| format!("启动 yt-dlp 失败：{e}"))?;
     if !output.status.success() {
@@ -802,12 +806,12 @@ fn run_probe(app: AppHandle, id: String) {
                         } else {
                             // 先 curl 直连（快）；失败后用 yt-dlp 兜底（自动走系统代理，
                             // curl 不走 WinINET，TUN/系统代理用户直连 i.ytimg.com 必败）
-                            match ytdlp_core::thumbs::save_remote_thumb(&u, &dest, Some(proxy2.as_str())) {
+                            match ytdlp_core::thumbs::save_remote_thumb(&u, &dest, Some(proxy2.as_str()), &mut |l| log_item(&app2, &id2, l)) {
                                 Ok(()) => Ok(()),
                                 Err(e) => {
                                     log_item(&app2, &id2, format!("缩略图直连下载失败（{}），尝试 yt-dlp 兜底…", e));
                                     if let Some(vurl) = &video_url {
-                                        fetch_thumb_ytdlp(&resolver2, vurl, &dest)
+                                        fetch_thumb_ytdlp(&resolver2, vurl, &dest, &mut |l| log_item(&app2, &id2, l))
                                     } else {
                                         Err(e)
                                     }

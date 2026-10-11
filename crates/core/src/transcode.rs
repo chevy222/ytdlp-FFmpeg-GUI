@@ -224,6 +224,11 @@ pub fn qsv_available(resolver: &ToolResolver) -> Result<bool> {
 /// 探测可用硬件编码器（QSV/NVENC/AMF，TC-14）。
 /// 带截止时间：设置页"编码器探测"卡死会连带把探测命令所在线程一起占住。
 pub fn detect_hw_encoders(resolver: &ToolResolver) -> Result<HwEncoders> {
+    // 如实记录实际执行的命令（工具/设置页均无条目日志上下文，写进程日志）
+    crate::log::info(format!(
+        "[命令] {}",
+        crate::exec::display_command("ffmpeg", &["-encoders".to_string()])
+    ));
     let mut cmd = resolver.command(Tool::Ffmpeg)?;
     cmd.arg("-encoders");
     let out = crate::exec::run_capture_deadline(cmd, std::time::Duration::from_secs(30))?;

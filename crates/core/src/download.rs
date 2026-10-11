@@ -820,7 +820,7 @@ pub fn post_process(
     }
     // 产物校验（§1.3：校验成功后才原子替换）——视频产物检查主视频流，
     // 纯音频产物（C4）检查主音频流，否则纯音频归一化产物会被误判失败、删掉。
-    if !verify_media(resolver, &out, audio_only) {
+    if !verify_media(resolver, &out, audio_only, &mut on_log) {
         on_log("后处理产物校验失败（保留原文件）".to_string());
         let _ = std::fs::remove_file(&out);
         return Ok((input.to_path_buf(), meta.clone()));
@@ -845,7 +845,12 @@ pub fn post_process(
 }
 
 /// 产物校验：ffprobe 能解析且存在主流（视频产物查 v:0，纯音频产物查 a:0）。
-fn verify_media(resolver: &ToolResolver, path: &Path, audio_only: bool) -> bool {
+fn verify_media(
+    resolver: &ToolResolver,
+    path: &Path,
+    audio_only: bool,
+    on_log: &mut dyn FnMut(String),
+) -> bool {
     let p = path.to_string_lossy().into_owned();
     let stream = if audio_only { "a:0" } else { "v:0" };
     let args: Vec<&str> = vec![
@@ -859,6 +864,9 @@ fn verify_media(resolver: &ToolResolver, path: &Path, audio_only: bool) -> bool 
         "csv=p=0",
         p.as_str(),
     ];
+    // 如实记录校验命令（产物校验属于业务链路，进条目日志）
+    let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    on_log(crate::exec::display_command("ffprobe", &owned));
     match crate::exec::run_tool_capture(resolver, Tool::Ffprobe, &args) {
         Ok(out) => !decode_text(&out.stdout).trim().is_empty(),
         Err(_) => false,

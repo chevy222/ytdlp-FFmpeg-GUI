@@ -306,11 +306,21 @@ impl ToolDownloader {
         self
     }
 
-    /// 给 curl 命令附加代理（未配置则不加）。
-    fn apply_proxy(&self, cmd: &mut std::process::Command) {
+    /// 构造 curl 命令：统一附加代理，并**如实记录**完整命令行（含代理地址）。
+    /// 工具维护无条目日志上下文，写入进程日志 `logs/app-*.log`。
+    fn curl(&self, args: &[&str]) -> std::process::Command {
+        let mut v: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         if let Some(p) = &self.proxy {
-            cmd.args(["--proxy", p]);
+            v.push("--proxy".into());
+            v.push(p.clone());
         }
+        crate::log::info(format!(
+            "[命令] {}",
+            crate::exec::display_command("curl", &v)
+        ));
+        let mut cmd = std::process::Command::new("curl");
+        cmd.args(&v);
+        cmd
     }
 
     /// 设置取消标志。
@@ -337,10 +347,7 @@ impl ToolDownloader {
     pub fn latest_version(&self, kind: ToolKind) -> Option<String> {
         match kind.version_feed()? {
             VersionFeed::Text(url) => {
-                let mut cmd = std::process::Command::new("curl");
-                // --max-time：版本查询跑在"下载/更新"的前置判断里，卡住就等于整个按钮无响应
-                cmd.args(["-sS", "--fail", "--max-time", "20", url]);
-                self.apply_proxy(&mut cmd);
+                let mut cmd = self.curl(&["-sS", "--fail", "--max-time", "20", url]);
                 crate::exec::hide_console(&mut cmd);
                 let out = cmd.output().ok()?;
                 if !out.status.success() {
@@ -361,12 +368,18 @@ impl ToolDownloader {
                     kind.exe_name(),
                     std::process::id()
                 ));
-                let mut cmd = std::process::Command::new("curl");
-                cmd.args(["-sIL", "--fail", "--max-time", "20", "-o"])
-                    .arg(&head)
-                    .args(["-w", "%{url_effective}"])
-                    .arg(url);
-                self.apply_proxy(&mut cmd);
+                let head_str = head.to_string_lossy().into_owned();
+                let mut cmd = self.curl(&[
+                    "-sIL",
+                    "--fail",
+                    "--max-time",
+                    "20",
+                    "-o",
+                    head_str.as_str(),
+                    "-w",
+                    "%{url_effective}",
+                    url,
+                ]);
                 crate::exec::hide_console(&mut cmd);
                 let out = cmd.output().ok();
                 let _ = std::fs::remove_file(&head);
@@ -382,9 +395,7 @@ impl ToolDownloader {
     /// 远端产物 SHA-256（`.sha256` 旁路文件；404/网络失败返回 None）。
     pub fn remote_sha(&self, kind: ToolKind) -> Option<String> {
         let url = kind.sha_url()?;
-        let mut cmd = std::process::Command::new("curl");
-        cmd.args(["-L", "--fail", "-sS", "--max-time", "20", url]);
-        self.apply_proxy(&mut cmd);
+        let mut cmd = self.curl(&["-L", "--fail", "-sS", "--max-time", "20", url]);
         crate::exec::hide_console(&mut cmd);
         let output = cmd.output().ok()?;
         if !output.status.success() {
@@ -490,8 +501,7 @@ impl ToolDownloader {
         // 超时/重试必须显式给：curl 默认不设总时长上限，对端半死时这条命令会一直挂着，
         // 用户只能点"取消"（而且工具下载的取消是轮询实现，依赖这里的 try_wait 循环）。
         let out_str = raw.to_string_lossy().into_owned();
-        let mut cmd = std::process::Command::new("curl");
-        cmd.args([
+        let mut cmd = self.curl(&[
             "-L",
             "--fail",
             "-sS",
@@ -504,7 +514,7 @@ impl ToolDownloader {
             "--max-time",
             "3600",
             "-o",
-            &out_str,
+            out_str.as_str(),
             url,
         ]);
         // stderr 必须 pipe：否则 wait_with_output 拿不到 curl 的报错，
@@ -512,7 +522,6 @@ impl ToolDownloader {
         // -sS 已静默进度，出错才输出，短文本不会撑爆管道缓冲。
         cmd.stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped());
-        self.apply_proxy(&mut cmd);
         crate::exec::hide_console(&mut cmd);
         let mut child = cmd.spawn().map_err(|e| format!("无法调用 curl：{e}"))?;
         // curl -sS 自身不输出进度，这里按已写入的字节数估算百分比上报，
@@ -579,9 +588,7 @@ impl ToolDownloader {
     /// 查询远端文件总大小（HEAD 跟随重定向）。
     /// 取不到（CDN 不给 content-length / 网络异常）返回 None，调用方退化为阶段提示。
     fn remote_size(&self, url: &str) -> Option<u64> {
-        let mut cmd = std::process::Command::new("curl");
-        cmd.args(["-sIL", "--fail", "--max-time", "20", url]);
-        self.apply_proxy(&mut cmd);
+        let mut cmd = self.curl(&["-sIL", "--fail", "--max-time", "20", url]);
         crate::exec::hide_console(&mut cmd);
         let out = cmd.output().ok()?;
         if !out.status.success() {

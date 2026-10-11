@@ -32,41 +32,55 @@ pub fn collect_written_thumbnail(output_path: &Path) -> Option<PathBuf> {
 /// 先直连尝试；失败且调用方给了代理时带 `--proxy` 重试一次——
 /// 需要代理的站点（YouTube 等）缩略图服务器直连拉不动，而 yt-dlp 主下载
 /// 走的是设置里的代理，缩略图不能因此缺席。
-pub fn save_remote_thumb(url: &str, dest: &Path, proxy: Option<&str>) -> Result<(), String> {
+/// `on_log`：如实回传实际执行的 curl 命令行（含代理）。
+pub fn save_remote_thumb(
+    url: &str,
+    dest: &Path,
+    proxy: Option<&str>,
+    on_log: &mut dyn FnMut(String),
+) -> Result<(), String> {
     ensure_parent(dest).map_err(|e| e.to_string())?;
-    match fetch_to(url, dest, None) {
+    match fetch_to(url, dest, None, on_log) {
         Ok(()) => Ok(()),
         Err(e) => match proxy {
-            Some(p) if !p.is_empty() => fetch_to(url, dest, Some(p)),
+            Some(p) if !p.is_empty() => fetch_to(url, dest, Some(p), on_log),
             _ => Err(e),
         },
     }
 }
 
-fn fetch_to(url: &str, dest: &Path, proxy: Option<&str>) -> Result<(), String> {
+fn fetch_to(
+    url: &str,
+    dest: &Path,
+    proxy: Option<&str>,
+    on_log: &mut dyn FnMut(String),
+) -> Result<(), String> {
     // 临时名带 UUID：同一 dest 被并发请求时不会互踩（固定名会让其中一个 rename 失败）
     let tmp = dest.with_file_name(format!(".thumb-{}.tmp", uuid::Uuid::new_v4()));
     let tmp_str = tmp.to_string_lossy().into_owned();
-    let mut cmd = std::process::Command::new("curl");
     // URL 来自三方元数据（yt-dlp 返回的 thumbnail），必须有上限：
     // --max-time 防止假死连接占住线程，--max-filesize 防止写爆 cache 目录
-    cmd.args([
-        "-L",
-        "--fail",
-        "-sS",
-        "--connect-timeout",
-        "10",
-        "--max-time",
-        "30",
-        "--max-filesize",
-        "20971520",
-        "-o",
-        &tmp_str,
-        url,
-    ]);
+    let mut args: Vec<String> = vec![
+        "-L".into(),
+        "--fail".into(),
+        "-sS".into(),
+        "--connect-timeout".into(),
+        "10".into(),
+        "--max-time".into(),
+        "30".into(),
+        "--max-filesize".into(),
+        "20971520".into(),
+        "-o".into(),
+        tmp_str.clone(),
+        url.to_string(),
+    ];
     if let Some(p) = proxy {
-        cmd.args(["--proxy", p]);
+        args.push("--proxy".into());
+        args.push(p.to_string());
     }
+    on_log(crate::exec::display_command("curl", &args));
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args(&args);
     // GUI 程序启动控制台子进程会弹出一个黑窗（一闪而过）；这里与其它调用点
     // 保持一致，显式隐藏控制台。
     crate::exec::hide_console(&mut cmd);
