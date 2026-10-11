@@ -282,7 +282,10 @@ pub enum TranscodeTier {
     GpuQsv,
     /// MODE 2 混合：QSV 解码 → hwdownload → CPU 滤镜 → hevc_qsv
     HybridQsv,
-    /// MODE 3 全软件：CPU 解码 → CPU 滤镜 → libx265（总是可用）
+    /// MODE 3 软件解码 + GPU 编码：CPU 解码 → CPU 滤镜 → format=nv12 → hevc_qsv
+    /// （对付 mpeg4/avi 等 QSV 硬解不支持的格式，编码仍走 GPU）
+    SoftwareQsv,
+    /// MODE 4 全软件：CPU 解码 → CPU 滤镜 → libx265（总是可用）
     Software,
 }
 
@@ -291,6 +294,7 @@ impl TranscodeTier {
         match self {
             Self::GpuQsv => "全 GPU（QSV 解码 → vpp_qsv/scale_qsv → hevc_qsv）",
             Self::HybridQsv => "混合（QSV 解码 → hwdownload → CPU 滤镜 → hevc_qsv）",
+            Self::SoftwareQsv => "软解硬编（CPU 解码 → CPU 滤镜 → hevc_qsv）",
             Self::Software => "全软件（CPU 解码 → CPU 滤镜 → libx265）",
         }
     }
@@ -316,31 +320,34 @@ pub fn build_args_for_tier(
     tier: TranscodeTier,
 ) -> Result<Vec<String>> {
     let rotated = params.rot_angle.degrees() != 0;
-    let hw = !matches!(tier, TranscodeTier::Software);
+    // 是否用 QSV 硬解（只有 GpuQsv/HybridQsv 用）
+    let qsv_decode = matches!(tier, TranscodeTier::GpuQsv | TranscodeTier::HybridQsv);
+    // 是否用 hevc_qsv 编码（GpuQsv/HybridQsv/SoftwareQsv 都用）
+    let qsv_encode = matches!(
+        tier,
+        TranscodeTier::GpuQsv | TranscodeTier::HybridQsv | TranscodeTier::SoftwareQsv
+    );
 
     // —— 编码器与编码参数 ——
     // QSV 层固定 hevc_qsv（ABR 码率三件套在下方按源码率装配）；
     // 软件层按显式模式选择（auto 在软件层就是 libx265——QSV 已由上层尝试过）。
-    let (encoder, mut enc_args) = match tier {
-        TranscodeTier::Software => {
-            let mode = match params.encoder_mode.as_str() {
-                "nvenc" | "amf" => params.encoder_mode.as_str(),
-                _ => "libx265",
-            };
-            pick_encoder(resolver, mode)?
-        }
-        _ => {
-            // low_power 始终启用（原设置项已移除，默认开启）
-            let a: Vec<String> = vec![
-                "-preset".into(),
-                "veryfast".into(),
-                "-extbrc".into(),
-                "1".into(),
-                "-low_power".into(),
-                "1".into(),
-            ];
-            ("hevc_qsv".into(), a)
-        }
+    let (encoder, mut enc_args) = if qsv_encode {
+        // low_power 始终启用（原设置项已移除，默认开启）
+        let a: Vec<String> = vec![
+            "-preset".into(),
+            "veryfast".into(),
+            "-extbrc".into(),
+            "1".into(),
+            "-low_power".into(),
+            "1".into(),
+        ];
+        ("hevc_qsv".into(), a)
+    } else {
+        let mode = match params.encoder_mode.as_str() {
+            "nvenc" | "amf" => params.encoder_mode.as_str(),
+            _ => "libx265",
+        };
+        pick_encoder(resolver, mode)?
     };
     if params.container == "mp4" && encoder == "libx265" {
         // hvc1 标签（Apple 兼容）。必须带 `:v:0`：不带流后缀的 `-tag:v`
@@ -427,7 +434,7 @@ pub fn build_args_for_tier(
         "-display_rotation".into(),
         "0".into(),
     ];
-    if hw {
+    if qsv_decode {
         args.push("-hwaccel".into());
         args.push("qsv".into());
         if tier == TranscodeTier::GpuQsv {
@@ -437,9 +444,10 @@ pub fn build_args_for_tier(
     }
     args.push("-i".into());
     args.push(params.input.to_string_lossy().into_owned());
-    // 旋转 + 保留封面（hw 层）：QSV 帧无法进 CPU 滤镜，封面改由第二个软件解码
-    // 输入取出并旋转（与 bat 的 DIN 第二输入同思路）
-    let cover_reencode = rotated && cover_idx.is_some();
+    // 旋转 + 保留封面（QSV 硬解层）：QSV 帧无法进 CPU 滤镜，封面改由第二个软件解码
+    // 输入取出并旋转（与 bat 的 DIN 第二输入同思路）。
+    // SoftwareQsv 是 CPU 解码，主视频帧可以直接进 CPU 滤镜，和 Software 一样走 filter_complex。
+    let cover_reencode = rotated && cover_idx.is_some() && qsv_decode;
     if cover_reencode {
         args.push("-i".into());
         args.push(params.input.to_string_lossy().into_owned());
@@ -452,10 +460,21 @@ pub fn build_args_for_tier(
             .cloned()
             .unwrap_or_else(|| "transpose=1".into())
     };
+    // SoftwareQsv 用 CPU 解码但 hevc_qsv 编码，滤镜输出需要 NV12 格式喂给 QSV 编码器。
+    // 在 cpu_vf 前自动加 format=nv12（无 cpu_vf 时也加，保证 QSV 编码器能吃）。
+    let cpu_vf_qsv: Option<String> = if qsv_encode && !qsv_decode {
+        // SoftwareQsv：CPU 解码 → format=nv12 → CPU 滤镜 → hevc_qsv
+        Some(match &cpu_vf {
+            Some(vf) => format!("format=nv12,{vf}"),
+            None => "format=nv12".to_string(),
+        })
+    } else {
+        cpu_vf.clone()
+    };
     match tier {
-        TranscodeTier::Software => {
-            // 软件层维持既有结构：旋转封面与主视频共用 filter_complex
-            match (&cpu_vf, cover_idx) {
+        TranscodeTier::Software | TranscodeTier::SoftwareQsv => {
+            // 软件解码层：旋转封面与主视频共用 filter_complex
+            match (&cpu_vf_qsv, cover_idx) {
                 (Some(filter), Some(ci)) => {
                     let src = main_idx
                         .map(|i| format!("0:{i}"))
@@ -482,7 +501,7 @@ pub fn build_args_for_tier(
                     }
                 }
                 _ => {
-                    if let Some(filter) = &cpu_vf {
+                    if let Some(filter) = &cpu_vf_qsv {
                         args.push("-vf".into());
                         args.push(filter.clone());
                     }
@@ -554,8 +573,8 @@ pub fn build_args_for_tier(
     args.push("-c:v:0".into());
     args.push(encoder);
     args.extend(enc_args);
-    if hw {
-        // QSV 层码率三件套：源码率（缺省用兜底码率 3500，原设置项已移除），
+    if qsv_encode {
+        // QSV 编码层码率三件套：源码率（缺省用兜底码率 3500，原设置项已移除），
         // 封顶截断；maxrate = 1.2×、bufsize = 2×（bat 同款）
         let src = meta
             .vbitrate_kbps
@@ -712,14 +731,16 @@ pub fn run_transcode(
 ) -> Result<PathBuf> {
     let explicit = matches!(params.encoder_mode.as_str(), "libx265" | "nvenc" | "amf");
     let auto_qsv = !explicit && qsv_available(resolver).unwrap_or(false);
-    // 层级序列：auto 模式且 QSV 可用时三级回落，否则纯软件。
-    // 参考 convert_h265.bat：full GPU QSV → hybrid → software libx265。
+    // 层级序列：auto 模式且 QSV 可用时四级回落，否则纯软件。
+    // 参考 convert_h265.bat：full GPU QSV → hybrid → 软解硬编 → software libx265。
+    // SoftwareQsv 对付 QSV 硬解不支持的格式（mpeg4/avi 等），CPU 解码但仍 GPU 编码。
     let all_tiers: &[TranscodeTier] = if explicit || !auto_qsv {
         &[TranscodeTier::Software]
     } else {
         &[
             TranscodeTier::GpuQsv,
             TranscodeTier::HybridQsv,
+            TranscodeTier::SoftwareQsv,
             TranscodeTier::Software,
         ]
     };
