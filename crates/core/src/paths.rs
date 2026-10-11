@@ -152,12 +152,39 @@ pub fn atomic_write_json_with<T: serde::Serialize>(
     // 直接 rename 覆盖目标：std::fs::rename 在 Windows 上走 MoveFileExW
     // （MOVEFILE_REPLACE_EXISTING），在类 Unix 上是原子替换。
     // 不要"先 remove 再 rename"——那会在两步之间制造文件缺失窗口，崩溃即丢整份配置。
-    if let Err(e) = std::fs::rename(&tmp, path) {
+    if let Err(e) = rename_with_retry(&tmp, path) {
         // rename 失败（如目标被其他程序占用）时清理 tmp，避免累积 *.tmp 垃圾
         let _ = std::fs::remove_file(&tmp);
         return Err(e.into());
     }
     Ok(())
+}
+
+/// 带指数退避的 rename。
+///
+/// Windows 下目标文件可能被杀软/编辑器/其它读进程短暂持有句柄，
+/// `MoveFileExW(REPLACE_EXISTING)` 此刻会返回 `ERROR_ACCESS_DENIED(5)` /
+/// `ERROR_SHARING_VIOLATION(32)` / `ERROR_LOCK_VIOLATION(33)`。这类失败是**瞬时**的，
+/// 直接放弃会表现为"历史/配置偶发写不进去且不报错"。这里对可重试错误退避重试。
+fn rename_with_retry(tmp: &Path, dst: &Path) -> std::io::Result<()> {
+    let mut delay = std::time::Duration::from_millis(20);
+    for attempt in 0..5 {
+        match std::fs::rename(tmp, dst) {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt < 4 && is_retryable_rename_error(&e) => {
+                std::thread::sleep(delay);
+                delay *= 2;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other("rename 重试循环异常结束"))
+}
+
+/// 是否属于"目标被短暂占用"的可重试错误（Windows: 5/32/33）。
+fn is_retryable_rename_error(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::PermissionDenied
+        || matches!(e.raw_os_error(), Some(5 | 32 | 33))
 }
 
 /// 容器名 → 输出扩展名（mkv → mkv，其余 → mp4；转码/合并共用，C2）。

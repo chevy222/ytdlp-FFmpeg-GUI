@@ -66,9 +66,24 @@ impl Status {
 }
 
 /// 旋转角度（0°/90°/180°/270°，封面旋转箭头指定，随条目保存，转码生效）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// 序列化为裸 `u16`（`transparent`），但**反序列化必须过 [`Self::from_degrees`] 归一**：
+/// 手改/旧版本写入的 `45` 等非法值若被直接带进 ffmpeg filtergraph 会产出错误画面，
+/// 且 `rotate_cw` 的加法会溢出 `u16`。因此这里手写 `Deserialize` 而非 derive。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct RotAngle(u16);
+
+impl<'de> Deserialize<'de> for RotAngle {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // 线格式仍是透明 u16，落库前统一归一（不变量收在类型边界上）
+        let raw = u16::deserialize(deserializer)?;
+        Ok(Self::from_degrees(raw))
+    }
+}
 
 impl RotAngle {
     pub const ZERO: Self = Self(0);
@@ -81,14 +96,14 @@ impl RotAngle {
         self.0
     }
 
-    /// 顺时针旋转 90°。
+    /// 顺时针旋转 90°（saturating：非法反序列化值也不得在此溢出）。
     pub fn rotate_cw(self) -> Self {
-        Self::from_degrees(self.0 + 90)
+        Self::from_degrees(self.0.saturating_add(90))
     }
 
-    /// 逆时针旋转 90°。
+    /// 逆时针旋转 90°（saturating 同 `rotate_cw`）。
     pub fn rotate_ccw(self) -> Self {
-        Self::from_degrees(self.0 + 270)
+        Self::from_degrees(self.0.saturating_add(270))
     }
 }
 
@@ -113,13 +128,18 @@ pub enum ItemKind {
 
 /// 音频音量探测结果（volumedetect，供转码增益决策，§MD-02/MD-06/TC-07）。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AudioVolume {
     pub mean_volume_db: Option<f32>,
     pub max_volume_db: Option<f32>,
 }
 
 /// 解析元数据（ffprobe / yt-dlp -j 结果，画质/格式列 11 项字段，§6.2）。
+///
+/// 容器级 `#[serde(default)]`：旧版/未来版的 history.json 条目缺失任意字段时
+/// 按 `Default` 补齐，而不是整条反序列化失败被 `recover_partial_history` 静默跳过。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MediaMeta {
     pub title: Option<String>,
     pub duration_secs: Option<f64>,
@@ -148,34 +168,28 @@ pub struct MediaMeta {
     /// 是否含封面
     pub has_cover: bool,
     /// 视频流 extradata（SPS/PPS 等，hex）——合并直拼硬性条件（MG-02）
-    #[serde(default)]
     pub extradata: Option<String>,
     /// 首音频流采样率 Hz
-    #[serde(default)]
     pub sample_rate: Option<u32>,
     /// 主视频流绝对索引（ffprobe `index`）。
     /// 封面流（attached_pic）可能排在主视频之前，映射必须用绝对索引，
     /// 否则 `0:v:0` 会选到封面（§TC-08 / MD-02）。
-    #[serde(default)]
     pub video_stream_index: Option<u32>,
     /// 封面流（attached_pic）绝对索引；`-map` / `-filter_complex` 按此映射。
     /// 注意：ffmpeg 的 `0:t?` 在 MP4 上**选不中** attached_pic（实测），必须用绝对索引。
-    #[serde(default)]
     pub cover_stream_index: Option<u32>,
     /// 容器内旋转标记（stream tags `rotate`，MD-02 采集）。
     /// 仅记录源文件标记；实际转码采用条目 `rot_angle`（TC-04 手动旋转）。
-    #[serde(default)]
     pub rotate_tag: Option<i32>,
     /// 源编码宽度（竖屏源与 rotate_tag 配合判定"短边"分辨率，MD-02/§8）。
-    #[serde(default)]
     pub width: Option<u32>,
     /// 结构化下载格式列表（DL-02 格式选择；含 format_id 供下载使用）
-    #[serde(default)]
     pub download_formats: Vec<DownloadFormat>,
 }
 
 /// 下载格式（DL-02：清晰度/编码/大小/帧率/码率，格式弹窗展示项）。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DownloadFormat {
     pub format_id: String,
     /// 可读标签（如 `1080P · MP4 · H.264 · 5.2MB · 30fps`）
@@ -190,7 +204,6 @@ pub struct DownloadFormat {
     /// 附加说明（如"需登录"、"AV1"）
     pub note: Option<String>,
     /// 是否仅音频格式
-    #[serde(default)]
     pub audio_only: bool,
 }
 
@@ -304,6 +317,8 @@ pub struct MediaItem {
     pub site: Option<String>,
     pub host: Option<String>,
     pub status: Status,
+    /// 进度百分比（旧条目可能缺该字段，缺失按 0 处理而非整条丢弃）
+    #[serde(default)]
     pub percent: f32,
     pub error: Option<String>,
     /// 下载进度附加信息（§7.1 speed/eta/file）
@@ -325,6 +340,8 @@ pub struct MediaItem {
     /// 避免再跑一次 ffmpeg 抽帧；ffmpeg 仅作兜底）
     #[serde(default)]
     pub thumbnail_url: Option<String>,
+    /// 手动旋转角（旧条目可能缺该字段，缺失按 0° 处理而非整条丢弃）
+    #[serde(default)]
     pub rot_angle: RotAngle,
     /// 下载任务专属：选中格式
     #[serde(default)]
@@ -760,5 +777,38 @@ mod tests {
         assert_eq!(it.updated_at.len(), 19); // YYYY-MM-DD HH:MM:SS
         assert_eq!(&it.updated_at[4..5], "-");
         assert_eq!(&it.updated_at[10..11], " ");
+    }
+
+    #[test]
+    fn rot_angle_deserialize_normalizes_invalid() {
+        // 手改/旧版本写入的非法角度必须在入口归一，不能带进 ffmpeg filtergraph
+        assert_eq!(serde_json::from_str::<RotAngle>("45").unwrap().degrees(), 0);
+        assert_eq!(
+            serde_json::from_str::<RotAngle>("450").unwrap().degrees(),
+            90
+        );
+        // 越界值不得 panic（from_degrees 内部先归一）
+        let big = serde_json::from_str::<RotAngle>("65535").unwrap();
+        assert_eq!(big.degrees() % 90, 0);
+        // 归一后的角度做旋转不得溢出
+        assert_eq!(big.rotate_cw().degrees() % 90, 0);
+    }
+
+    #[test]
+    fn meta_missing_non_option_fields_use_defaults() {
+        // 旧版 history 缺 has_cover/audio_volume 等非 Option 字段时不得整条失败
+        let m: MediaMeta = serde_json::from_str(r#"{"height":1080}"#).unwrap();
+        assert_eq!(m.height, Some(1080));
+        assert!(!m.has_cover);
+        assert_eq!(m.audio_volume, AudioVolume::default());
+    }
+
+    #[test]
+    fn item_missing_rot_and_percent_use_defaults() {
+        // 旧条目缺 rot_angle/percent 时应解析为默认，而非整条被 recover 跳过
+        let json = r#"{"id":"x","kind":"LocalFile","title":"t","status":"Ready"}"#;
+        let it: MediaItem = serde_json::from_str(json).unwrap();
+        assert_eq!(it.rot_angle.degrees(), 0);
+        assert_eq!(it.percent, 0.0);
     }
 }

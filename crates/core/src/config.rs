@@ -1,4 +1,5 @@
-//! config.json 用户设置（§7.2 / §3.6）：原子写，损坏回退默认。
+//! config.json 用户设置（§7.2 / §3.6）：原子写；损坏则备份并返回错误，
+//! 由调用方决定是否回退默认值。
 
 use std::path::Path;
 
@@ -209,7 +210,8 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
-    /// 加载；文件缺失返回默认；损坏则备份（`<原名>.corrupt-<ts>.json`）后回退默认（§3.7 规则）。
+    /// 加载；文件缺失返回默认；JSON 损坏则备份（`<原名>.corrupt-<ts>.json`）
+    /// 并返回 [`CoreError::ConfigCorrupt`]（**不回退默认**，由调用方决定），§3.7 规则。
     pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
