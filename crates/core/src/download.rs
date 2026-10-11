@@ -43,9 +43,13 @@ pub struct DownloadParams {
     /// 合并容器、嵌入封面、时间范围裁剪、音轨提取都依赖 ffmpeg，而 yt-dlp
     /// 默认只在 PATH 与自身目录查找；托管模式（`<exe 同级>\tools\`）必须显式传入。
     pub ffmpeg_path: Option<String>,
-    /// yt-dlp `--po-token` 取值（YouTube 风控验证令牌）。
-    /// 启用且非空时传入，用于通过 YouTube 机器人验证、降低 403/风控拦截概率。
+    /// PO Token 的 yt-dlp 取值（YouTube 风控验证令牌），形如
+    /// `web.gvs+<base64url>`（或带 `client.context` 的完整配置值）。
+    /// 通过 `--extractor-args "youtube:po_token=.."` 下发；留空不下发。
     pub po_token: Option<String>,
+    /// 与 `po_token` 绑定的 visitorData（GVS 场景必需，随 po_token 成对下发：
+    /// `--extractor-args "youtube:visitor_data=..;po_token=.."`）。
+    pub visitor_data: Option<String>,
 }
 
 /// 文件名模板 → yt-dlp 输出模板（DL-10）。
@@ -209,13 +213,14 @@ pub fn build_args(url: &str, p: &DownloadParams, cfg: &DownloadConfig) -> Vec<St
             args.push(ff.clone());
         }
     }
-    // PO-Token（YouTube 风控验证令牌）：启用且非空时传入，降低 403/风控拦截概率。
-    // yt-dlp 支持直接传 token 字符串或指向 token 文件的路径。
-    if let Some(pt) = &p.po_token {
-        if !pt.is_empty() {
-            args.push("--po-token".into());
-            args.push(pt.clone());
-        }
+    // PO-Token（YouTube 风控验证令牌）：yt-dlp 没有 `--po-token` 参数，正确形式是
+    // `--extractor-args "youtube:visitor_data=..;po_token=web.gvs+.."`；GVS 场景
+    // poToken 与 visitorData 绑定，二者必须成对下发（见 potoken::extractor_args）。
+    if let Some(extra) =
+        crate::potoken::extractor_args(p.po_token.as_deref(), p.visitor_data.as_deref())
+    {
+        args.push("--extractor-args".into());
+        args.push(extra);
     }
     // 其他
     args.push("--no-warnings".into());
@@ -932,6 +937,7 @@ mod tests {
             js_runtime: None,
             ffmpeg_path: None,
             po_token: None,
+            visitor_data: None,
         }
     }
 
@@ -1014,14 +1020,17 @@ mod tests {
     #[test]
     fn build_args_passes_po_token() {
         let mut p = params();
-        // 未设置时不出现 --po-token
+        // 未设置时不出现 --extractor-args
         assert!(!build_args("u", &p, &DownloadConfig::default())
             .join(" ")
-            .contains("--po-token"));
-        p.po_token = Some("MII...token-string...".into());
+            .contains("--extractor-args"));
+        // PO Token 走 --extractor-args（yt-dlp 无 --po-token 参数），
+        // 且 GVS 场景必须与 visitor_data 成对下发
+        p.po_token = Some("web.gvs+MII-token-string".into());
+        p.visitor_data = Some("VD123".into());
         let joined = build_args("u", &p, &DownloadConfig::default()).join(" ");
         assert!(
-            joined.contains("--po-token MII...token-string..."),
+            joined.contains("--extractor-args youtube:visitor_data=VD123;po_token=web.gvs+MII-token-string"),
             "{}",
             joined
         );

@@ -70,6 +70,7 @@ fn ytdlp_args(
     cookies_file: Option<&Path>,
     network: &NetworkConfig,
     po_token: Option<&str>,
+    visitor_data: Option<&str>,
     extra: &[&str],
 ) -> Vec<String> {
     let mut args: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
@@ -85,11 +86,11 @@ fn ytdlp_args(
         args.push("--proxy".into());
         args.push(p);
     }
-    if let Some(pt) = po_token {
-        if !pt.is_empty() {
-            args.push("--po-token".into());
-            args.push(pt.to_string());
-        }
+    // PO Token：yt-dlp 无 --po-token 参数，走 --extractor-args；GVS 场景
+    // poToken 与 visitorData 绑定，成对下发（见 potoken::extractor_args）。
+    if let Some(extra) = crate::potoken::extractor_args(po_token, visitor_data) {
+        args.push("--extractor-args".into());
+        args.push(extra);
     }
     args.push(url.to_string());
     args
@@ -100,12 +101,15 @@ fn ytdlp_args(
 ///
 /// 与 [`probe_url`] 同一套读取方式：边下边读、可由 `cancel` 终止、300 秒兜底。
 /// 大合集的 JSON 可达数十 MB，持续排空 stdout 才不会把自己卡在管道缓冲区上。
+// 参数较多是解析入口的固有形态（与 probe_url 同款），按项目惯例放行该 lint。
+#[allow(clippy::too_many_arguments)]
 pub fn list_playlist_entries(
     resolver: &ToolResolver,
     url: &str,
     cookies_file: Option<&Path>,
     network: &NetworkConfig,
     po_token: Option<&str>,
+    visitor_data: Option<&str>,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     mut on_log: impl FnMut(String),
 ) -> std::result::Result<Vec<PlaylistEntry>, ProbeFailure> {
@@ -116,6 +120,7 @@ pub fn list_playlist_entries(
         cookies_file,
         network,
         po_token,
+        visitor_data,
         &["-J", "--flat-playlist", "--no-warnings"],
     );
     on_log(crate::exec::display_command("yt-dlp", &args));
@@ -218,6 +223,7 @@ pub fn probe_url(
     cookies_file: Option<&Path>,
     network: &NetworkConfig,
     po_token: Option<&str>,
+    visitor_data: Option<&str>,
     playlist: bool,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     mut on_log: impl FnMut(String),
@@ -228,7 +234,15 @@ pub fn probe_url(
     } else {
         &["-J", "--no-warnings", "--no-playlist", "--socket-timeout", "60"]
     };
-    let args = ytdlp_args(resolver, url, cookies_file, network, po_token, extra);
+    let args = ytdlp_args(
+        resolver,
+        url,
+        cookies_file,
+        network,
+        po_token,
+        visitor_data,
+        extra,
+    );
     on_log(crate::exec::display_command("yt-dlp", &args));
     let mut cmd = resolver.command(Tool::YtDlp).map_err(|e| ProbeFailure {
         kind: ProbeErrorKind::Failed,

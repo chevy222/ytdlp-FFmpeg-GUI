@@ -11,6 +11,7 @@ use ytdlp_core::config::AppConfig;
 use ytdlp_core::exec::ToolResolver;
 use ytdlp_core::history::History;
 use ytdlp_core::paths::Paths;
+use ytdlp_core::potoken::CachedPot;
 use ytdlp_core::worker::TaskQueue;
 
 fn epoch_ms() -> u64 {
@@ -55,6 +56,10 @@ pub struct AppState {
     pub upscale_ids: Mutex<HashSet<String>>,
     /// CLI 本次调用级覆盖（--dir/--cookies/--yt-dlp-path/--deno-path）
     pub cli: Mutex<CliOverrides>,
+    /// PO Token 自动生成缓存（None = 尚未生成/已过期）。带 TTL，过期后重新生成。
+    pub potoken: Mutex<Option<CachedPot>>,
+    /// PO Token 生成串行锁：避免多任务并发触发重复生成（拿到锁后需再查缓存）。
+    pub potoken_gen: Mutex<()>,
     /// 历史写盘串行锁（同一时刻只有一个写入者）
     persist_lock: Mutex<()>,
     /// persist 请求序号（每调用一次 +1）
@@ -95,6 +100,8 @@ impl AppState {
             merge_jobs: Mutex::new(HashMap::new()),
             upscale_ids: Mutex::new(HashSet::new()),
             cli: Mutex::new(CliOverrides::default()),
+            potoken: Mutex::new(None),
+            potoken_gen: Mutex::new(()),
             persist_lock: Mutex::new(()),
             persist_req: AtomicU64::new(0),
             persist_done: AtomicU64::new(0),

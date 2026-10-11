@@ -36,6 +36,7 @@ use ytdlp_core::download::{self, post_process, probe_output, run_download, Downl
 use ytdlp_core::exec::{ToolResolver, ToolSource};
 use ytdlp_core::merge::{self, MergeParams};
 use ytdlp_core::model::{ItemKind, MediaItem, Status};
+use ytdlp_core::potoken;
 use ytdlp_core::probe::{self, ProbeErrorKind};
 use ytdlp_core::tool_download::{installed_matches, InstalledIndex, ToolDownloader, ToolKind};
 use ytdlp_core::transcode::{self, TranscodeParams};
@@ -712,6 +713,86 @@ fn clean_url(raw: &str) -> String {
         .to_string()
 }
 
+/// 解析本次任务要用的 PO Token（YouTube 风控令牌）。
+///
+/// 取值优先级：**手动填入**（设置页 po_token，字符串或文件路径）→ **自动生成**
+/// （内存缓存命中即用，过期/未命中才调用内嵌 deno 脚本生成）→ 无（不下发参数）。
+/// 自动生成失败一律回退为"不下发"，绝不因此让解析/下载失败。
+///
+/// 返回 `(po_token 配置值, visitor_data)`；GVS 场景二者必须成对下发，故命中缓存/
+/// 自动生成时一并返回绑定用的 visitorData（手动填入无对应 visitorData，返回 None）。
+fn resolve_potoken(
+    state: &AppState,
+    resolver: &ToolResolver,
+    url: &str,
+    proxy: Option<&str>,
+    mut log_line: impl FnMut(String),
+) -> (Option<String>, Option<String>) {
+    // PO Token 只对 YouTube 有意义：非 YouTube 直接跳过（避免无谓生成/下发）
+    if !potoken::is_youtube_url(url) {
+        return (None, None);
+    }
+    let (enabled, manual) = {
+        let cfg = state.config.lock();
+        (
+            cfg.dependencies.potoken_enabled,
+            cfg.dependencies.po_token.clone(),
+        )
+    };
+    if !enabled {
+        return (None, None);
+    }
+    // 1) 手动填入优先
+    if let Some(pt) = potoken::normalize_manual(&manual) {
+        return (Some(pt), None);
+    }
+    // 2) 缓存命中（未过期）
+    let hit = |cache: &Option<ytdlp_core::potoken::CachedPot>| {
+        cache.as_ref().filter(|c| c.is_fresh(std::time::Instant::now())).map(|c| {
+            (
+                Some(format!("web.gvs+{}", c.pot.po_token)),
+                Some(c.pot.visitor_data.clone()),
+            )
+        })
+    };
+    if let Some(v) = hit(&state.potoken.lock()) {
+        return v;
+    }
+    // 3) 自动生成（串行；拿到锁后再查一次缓存，避免并发任务重复生成）
+    let _generating = state.potoken_gen.lock();
+    if let Some(v) = hit(&state.potoken.lock()) {
+        return v;
+    }
+    let script = match potoken::materialize_script(&state.paths.temp_dir()) {
+        Ok(p) => p,
+        Err(e) => {
+            log_line(format!("PO Token 自动生成不可用（脚本释放失败：{e}）"));
+            return (None, None);
+        }
+    };
+    if resolver.resolve(ytdlp_core::exec::Tool::Deno).is_err() {
+        log_line("PO Token 自动生成不可用（未找到 deno，可在依赖页下载）".to_string());
+        return (None, None);
+    }
+    log_line(potoken::display_invocation(&script, proxy));
+    match potoken::generate(resolver, &script, proxy, potoken::GENERATE_TIMEOUT) {
+        Ok(pot) => {
+            let po = format!("web.gvs+{}", pot.po_token);
+            let vd = pot.visitor_data.clone();
+            *state.potoken.lock() =
+                Some(ytdlp_core::potoken::CachedPot::new(pot, std::time::Instant::now()));
+            log_line("PO Token 已自动生成".to_string());
+            (Some(po), Some(vd))
+        }
+        Err(e) => {
+            log_line(format!(
+                "PO Token 自动生成失败（{e}）；继续执行，可能触发 YouTube 风控"
+            ));
+            (None, None)
+        }
+    }
+}
+
 /// 解析任务（URL 或本地；阻塞运行在线程中）。
 ///
 /// 注册取消标志：**解析中的条目也要能取消**（yt-dlp 卡在 DNS/握手时，
@@ -730,14 +811,20 @@ fn run_probe(app: AppHandle, id: String) {
     log_item(&app, &id, "开始解析元数据…");
 
     let resolver = state.resolver();
-    // 一次锁内读齐 network + dependencies + download.playlist，避免多次加锁
-    let (network, po_token, playlist_on) = {
+    // 一次锁内读齐 network + download.playlist，避免多次加锁
+    let (network, playlist_on) = {
         let cfg = state.config.lock();
-        let pt = if cfg.dependencies.potoken_enabled && !cfg.dependencies.po_token.is_empty() {
-            Some(cfg.dependencies.po_token.clone())
-        } else { None };
-        (cfg.network.clone(), pt, cfg.download.playlist)
+        (cfg.network.clone(), cfg.download.playlist)
     };
+    // PO Token（YouTube 风控）：手动填入优先，否则自动生成（带缓存/失败回退）
+    let proxy = item.url.as_deref().and_then(|u| network.resolve_proxy(u));
+    let (po_token, visitor_data) = resolve_potoken(
+        &state,
+        &resolver,
+        item.url.as_deref().unwrap_or_default(),
+        proxy.as_deref(),
+        |l| log_item(&app, &id, l),
+    );
     // 任务私有临时目录：cookie 导出落这里，任务结束整体清理
     let task_tmp = state.paths.task_temp_dir(&id);
     let _ = std::fs::create_dir_all(&task_tmp);
@@ -753,6 +840,7 @@ fn run_probe(app: AppHandle, id: String) {
             netscape.as_deref(),
             &network,
             po_token.as_deref(),
+            visitor_data.as_deref(),
             playlist_on,
             Some(&cancel),
             |l| log_item(&app, &id, l),
@@ -861,6 +949,7 @@ fn run_probe(app: AppHandle, id: String) {
                     netscape.as_deref(),
                     &network,
                     po_token.as_deref(),
+                    visitor_data.as_deref(),
                     &cancel,
                 );
             }
@@ -1070,6 +1159,7 @@ fn run_download_task(app: AppHandle, id: String, format_id: Option<String>, audi
         template,
         proxy,
         po_token,
+        visitor_data,
         netscape,
         sections,
         js_runtime,
@@ -1087,15 +1177,24 @@ fn run_download_task(app: AppHandle, id: String, format_id: Option<String>, audi
             return;
         };
         let url = item.url.clone().unwrap_or_default();
-        // 一次锁内读齐 download + general + network + dependencies
-        let (cfg, general, proxy, po_token) = {
+        // 一次锁内读齐 download + general + network
+        let (cfg, general, proxy) = {
             let c = state.config.lock();
-            let pt = if c.dependencies.potoken_enabled && !c.dependencies.po_token.is_empty() {
-                Some(c.dependencies.po_token.clone())
-            } else { None };
-            (c.download.clone(), c.general.clone(), c.network.resolve_proxy(&url), pt)
+            (
+                c.download.clone(),
+                c.general.clone(),
+                c.network.resolve_proxy(&url),
+            )
         };
         let resolver = state.resolver();
+        // PO Token（YouTube 风控）：手动填入优先，否则自动生成（带缓存/失败回退）
+        let (po_token, visitor_data) = resolve_potoken(
+            &state,
+            &resolver,
+            &url,
+            proxy.as_deref(),
+            |l| log_item(&app, &id, l),
+        );
         let out_dir = default_output_dir(&state);
         let template = cfg.filename_template.clone();
         let task_tmp = state.paths.task_temp_dir(&id);
@@ -1116,6 +1215,7 @@ fn run_download_task(app: AppHandle, id: String, format_id: Option<String>, audi
             template,
             proxy,
             po_token,
+            visitor_data,
             netscape,
             sections,
             js_runtime,
@@ -1144,6 +1244,7 @@ fn run_download_task(app: AppHandle, id: String, format_id: Option<String>, audi
             .ok()
             .map(|p| p.to_string_lossy().into_owned()),
         po_token,
+        visitor_data,
     };
 
     let app2 = app.clone();
@@ -2011,15 +2112,23 @@ fn expand_playlist(
     cookies: Option<&Path>,
     network: &NetworkConfig,
     po_token: Option<&str>,
+    visitor_data: Option<&str>,
     cancel: &Arc<AtomicBool>,
 ) {
     let url = item.url.clone().unwrap_or_default();
     if url.is_empty() {
         return;
     }
-    match probe::list_playlist_entries(resolver, &url, cookies, network, po_token, Some(cancel), |l| {
-        log_item(app, id, l)
-    }) {
+    match probe::list_playlist_entries(
+        resolver,
+        &url,
+        cookies,
+        network,
+        po_token,
+        visitor_data,
+        Some(cancel),
+        |l| log_item(app, id, l),
+    ) {
         Ok(entries) => {
             let n = entries.len();
             log_item(app, id, format!("播放列表展开：{n} 集"));
