@@ -825,14 +825,6 @@ fn run_probe(app: AppHandle, id: String) {
     };
     // PO Token（YouTube 风控）：手动填入优先，否则自动生成（带缓存/失败回退）
     let proxy = item.url.as_deref().and_then(|u| network.resolve_proxy(u));
-    // 调试：输出实际代理配置，帮助定位"配了代理但没生效"
-    log_item(&app, &id, format!(
-        "代理配置：proxy_url=\"{}\" site_proxy={:?} → resolve_proxy({}) = {:?}",
-        network.proxy_url,
-        network.site_proxy,
-        item.url.as_deref().unwrap_or(""),
-        proxy
-    ));
     let (po_token, visitor_data) = resolve_potoken(
         &state,
         &resolver,
