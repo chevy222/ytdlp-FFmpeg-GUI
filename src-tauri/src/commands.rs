@@ -486,6 +486,59 @@ fn log_item(app: &AppHandle, id: &str, line: impl Into<String>) {
     let _ = app.emit("item:log", serde_json::json!({ "id": id, "line": line }));
 }
 
+/// 用 yt-dlp 兜底下载缩略图（curl 直连失败时）。
+///
+/// curl 不走 Windows 系统代理（WinINET），用户开 TUN/系统代理时直连 i.ytimg.com
+/// 必然失败；yt-dlp 会自动读取系统代理/环境变量，与主下载同口径，作为兜底最可靠。
+/// `--write-thumbnail --skip-download` 只拉封面不下载视频，速度快。
+fn fetch_thumb_ytdlp(
+    resolver: &ToolResolver,
+    video_url: &str,
+    dest: &Path,
+) -> Result<(), String> {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_dir = std::env::temp_dir().join(format!("ytdlp-thumb-{ts}"));
+    std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("创建临时目录失败：{e}"))?;
+    let out_tmpl = tmp_dir.join("%(id)s.%(ext)s");
+    let mut cmd = resolver.command(ytdlp_core::exec::Tool::YtDlp).map_err(|e| e.to_string())?;
+    cmd.args([
+        "--write-thumbnail",
+        "--skip-download",
+        "--no-warnings",
+        "--no-playlist",
+        "--socket-timeout",
+        "30",
+        "-o",
+        out_tmpl.to_str().unwrap_or("thumb.%(ext)s"),
+        video_url,
+    ]);
+    ytdlp_core::exec::hide_console(&mut cmd);
+    let output = cmd.output().map_err(|e| format!("启动 yt-dlp 失败：{e}"))?;
+    if !output.status.success() {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        let detail = ytdlp_core::exec::decode_text(&output.stderr);
+        return Err(format!("yt-dlp 缩略图下载失败：{}", detail.trim()));
+    }
+    // yt-dlp 写出的封面扩展名可能是 webp/jpg/jpeg/png，找到第一个文件即可
+    let thumb_file = std::fs::read_dir(&tmp_dir)
+        .ok()
+        .and_then(|mut rd| rd.find_map(|e| e.ok()))
+        .map(|e| e.path());
+    let Some(thumb_file) = thumb_file else {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return Err("yt-dlp 未生成缩略图文件".into());
+    };
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    std::fs::copy(&thumb_file, dest).map_err(|e| format!("复制缩略图失败：{e}"))?;
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    Ok(())
+}
+
 /// persist 去抖窗口：500ms 内的多次变更合并为一次写盘。
 ///
 /// P1-5：批量转码 50 条 = 每条收尾调一次 persist，此前是 50 次全量
@@ -659,7 +712,14 @@ fn run_probe(app: AppHandle, id: String) {
     log_item(&app, &id, "开始解析元数据…");
 
     let resolver = state.resolver();
-    let network = state.config.lock().network.clone();
+    // 一次锁内读齐 network + dependencies + download.playlist，避免多次加锁
+    let (network, po_token, playlist_on) = {
+        let cfg = state.config.lock();
+        let pt = if cfg.dependencies.potoken_enabled && !cfg.dependencies.po_token.is_empty() {
+            Some(cfg.dependencies.po_token.clone())
+        } else { None };
+        (cfg.network.clone(), pt, cfg.download.playlist)
+    };
     // 任务私有临时目录：cookie 导出落这里，任务结束整体清理
     let task_tmp = state.paths.task_temp_dir(&id);
     let _ = std::fs::create_dir_all(&task_tmp);
@@ -668,13 +728,13 @@ fn run_probe(app: AppHandle, id: String) {
         log_item(&app, &id, w);
     }
 
-    let playlist_on = state.config.lock().download.playlist;
     let result = if item.url.is_some() {
         probe::probe_url(
             &resolver,
             item.url.as_deref().unwrap_or_default(),
             netscape.as_deref(),
             &network,
+            po_token.as_deref(),
             playlist_on,
             Some(&cancel),
             |l| log_item(&app, &id, l),
@@ -726,6 +786,7 @@ fn run_probe(app: AppHandle, id: String) {
                     let cache_dir = state.paths.cache_dir();
                     let thumb_url = p.thumbnail_url.clone();
                     let local_path = item.path.clone();
+                    let video_url = item.url.clone();
                     // 本地文件优先取内嵌封面（元数据），与桌面缩略图同源
                     let resolver2 = resolver.clone();
                     let proxy2 = network.proxy_url.clone();
@@ -735,9 +796,19 @@ fn run_probe(app: AppHandle, id: String) {
                         if u.is_empty() {
                             Ok(())
                         } else {
-                            // 直连失败自动带设置里的代理重试一次（YouTube 等站点
-                            // 缩略图服务器直连拉不动，主下载却走代理）
-                            ytdlp_core::thumbs::save_remote_thumb(&u, &dest, Some(proxy2.as_str()))
+                            // 先 curl 直连（快）；失败后用 yt-dlp 兜底（自动走系统代理，
+                            // curl 不走 WinINET，TUN/系统代理用户直连 i.ytimg.com 必败）
+                            match ytdlp_core::thumbs::save_remote_thumb(&u, &dest, Some(proxy2.as_str())) {
+                                Ok(()) => Ok(()),
+                                Err(e) => {
+                                    log_item(&app2, &id2, format!("缩略图直连下载失败（{}），尝试 yt-dlp 兜底…", e));
+                                    if let Some(vurl) = &video_url {
+                                        fetch_thumb_ytdlp(&resolver2, vurl, &dest)
+                                    } else {
+                                        Err(e)
+                                    }
+                                }
+                            }
                         }
                     } else if let Some(p) = local_path {
                         ytdlp_core::thumbs::ensure_thumb(
@@ -750,11 +821,16 @@ fn run_probe(app: AppHandle, id: String) {
                     } else {
                         Ok(())
                     };
-                    if let Ok(()) = r {
-                        update_item(&app2, &id2, |it| {
-                            it.thumb = Some(dest.to_string_lossy().into_owned());
-                        });
-                        app2.state::<AppState>().persist();
+                    match r {
+                        Ok(()) => {
+                            update_item(&app2, &id2, |it| {
+                                it.thumb = Some(dest.to_string_lossy().into_owned());
+                            });
+                            app2.state::<AppState>().persist();
+                        }
+                        Err(e) => {
+                            log_item(&app2, &id2, format!("缩略图生成失败：{e}"));
+                        }
                     }
                 });
             }
@@ -771,6 +847,7 @@ fn run_probe(app: AppHandle, id: String) {
                     &resolver,
                     netscape.as_deref(),
                     &network,
+                    po_token.as_deref(),
                     &cancel,
                 );
             }
@@ -979,6 +1056,7 @@ fn run_download_task(app: AppHandle, id: String, format_id: Option<String>, audi
         out_dir,
         template,
         proxy,
+        po_token,
         netscape,
         sections,
         js_runtime,
@@ -996,12 +1074,17 @@ fn run_download_task(app: AppHandle, id: String, format_id: Option<String>, audi
             return;
         };
         let url = item.url.clone().unwrap_or_default();
-        let cfg = state.config.lock().download.clone();
-        let general = state.config.lock().general.clone();
+        // 一次锁内读齐 download + general + network + dependencies
+        let (cfg, general, proxy, po_token) = {
+            let c = state.config.lock();
+            let pt = if c.dependencies.potoken_enabled && !c.dependencies.po_token.is_empty() {
+                Some(c.dependencies.po_token.clone())
+            } else { None };
+            (c.download.clone(), c.general.clone(), c.network.resolve_proxy(&url), pt)
+        };
         let resolver = state.resolver();
         let out_dir = default_output_dir(&state);
         let template = cfg.filename_template.clone();
-        let proxy = state.config.lock().network.resolve_proxy(&url);
         let task_tmp = state.paths.task_temp_dir(&id);
         let (netscape, cookie_warn) = resolve_cookies(&state, &item, &task_tmp);
         let sections = item.sections.clone();
@@ -1019,6 +1102,7 @@ fn run_download_task(app: AppHandle, id: String, format_id: Option<String>, audi
             out_dir,
             template,
             proxy,
+            po_token,
             netscape,
             sections,
             js_runtime,
@@ -1046,6 +1130,7 @@ fn run_download_task(app: AppHandle, id: String, format_id: Option<String>, audi
             .resolve(ytdlp_core::exec::Tool::Ffmpeg)
             .ok()
             .map(|p| p.to_string_lossy().into_owned()),
+        po_token,
     };
 
     let app2 = app.clone();
@@ -1911,13 +1996,14 @@ fn expand_playlist(
     resolver: &ToolResolver,
     cookies: Option<&Path>,
     network: &NetworkConfig,
+    po_token: Option<&str>,
     cancel: &Arc<AtomicBool>,
 ) {
     let url = item.url.clone().unwrap_or_default();
     if url.is_empty() {
         return;
     }
-    match probe::list_playlist_entries(resolver, &url, cookies, network, Some(cancel), |l| {
+    match probe::list_playlist_entries(resolver, &url, cookies, network, po_token, Some(cancel), |l| {
         log_item(app, id, l)
     }) {
         Ok(entries) => {

@@ -792,7 +792,10 @@ function renderSetPage(){
     h+=toolRow('ffmpeg_path','ffmpeg 路径');
     h+=toolRow('ffprobe_path','ffprobe 路径');
     h+=toolRow('deno_path','deno 路径');
-    h+=row('PO-Token 服务',chk('dependencies.potoken_enabled',dp.potoken_enabled,'启用').replace('<input ','<input disabled '),'【暂未生效】PO-Token（POT）是 YouTube 风控验证令牌（Proof-of-Origin Token），由 deno 运行 potoken 生成器产出，用于通过 YouTube 机器人验证、降低 403/风控拦截概率。默认启用。');
+    h+=row('PO-Token',
+      chk('dependencies.potoken_enabled',dp.potoken_enabled,'启用')+
+      '<div style="margin-top:6px">'+txt('dependencies.po_token',dp.po_token,'填入 PO-Token 值或 token 文件路径')+'</div>',
+      'PO-Token（POT）是 YouTube 风控验证令牌（Proof-of-Origin Token），用于通过 YouTube 机器人验证、降低 403/风控拦截概率。可填入 token 字符串或指向 token 文件的路径；留空时即使启用也不传入。默认启用。');
   } else if(curPage==='network'){
     h+=row('代理地址',txt('network.proxy_url',n.proxy_url,'socks5://127.0.0.1:10808')+
       '<div class="proto-tags"><span class="proto-hint">常用：</span>'+

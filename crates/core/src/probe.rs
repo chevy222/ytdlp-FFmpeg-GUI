@@ -69,6 +69,7 @@ fn ytdlp_args(
     url: &str,
     cookies_file: Option<&Path>,
     network: &NetworkConfig,
+    po_token: Option<&str>,
     extra: &[&str],
 ) -> Vec<String> {
     let mut args: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
@@ -84,6 +85,12 @@ fn ytdlp_args(
         args.push("--proxy".into());
         args.push(p);
     }
+    if let Some(pt) = po_token {
+        if !pt.is_empty() {
+            args.push("--po-token".into());
+            args.push(pt.to_string());
+        }
+    }
     args.push(url.to_string());
     args
 }
@@ -98,6 +105,7 @@ pub fn list_playlist_entries(
     url: &str,
     cookies_file: Option<&Path>,
     network: &NetworkConfig,
+    po_token: Option<&str>,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     mut on_log: impl FnMut(String),
 ) -> std::result::Result<Vec<PlaylistEntry>, ProbeFailure> {
@@ -107,6 +115,7 @@ pub fn list_playlist_entries(
         url,
         cookies_file,
         network,
+        po_token,
         &["-J", "--flat-playlist", "--no-warnings"],
     );
     on_log(crate::exec::display_command("yt-dlp", &args));
@@ -205,6 +214,7 @@ pub fn probe_url(
     url: &str,
     cookies_file: Option<&Path>,
     network: &NetworkConfig,
+    po_token: Option<&str>,
     playlist: bool,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     mut on_log: impl FnMut(String),
@@ -215,7 +225,7 @@ pub fn probe_url(
     } else {
         &["-J", "--no-warnings", "--no-playlist", "--socket-timeout", "60"]
     };
-    let args = ytdlp_args(resolver, url, cookies_file, network, extra);
+    let args = ytdlp_args(resolver, url, cookies_file, network, po_token, extra);
     on_log(crate::exec::display_command("yt-dlp", &args));
     let mut cmd = resolver.command(Tool::YtDlp).map_err(|e| ProbeFailure {
         kind: ProbeErrorKind::Failed,

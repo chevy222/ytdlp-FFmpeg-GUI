@@ -43,6 +43,9 @@ pub struct DownloadParams {
     /// 合并容器、嵌入封面、时间范围裁剪、音轨提取都依赖 ffmpeg，而 yt-dlp
     /// 默认只在 PATH 与自身目录查找；托管模式（`<exe 同级>\tools\`）必须显式传入。
     pub ffmpeg_path: Option<String>,
+    /// yt-dlp `--po-token` 取值（YouTube 风控验证令牌）。
+    /// 启用且非空时传入，用于通过 YouTube 机器人验证、降低 403/风控拦截概率。
+    pub po_token: Option<String>,
 }
 
 /// 文件名模板 → yt-dlp 输出模板（DL-10）。
@@ -204,6 +207,14 @@ pub fn build_args(url: &str, p: &DownloadParams, cfg: &DownloadConfig) -> Vec<St
         if !ff.is_empty() {
             args.push("--ffmpeg-location".into());
             args.push(ff.clone());
+        }
+    }
+    // PO-Token（YouTube 风控验证令牌）：启用且非空时传入，降低 403/风控拦截概率。
+    // yt-dlp 支持直接传 token 字符串或指向 token 文件的路径。
+    if let Some(pt) = &p.po_token {
+        if !pt.is_empty() {
+            args.push("--po-token".into());
+            args.push(pt.clone());
         }
     }
     // 其他
@@ -912,6 +923,7 @@ mod tests {
             sections: None,
             js_runtime: None,
             ffmpeg_path: None,
+            po_token: None,
         }
     }
 
@@ -986,6 +998,22 @@ mod tests {
         let joined = build_args("u", &p, &DownloadConfig::default()).join(" ");
         assert!(
             joined.contains("--js-runtimes deno:C:\\tools\\deno.exe"),
+            "{}",
+            joined
+        );
+    }
+
+    #[test]
+    fn build_args_passes_po_token() {
+        let mut p = params();
+        // 未设置时不出现 --po-token
+        assert!(!build_args("u", &p, &DownloadConfig::default())
+            .join(" ")
+            .contains("--po-token"));
+        p.po_token = Some("MII...token-string...".into());
+        let joined = build_args("u", &p, &DownloadConfig::default()).join(" ");
+        assert!(
+            joined.contains("--po-token MII...token-string..."),
             "{}",
             joined
         );

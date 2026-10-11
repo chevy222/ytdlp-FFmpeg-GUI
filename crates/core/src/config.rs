@@ -121,8 +121,11 @@ pub struct DependenciesConfig {
     pub ffmpeg_path: Option<String>,
     pub ffprobe_path: Option<String>,
     pub deno_path: Option<String>,
-    /// PO-Token 服务（YouTube 风控验证令牌，deno 跑 potoken 生成器），默认启用
+    /// PO-Token 服务总开关（YouTube 风控验证令牌），默认启用
     pub potoken_enabled: bool,
+    /// PO-Token 值（字符串或文件路径）。留空时即使启用也不传入 --po-token；
+    /// yt-dlp 支持直接传 token 字符串或指向 token 文件的路径。
+    pub po_token: String,
 }
 
 impl Default for DependenciesConfig {
@@ -133,6 +136,7 @@ impl Default for DependenciesConfig {
             ffprobe_path: None,
             deno_path: None,
             potoken_enabled: true,
+            po_token: String::new(),
         }
     }
 }
