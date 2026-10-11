@@ -499,13 +499,16 @@ fn fetch_thumb_ytdlp(
     resolver: &ToolResolver,
     video_url: &str,
     dest: &Path,
+    temp_root: &Path,
     on_log: &mut dyn FnMut(String),
 ) -> Result<(), String> {
+    // 运行时文件必须落 <exe 同级>\temp\（§3.7），禁止系统 temp；
+    // 目录名带纳秒时间戳，避免同进程内多次调用撞名
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let tmp_dir = std::env::temp_dir().join(format!("ytdlp-thumb-{ts}"));
+    let tmp_dir = temp_root.join(format!("thumb-{ts}"));
     std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("创建临时目录失败：{e}"))?;
     let out_tmpl = tmp_dir.join("%(id)s.%(ext)s");
     let out_tmpl_str = out_tmpl.to_string_lossy().into_owned();
@@ -579,11 +582,18 @@ fn persist(app: &AppHandle) {
 
 /// 读取剪贴板文本。首页"添加"按钮在输入框为空时自动调用，
 /// 把剪贴板里的 URL 直接添加，省去手动粘贴步骤。
+///
+/// 剪贴板被其它进程占用时 `OpenClipboard` 会阻塞数秒，同步命令跑在主线程会卡窗口，
+/// 因此走 `spawn_blocking`（A6：不得在主线程做阻塞 IO）。
 #[tauri::command]
-pub fn read_clipboard() -> CmdResult<String> {
-    let mut clipboard = arboard::Clipboard::new().map_err(|e| format!("打开剪贴板失败：{e}"))?;
-    let text = clipboard.get_text().unwrap_or_default();
-    Ok(text)
+pub async fn read_clipboard() -> CmdResult<String> {
+    tauri::async_runtime::spawn_blocking(|| -> CmdResult<String> {
+        let mut clipboard =
+            arboard::Clipboard::new().map_err(|e| format!("打开剪贴板失败：{e}"))?;
+        Ok(clipboard.get_text().unwrap_or_default())
+    })
+    .await
+    .map_err(|e| format!("读取剪贴板任务异常：{e}"))?
 }
 
 #[tauri::command(async)]
@@ -792,6 +802,7 @@ fn run_probe(app: AppHandle, id: String) {
                     // 本地文件优先取内嵌封面（元数据），与桌面缩略图同源
                     let resolver2 = resolver.clone();
                     let proxy2 = network.proxy_url.clone();
+                    let thumb_tmp_root = state.paths.temp_dir();
                     tauri::async_runtime::spawn_blocking(move || {
                     let dest = ytdlp_core::thumbs::thumb_path(&cache_dir, &id2);
                     let r = if let Some(u) = thumb_url {
@@ -805,7 +816,7 @@ fn run_probe(app: AppHandle, id: String) {
                                 Err(e) => {
                                     log_item(&app2, &id2, format!("缩略图直连下载失败（{}），尝试 yt-dlp 兜底…", e));
                                     if let Some(vurl) = &video_url {
-                                        fetch_thumb_ytdlp(&resolver2, vurl, &dest, &mut |l| log_item(&app2, &id2, l))
+                                        fetch_thumb_ytdlp(&resolver2, vurl, &dest, &thumb_tmp_root, &mut |l| log_item(&app2, &id2, l))
                                     } else {
                                         Err(e)
                                     }
@@ -2799,7 +2810,7 @@ fn open_in_explorer(_dir: &Path, _select: Option<&Path>) -> CmdResult<()> {
 /// 豁免清单必须覆盖 temp 下**所有**非任务 id 命名的活跃产物：
 /// - `merge_<uuid>/`、`norm_<uuid>.mp4`：进行中的合并与音量归一化
 /// - `tool_dl/`：进行中的工具下载
-/// - `ytdlp-*.txt`：进行中的下载产物定位文件（下载中）
+/// - `ytdlp-*.txt`、`thumb-*/`：进行中的下载产物定位文件与缩略图 yt-dlp 兜底目录
 ///
 /// 返回实际清理掉的条目数。启动时（此时豁免表为空）也调它清上次崩溃留下的垃圾。
 pub fn clear_temp_inner(state: &AppState) -> std::io::Result<usize> {
@@ -2818,7 +2829,8 @@ pub fn clear_temp_inner(state: &AppState) -> std::io::Result<usize> {
             || (tool_dl_busy && name == "tool_dl")
             || (busy && name.starts_with("merge_"))
             || (busy && name.starts_with("norm_"))
-            || (busy && name.starts_with("ytdlp-"));
+            || (busy && name.starts_with("ytdlp-"))
+            || (busy && name.starts_with("thumb-"));
         if skip {
             continue;
         }
@@ -2877,8 +2889,9 @@ pub struct UpdateInfo {
 /// 查询 GitHub 最新 release：返回 (tag, html_url)。
 ///
 /// 用系统 curl 发请求（与 tool_download 一致，避免 TLS 交叉编译问题）；
-/// 调用方负责隐藏控制台窗口（hide_console）。
-fn fetch_latest_release() -> CmdResult<(String, String)> {
+/// 调用方负责隐藏控制台窗口（hide_console）与放到阻塞线程（A6）。
+/// `proxy`：应用代理（GitHub 常被墙，与工具链下载同口径）。
+fn fetch_latest_release(proxy: Option<&str>) -> CmdResult<(String, String)> {
     let api_url = "https://api.github.com/repos/chevy222/ytdlp-FFmpeg-GUI/releases/latest";
     let mut cmd = std::process::Command::new("curl");
     cmd.args([
@@ -2890,8 +2903,11 @@ fn fetch_latest_release() -> CmdResult<(String, String)> {
         "Accept: application/vnd.github+json",
         "-H",
         "User-Agent: ytdlp-FFmpeg-GUI",
-        api_url,
     ]);
+    if let Some(p) = proxy.filter(|p| !p.trim().is_empty()) {
+        cmd.args(["--proxy", p]);
+    }
+    cmd.arg(api_url);
     ytdlp_core::exec::hide_console(&mut cmd);
     let output = cmd
         .output()
@@ -2926,14 +2942,22 @@ fn fetch_latest_release() -> CmdResult<(String, String)> {
 /// - 配置 `general.check_update` 为 false 时直接返回 None；
 /// - 有新版时返回 Some(UpdateInfo)，无新版返回 None；
 /// - 失败时返回错误，前端静默忽略（检查更新是可选增强，不应阻塞启动）。
-#[tauri::command(async)]
-pub fn check_update(app: AppHandle) -> CmdResult<Option<UpdateInfo>> {
-    let state = app.state::<AppState>();
-    if !state.config.lock().general.check_update {
+#[tauri::command]
+pub async fn check_update(app: AppHandle) -> CmdResult<Option<UpdateInfo>> {
+    let (enabled, proxy) = {
+        let state = app.state::<AppState>();
+        let c = state.config.lock();
+        (c.general.check_update, c.network.proxy_url.clone())
+    };
+    if !enabled {
         return Ok(None);
     }
     let current = env!("CARGO_PKG_VERSION").to_string();
-    let (tag, release_url) = fetch_latest_release()?;
+    // curl 最长 10s：必须离开 async worker（A6），并带上应用代理
+    let (tag, release_url) =
+        tauri::async_runtime::spawn_blocking(move || fetch_latest_release(Some(proxy.as_str())))
+            .await
+            .map_err(|e| format!("检查更新任务异常：{e}"))??;
     if version_greater(&tag, &current) {
         Ok(Some(UpdateInfo {
             current_version: current,
@@ -2949,10 +2973,20 @@ pub fn check_update(app: AppHandle) -> CmdResult<Option<UpdateInfo>> {
 ///
 /// 前端在"启动时检查更新"旁边展示"当前 vX.Y.Z / 最新 vA.B.C"，让用户在
 /// 关闭自动检查时也能手动看到版本状态。查询失败时 latest_version 为空串。
-#[tauri::command(async)]
-pub fn get_version_info() -> CmdResult<UpdateInfo> {
+#[tauri::command]
+pub async fn get_version_info(app: AppHandle) -> CmdResult<UpdateInfo> {
+    let proxy = {
+        let state = app.state::<AppState>();
+        state.config.lock().network.proxy_url.clone()
+    };
     let current = env!("CARGO_PKG_VERSION").to_string();
-    match fetch_latest_release() {
+    // curl 最长 10s：离开 async worker（A6），并带应用代理
+    let fetched = tauri::async_runtime::spawn_blocking(move || {
+        fetch_latest_release(Some(proxy.as_str()))
+    })
+    .await
+    .unwrap_or_else(|_| Err("查询任务异常".into()));
+    match fetched {
         Ok((tag, url)) => Ok(UpdateInfo {
             current_version: current,
             latest_version: tag,
