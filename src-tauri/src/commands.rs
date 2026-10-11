@@ -502,6 +502,8 @@ fn fetch_thumb_ytdlp(
     video_url: &str,
     dest: &Path,
     temp_root: &Path,
+    proxy: Option<&str>,
+    cookies: Option<&Path>,
     on_log: &mut dyn FnMut(String),
 ) -> Result<(), String> {
     // 运行时文件必须落 <exe 同级>\temp\（§3.7），禁止系统 temp；
@@ -514,17 +516,27 @@ fn fetch_thumb_ytdlp(
     std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("创建临时目录失败：{e}"))?;
     let out_tmpl = tmp_dir.join("%(id)s.%(ext)s");
     let out_tmpl_str = out_tmpl.to_string_lossy().into_owned();
-    let args: Vec<String> = vec![
+    let mut args: Vec<String> = vec![
         "--write-thumbnail".into(),
         "--skip-download".into(),
         "--no-warnings".into(),
         "--no-playlist".into(),
         "--socket-timeout".into(),
         "30".into(),
-        "-o".into(),
-        out_tmpl_str,
-        video_url.to_string(),
     ];
+    if let Some(p) = proxy {
+        if !p.is_empty() {
+            args.push("--proxy".into());
+            args.push(p.to_string());
+        }
+    }
+    if let Some(c) = cookies {
+        args.push("--cookies".into());
+        args.push(c.to_string_lossy().into_owned());
+    }
+    args.push("-o".into());
+    args.push(out_tmpl_str);
+    args.push(video_url.to_string());
     on_log(ytdlp_core::exec::display_command("yt-dlp", &args));
     let mut cmd = resolver.command(ytdlp_core::exec::Tool::YtDlp).map_err(|e| e.to_string())?;
     cmd.args(&args);
@@ -902,6 +914,7 @@ fn run_probe(app: AppHandle, id: String) {
                     let thumb_proxy = video_url
                         .as_deref()
                         .and_then(|u| network.resolve_proxy(u));
+                    let thumb_cookies = netscape.clone();
                     let thumb_tmp_root = state.paths.temp_dir();
                     tauri::async_runtime::spawn_blocking(move || {
                     let dest = ytdlp_core::thumbs::thumb_path(&cache_dir, &id2);
@@ -912,7 +925,8 @@ fn run_probe(app: AppHandle, id: String) {
                             // 无代理：curl 不走 WinINET/TUN，直连必败，直接 yt-dlp 兜底
                             log_item(&app2, &id2, "无站点代理，缩略图直接用 yt-dlp 下载…");
                             if let Some(vurl) = &video_url {
-                                fetch_thumb_ytdlp(&resolver2, vurl, &dest, &thumb_tmp_root, &mut |l| log_item(&app2, &id2, l))
+                                fetch_thumb_ytdlp(&resolver2, vurl, &dest, &thumb_tmp_root,
+                                    None, thumb_cookies.as_deref(), &mut |l| log_item(&app2, &id2, l))
                             } else {
                                 Err("无代理且无视频 URL".into())
                             }
@@ -923,7 +937,8 @@ fn run_probe(app: AppHandle, id: String) {
                                 Err(e) => {
                                     log_item(&app2, &id2, format!("缩略图 curl 下载失败（{}），尝试 yt-dlp 兜底…", e));
                                     if let Some(vurl) = &video_url {
-                                        fetch_thumb_ytdlp(&resolver2, vurl, &dest, &thumb_tmp_root, &mut |l| log_item(&app2, &id2, l))
+                                        fetch_thumb_ytdlp(&resolver2, vurl, &dest, &thumb_tmp_root,
+                                            thumb_proxy.as_deref(), thumb_cookies.as_deref(), &mut |l| log_item(&app2, &id2, l))
                                     } else {
                                         Err(e)
                                     }

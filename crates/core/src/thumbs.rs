@@ -27,12 +27,10 @@ pub fn collect_written_thumbnail(output_path: &Path) -> Option<PathBuf> {
     None
 }
 
-/// 从远程缩略图 URL 下载到 dest（如 yt-dlp 的 thumbnail）。
+/// 从远程缩略图 URL 下载到 dest。
 ///
-/// 先直连尝试；失败且调用方给了代理时带 `--proxy` 重试一次——
-/// 需要代理的站点（YouTube 等）缩略图服务器直连拉不动，而 yt-dlp 主下载
-/// 走的是设置里的代理，缩略图不能因此缺席。
-/// `on_log`：如实回传实际执行的 curl 命令行（含代理）。
+/// 有代理时直接走代理（直连国内必超时 10s，白等）；无代理时直连。
+/// `on_log`：如实回传实际执行的 curl 命令行。
 pub fn save_remote_thumb(
     url: &str,
     dest: &Path,
@@ -40,13 +38,9 @@ pub fn save_remote_thumb(
     on_log: &mut dyn FnMut(String),
 ) -> Result<(), String> {
     ensure_parent(dest).map_err(|e| e.to_string())?;
-    match fetch_to(url, dest, None, on_log) {
-        Ok(()) => Ok(()),
-        Err(e) => match proxy {
-            Some(p) if !p.is_empty() => fetch_to(url, dest, Some(p), on_log),
-            _ => Err(e),
-        },
-    }
+    // 有代理直接用代理（避免国内直连超时 10s）；无代理才直连
+    let proxy = proxy.filter(|p| !p.is_empty());
+    fetch_to(url, dest, proxy, on_log)
 }
 
 fn fetch_to(
