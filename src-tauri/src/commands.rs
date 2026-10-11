@@ -774,6 +774,12 @@ fn resolve_potoken(
         log_line("PO Token 自动生成不可用（未找到 deno，可在依赖页下载）".to_string());
         return (None, None);
     }
+    // deno 的 fetch 不走 Windows 系统代理（WinINET/TUN），必须显式 --proxy。
+    // 无代理时 deno 脚本 fetch youtube.com 必然失败，直接跳过不浪费 120s 超时。
+    if proxy.map(|p| p.is_empty()).unwrap_or(true) {
+        log_line("PO Token 自动生成跳过：当前站点无代理配置（deno 不走系统代理/TUN，请在设置-网络中为该站点配置代理地址）".to_string());
+        return (None, None);
+    }
     log_line(potoken::display_invocation(&script, proxy));
     match potoken::generate(resolver, &script, proxy, potoken::GENERATE_TIMEOUT) {
         Ok(pot) => {
@@ -889,20 +895,32 @@ fn run_probe(app: AppHandle, id: String) {
                     let video_url = item.url.clone();
                     // 本地文件优先取内嵌封面（元数据），与桌面缩略图同源
                     let resolver2 = resolver.clone();
-                    let proxy2 = network.proxy_url.clone();
+                    // 缩略图域名（i.ytimg.com 等）按站点分流解析代理，而非全局 proxy_url
+                    // ——用户可能给 youtube.com 勾了代理但 i.ytimg.com 未勾；
+                    // 无代理时跳过 curl 直连（TUN 用户直连必超时 10s），直接 yt-dlp 兜底
+                    let thumb_proxy = thumb_url
+                        .as_deref()
+                        .and_then(|u| network.resolve_proxy(u));
                     let thumb_tmp_root = state.paths.temp_dir();
                     tauri::async_runtime::spawn_blocking(move || {
                     let dest = ytdlp_core::thumbs::thumb_path(&cache_dir, &id2);
                     let r = if let Some(u) = thumb_url {
                         if u.is_empty() {
                             Ok(())
+                        } else if thumb_proxy.is_none() {
+                            // 无代理：curl 不走 WinINET/TUN，直连必败，直接 yt-dlp 兜底
+                            log_item(&app2, &id2, "无站点代理，缩略图直接用 yt-dlp 下载…");
+                            if let Some(vurl) = &video_url {
+                                fetch_thumb_ytdlp(&resolver2, vurl, &dest, &thumb_tmp_root, &mut |l| log_item(&app2, &id2, l))
+                            } else {
+                                Err("无代理且无视频 URL".into())
+                            }
                         } else {
-                            // 先 curl 直连（快）；失败后用 yt-dlp 兜底（自动走系统代理，
-                            // curl 不走 WinINET，TUN/系统代理用户直连 i.ytimg.com 必败）
-                            match ytdlp_core::thumbs::save_remote_thumb(&u, &dest, Some(proxy2.as_str()), &mut |l| log_item(&app2, &id2, l)) {
+                            // 有代理：先 curl（快），失败再 yt-dlp 兜底
+                            match ytdlp_core::thumbs::save_remote_thumb(&u, &dest, thumb_proxy.as_deref(), &mut |l| log_item(&app2, &id2, l)) {
                                 Ok(()) => Ok(()),
                                 Err(e) => {
-                                    log_item(&app2, &id2, format!("缩略图直连下载失败（{}），尝试 yt-dlp 兜底…", e));
+                                    log_item(&app2, &id2, format!("缩略图 curl 下载失败（{}），尝试 yt-dlp 兜底…", e));
                                     if let Some(vurl) = &video_url {
                                         fetch_thumb_ytdlp(&resolver2, vurl, &dest, &thumb_tmp_root, &mut |l| log_item(&app2, &id2, l))
                                     } else {
