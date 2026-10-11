@@ -598,12 +598,24 @@ pub fn build_args_for_tier(
             args.push("copy".into());
         }
     }
+    // 音频：能直拷就直拷（零损耗），否则重编码 aac。
+    // MP4 容器不支持 opus/vorbis/flac 等音频编码，直接 `-c:a copy` 会让 ffmpeg 报
+    // "codec not currently supported in container"；且该失败与转码层级无关
+    // （三层都带同样的音频参数）→ 整个任务无解。因此按容器做兼容性判定。
+    let mp4_audio_ok = matches!(
+        meta.acodec.as_deref(),
+        Some("aac" | "mp3" | "ac3" | "eac3" | "alac" | "mp2")
+    );
+    let copy_audio =
+        gain.is_none() && (params.container != "mp4" || meta.acodec.is_none() || mp4_audio_ok);
     args.push("-c:a".into());
-    args.push(if gain.is_some() { "aac" } else { "copy" }.into());
-    if let Some(g) = gain {
-        if g > 0.1 {
-            args.push("-af".into());
-            args.push(format!("volume={:.2}dB", g));
+    args.push(if copy_audio { "copy" } else { "aac" }.into());
+    if gain.is_some() || !copy_audio {
+        if let Some(g) = gain {
+            if g > 0.1 {
+                args.push("-af".into());
+                args.push(format!("volume={:.2}dB", g));
+            }
         }
         // 音频码率跟随源，clamp 64-192k（MediaMeta::audio_bitrate_kbps，
         // convert_h265.bat 同款：低码率源不膨胀，高码率源不浪费）

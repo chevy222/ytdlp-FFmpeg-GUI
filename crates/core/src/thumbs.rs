@@ -1,8 +1,12 @@
 //! 封面缩略图：URL 解析结果下载 / 本地文件与下载产物抽帧。
 //! 统一落在 `<exe 同级>\config\cache\thumbs\<id>.jpg`，前端经 asset 协议展示。
 
-use crate::exec::{ChildGuard, Tool, ToolResolver};
+use crate::exec::{run_capture_deadline, Tool, ToolResolver};
 use std::path::{Path, PathBuf};
+
+/// 缩略图相关 ffmpeg 命令的墙钟上限（与本地探测同源：损坏容器/网络盘上的文件
+/// 会让"看着很快"的抽帧命令永久挂住，而调用点在解析/下载收尾链路上）。
+const THUMB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// 从输出目录收集 yt-dlp `--write-thumbnail` 写出的封面文件。
 ///

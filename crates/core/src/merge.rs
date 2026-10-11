@@ -182,8 +182,11 @@ fn transcode_segment(
         input.to_string_lossy().into_owned(),
         "-map".into(),
         main_map,
+        // 只保留主音轨：模式 B 的触发条件之一正是各段音轨数不一致（same_parameters），
+        // 若这里 `-map 0:a?` 保留全部音轨，段与段的流布局会不同，随后的 concat
+        // `-c copy` 会因 "parameters do not match" 直接失败。统一为单音轨保证结构一致。
         "-map".into(),
-        "0:a?".into(),
+        "0:a:0?".into(),
         "-vf".into(),
         // 偶数对齐：宽度 -2 自动取偶，高度 min() 封顶 + force_divisible_by=2（§11.5）
         format!(
