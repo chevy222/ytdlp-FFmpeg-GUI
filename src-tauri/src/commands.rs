@@ -896,10 +896,10 @@ fn run_probe(app: AppHandle, id: String) {
                     let video_url = item.url.clone();
                     // 本地文件优先取内嵌封面（元数据），与桌面缩略图同源
                     let resolver2 = resolver.clone();
-                    // 缩略图域名（i.ytimg.com 等）按站点分流解析代理，而非全局 proxy_url
-                    // ——用户可能给 youtube.com 勾了代理但 i.ytimg.com 未勾；
-                    // 无代理时跳过 curl 直连（TUN 用户直连必超时 10s），直接 yt-dlp 兜底
-                    let thumb_proxy = thumb_url
+                    // 缩略图代理按视频页面 URL 解析（而非缩略图 URL i.ytimg.com）——
+                    // 用户勾的是 youtube.com，i.ytimg.com 不匹配；缩略图属于该视频，
+                    // 应跟视频走同一代理。
+                    let thumb_proxy = video_url
                         .as_deref()
                         .and_then(|u| network.resolve_proxy(u));
                     let thumb_tmp_root = state.paths.temp_dir();
