@@ -151,15 +151,19 @@ pub struct NetworkConfig {
     pub site_proxy: std::collections::HashMap<String, bool>,
 }
 
+/// 未填写代理地址时使用的默认代理（本地常见 SOCKS5 端口）。
+///
+/// 语义：勾了"走代理"就必须有代理可用，否则等于白勾；留空时回退到本默认值。
+/// deno（PO Token 生成）等子进程不走 Windows 系统代理/TUN，也依赖这里给出显式地址。
+pub const DEFAULT_PROXY: &str = "socks5://127.0.0.1:10808";
+
 impl NetworkConfig {
     /// 站点分流解析：返回该 URL 应使用的代理地址。
-    /// 白名单规则：仅分流中勾选（=走代理）的站点使用代理，其余一律直连；
-    /// 代理地址为空时全部直连。多条站点规则命中同一 host 时取**最长标签**
-    /// （最具体优先），避免 HashMap 随机迭代导致同 URL 结果不定。
+    /// 白名单规则：仅分流中勾选（=走代理）的站点使用代理，其余一律直连。
+    /// **代理地址留空时回退 [`DEFAULT_PROXY`]**（见 [`Self::effective_proxy`]）。
+    /// 多条站点规则命中同一 host 时取**最长标签**（最具体优先），避免 HashMap
+    /// 随机迭代导致同 URL 结果不定。
     pub fn resolve_proxy(&self, url: &str) -> Option<String> {
-        if self.proxy_url.is_empty() {
-            return None;
-        }
         let host = host_from_url(url)?;
         // 短链接域名映射到主站：youtu.be → youtube.com（用户只需给主站勾代理，
         // 短链接自动继承主站的代理设置）。
@@ -173,8 +177,17 @@ impl NetworkConfig {
             .filter(|(site, _)| site_matches(site, &host) || site_matches(site, &canonical))
             .max_by_key(|(site, _)| site.trim().trim_start_matches('.').len());
         match best {
-            Some((_, true)) => Some(self.proxy_url.clone()),
+            Some((_, true)) => Some(self.effective_proxy()),
             _ => None,
+        }
+    }
+
+    /// 生效的代理地址：`proxy_url` 留空（或纯空白）时回退 [`DEFAULT_PROXY`]。
+    pub fn effective_proxy(&self) -> String {
+        if self.proxy_url.trim().is_empty() {
+            DEFAULT_PROXY.to_string()
+        } else {
+            self.proxy_url.clone()
         }
     }
 }
@@ -357,11 +370,38 @@ mod tests {
             None
         );
         assert_eq!(n.resolve_proxy("https://www.youtube.com/watch?v=abc"), None);
-        // 代理地址为空：全部直连
+        // 未配置任何分流站点：即使代理地址为空也不会有代理（没有站点勾选"走代理"）
         assert_eq!(
             NetworkConfig::default().resolve_proxy("https://www.bilibili.com/video/BV1xx"),
             None
         );
+    }
+
+    #[test]
+    fn resolve_proxy_falls_back_to_default_when_url_empty() {
+        // 勾了"走代理"但代理地址留空 → 回退默认代理（否则勾了等于白勾）
+        let mut n = NetworkConfig::default();
+        n.site_proxy.insert("youtube.com".into(), true);
+        assert_eq!(n.proxy_url, "");
+        assert_eq!(n.effective_proxy(), DEFAULT_PROXY);
+        assert_eq!(
+            n.resolve_proxy("https://www.youtube.com/watch?v=abc"),
+            Some(DEFAULT_PROXY.to_string())
+        );
+        // 纯空白也视作未填
+        n.proxy_url = "   ".into();
+        assert_eq!(
+            n.resolve_proxy("https://www.youtube.com/watch?v=abc"),
+            Some(DEFAULT_PROXY.to_string())
+        );
+        // 显式填写优先于默认值
+        n.proxy_url = "http://127.0.0.1:7890".into();
+        assert_eq!(
+            n.resolve_proxy("https://www.youtube.com/watch?v=abc"),
+            Some("http://127.0.0.1:7890".to_string())
+        );
+        // 未勾选"走代理"的站点仍直连（即便代理地址为空）
+        assert_eq!(n.resolve_proxy("https://vimeo.com/1"), None);
     }
 
     #[test]

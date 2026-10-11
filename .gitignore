@@ -22,3 +22,8 @@ src-tauri/gen/schemas/
 .vscode/
 *.swp
 .workbuddy
+
+# 工具/平台生成的分享包与临时上传（非项目产物，勿入库）
+.trae-html-share-packages/
+/uploads/
+.uploads/

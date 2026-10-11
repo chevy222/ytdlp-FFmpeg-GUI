@@ -215,8 +215,9 @@ pub async fn download_tool(
     let flag = state.register_cancel(&cancel_key);
     let tools_dir = state.paths.tools_dir();
     // 工具维护流量（github.com / gyan.dev）走应用代理：这两个域通常不在用户的
-    // "下载站点分流"白名单里，但被墙时依赖下载/更新必须仍可用。代理为空则直连。
-    let proxy = state.config.lock().network.proxy_url.clone();
+    // "下载站点分流"白名单里，但被墙时依赖下载/更新必须仍可用。
+    // 代理地址留空则回退默认代理（见 NetworkConfig::effective_proxy）。
+    let proxy = state.config.lock().network.effective_proxy();
     let dl = ToolDownloader::new(tools_dir.clone(), state.paths.temp_dir().join("tool_dl"))
         .with_proxy(Some(proxy));
     let ctx = ToolInstallCtx {
@@ -3083,7 +3084,7 @@ pub async fn check_update(app: AppHandle) -> CmdResult<Option<UpdateInfo>> {
     let (enabled, proxy) = {
         let state = app.state::<AppState>();
         let c = state.config.lock();
-        (c.general.check_update, c.network.proxy_url.clone())
+        (c.general.check_update, c.network.effective_proxy())
     };
     if !enabled {
         return Ok(None);
@@ -3114,7 +3115,7 @@ pub async fn get_version_info(app: AppHandle) -> CmdResult<UpdateInfo> {
     let proxy = {
         let state = app.state::<AppState>();
         let c = state.config.lock();
-        c.network.proxy_url.clone()
+        c.network.effective_proxy()
     };
     let current = env!("CARGO_PKG_VERSION").to_string();
     // curl 最长 10s：离开 async worker（A6），并带应用代理
