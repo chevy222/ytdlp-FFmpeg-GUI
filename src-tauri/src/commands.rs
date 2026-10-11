@@ -778,12 +778,6 @@ fn run_probe(app: AppHandle, id: String) {
                 it.percent = 0.0;
                 it.error = None;
                 it.push_log("解析完成，已就绪".to_string());
-                if url_src {
-                    let heights: Vec<String> = it.meta.download_formats.iter()
-                        .map(|f| format!("{}", f.height.unwrap_or(0)))
-                        .collect();
-                    it.push_log(format!("可用格式：{} 项（高度：{}）", it.meta.download_formats.len(), heights.join(", ")));
-                }
             });
                 // 封面缩略图（异步生成，不阻塞就绪）。
                 // spawn_blocking：里面是 curl 网络下载 + ffmpeg 子进程，全是阻塞调用，
