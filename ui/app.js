@@ -1005,6 +1005,17 @@ function refreshDeps(){
   });
 }
 function saveSettings(){
+  // 保存前从 DOM 重新收集所有输入框的值，不依赖 input/change 事件实时同步——
+  // 用户在代理地址输入框粘贴后直接点"保存"，最后一次 input 事件可能尚未触发，
+  // 导致 S.config 里仍是旧值（空），而输入框里显示的新值没有被保存。
+  document.querySelectorAll('#settingsModal [data-cfg]').forEach(el=>{
+    const path=el.dataset.cfg;
+    let val;
+    if(el.type==='checkbox')val=el.checked;
+    else if(el.type==='number')val=el.value===''?null:Number(el.value);
+    else val=el.value;
+    setCfg(path,val);
+  });
   INVOKE('save_config',{config:S.config}).then(()=>{toast('设置已保存');closeSettings();}).catch(err=>toast(err));
 }
 
