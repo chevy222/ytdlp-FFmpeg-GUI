@@ -12,6 +12,8 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
+
 use crate::exec::{decode_text, display_command, run_capture_deadline, Tool, ToolResolver};
 use crate::{CoreError, Result};
 
@@ -63,6 +65,54 @@ impl CachedPot {
 
     pub fn is_fresh(&self, now: Instant) -> bool {
         now < self.expires_at
+    }
+
+    /// 序列化为磁盘缓存结构（Instant 不能直接序列化，用 epoch 毫秒）。
+    pub fn to_disk(&self) -> PotCacheDisk {
+        let now = Instant::now();
+        let remaining = self.expires_at.saturating_duration_since(now);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        PotCacheDisk {
+            po_token: self.pot.po_token.clone(),
+            visitor_data: self.pot.visitor_data.clone(),
+            ttl_secs: self.pot.ttl_secs,
+            expires_at_ms: now_ms + remaining.as_millis() as u64,
+        }
+    }
+}
+
+/// 磁盘缓存结构（可序列化，存 config/cache/potoken.json）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PotCacheDisk {
+    pub po_token: String,
+    pub visitor_data: String,
+    pub ttl_secs: u64,
+    /// 过期时刻（epoch 毫秒）；0 或已过期则丢弃。
+    pub expires_at_ms: u64,
+}
+
+impl PotCacheDisk {
+    /// 从磁盘缓存恢复（过期返回 None）。
+    pub fn to_cached(&self) -> Option<CachedPot> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis() as u64;
+        if self.expires_at_ms <= now_ms {
+            return None;
+        }
+        let expires_in_ms = self.expires_at_ms - now_ms;
+        Some(CachedPot {
+            pot: Pot {
+                visitor_data: self.visitor_data.clone(),
+                po_token: self.po_token.clone(),
+                ttl_secs: self.ttl_secs,
+            },
+            expires_at: Instant::now() + Duration::from_millis(expires_in_ms),
+        })
     }
 }
 
@@ -215,9 +265,10 @@ pub fn generate(
     parse_output(&decode_text(&out.stdout))
 }
 
-/// 生成器的可读命令行（日志用）。
+/// 生成器的可读命令行（日志用）。proxy 自动转 http（与实际执行一致）。
 pub fn display_invocation(script: &Path, proxy: Option<&str>) -> String {
-    display_command("deno", &deno_args(script, proxy))
+    let http_proxy = proxy.map(to_http_proxy);
+    display_command("deno", &deno_args(script, http_proxy.as_deref()))
 }
 
 #[cfg(test)]

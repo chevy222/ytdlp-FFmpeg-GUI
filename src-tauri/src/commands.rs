@@ -796,16 +796,27 @@ fn resolve_potoken(
     log_line(potoken::display_invocation(&script, proxy));
     match potoken::generate(resolver, &script, proxy, potoken::GENERATE_TIMEOUT) {
         Ok(pot) => {
-            let po = format!("web.gvs+{}", pot.po_token);
-            let vd = pot.visitor_data.clone();
-            *state.potoken.lock() =
-                Some(ytdlp_core::potoken::CachedPot::new(pot, std::time::Instant::now()));
-            log_line("PO Token 已自动生成".to_string());
+            let cached = ytdlp_core::potoken::CachedPot::new(pot, std::time::Instant::now());
+            // 写磁盘缓存（重启后复用，省 deno 冷启动）
+            let _ = std::fs::create_dir_all(state.paths.cache_dir());
+            if let Ok(v) = serde_json::to_string_pretty(&cached.to_disk()) {
+                let _ = std::fs::write(state.paths.cache_dir().join("potoken.json"), v);
+            }
+            let po = format!("web.gvs+{}", cached.pot.po_token);
+            let vd = cached.pot.visitor_data.clone();
+            *state.potoken.lock() = Some(cached);
+            log_line("PO Token 已自动生成并缓存到磁盘".to_string());
             (Some(po), Some(vd))
         }
         Err(e) => {
+            let hint = if proxy.map(|p| p.starts_with("socks5")).unwrap_or(false) {
+                "；若报 fetch failed，可能是 SOCKS 端口不支持 HTTP 协议，请改用 Clash 混合端口（如 http://127.0.0.1:7890）"
+            } else {
+                ""
+            };
             log_line(format!(
-                "PO Token 自动生成失败（{e}）；继续执行，可能触发 YouTube 风控"
+                "PO Token 自动生成失败（{e}{}）；继续执行，可能触发 YouTube 风控",
+                hint
             ));
             (None, None)
         }

@@ -143,6 +143,10 @@ impl Default for DependenciesConfig {
 }
 
 /// 网络段（§3.6 网络分组：代理地址 + 站点分流）。
+///
+/// `proxy_url` 默认为空字符串（derive Default），但 [`Self::effective_proxy`]
+/// 在空值时回退到 [`DEFAULT_PROXY`]。这样设计是为了：用户清空代理地址=用默认本地代理，
+/// 而不是直连（国内用户配了代理软件但忘了填地址时仍然能用）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NetworkConfig {
