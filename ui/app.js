@@ -1016,7 +1016,12 @@ function saveSettings(){
     else val=el.value;
     setCfg(path,val);
   });
-  INVOKE('save_config',{config:S.config}).then(()=>{toast('设置已保存');closeSettings();}).catch(err=>toast(err));
+  INVOKE('save_config',{config:S.config}).then(()=>{
+    // 临时调试：确认代理地址是否真正保存
+    const p=S.config.network&&S.config.network.proxy_url||'(空)';
+    toast('设置已保存，代理地址：'+p);
+    closeSettings();
+  }).catch(err=>toast(err));
 }
 
 // ===== 初始化 =====
