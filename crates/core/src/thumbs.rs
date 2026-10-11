@@ -121,20 +121,18 @@ pub fn extract_cover(
     on_log(crate::exec::display_command("ffmpeg", &args));
     let mut cmd = resolver.command(Tool::Ffmpeg).map_err(|e| e.to_string())?;
     cmd.args(&args);
-    cmd.stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped());
-    let child = ChildGuard::spawn(&mut cmd).map_err(|e| e.to_string())?;
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    if out.status.success() && dest.is_file() {
-        return Ok(true);
+    // 带截止时间：坏文件/网络盘上 ffmpeg 可能长期不出结果，而本函数在解析/下载
+    // 收尾链路上同步执行（与 probe 的 PROBE_TIMEOUT 同口径）。
+    match run_capture_deadline(cmd, THUMB_TIMEOUT) {
+        Ok(_) if dest.is_file() => Ok(true),
+        Ok(_) => Ok(false),
+        Err(e) => {
+            // 取内嵌封面失败不算错误（可能本就没有封面流）：交给调用方回退抽帧，
+            // 但把原因写进日志，别让"回退"变成无法解释的行为
+            on_log(format!("内嵌封面提取失败（回退抽帧）：{e}"));
+            Ok(false)
+        }
     }
-    // 取内嵌封面失败不算错误（可能本就没有封面流）：交给调用方回退抽帧，
-    // 但把 ffmpeg 的报错写进日志，别让"回退"变成无法解释的行为
-    let detail = crate::exec::decode_text(&out.stderr);
-    if !detail.trim().is_empty() {
-        on_log(format!("内嵌封面提取失败（回退抽帧）：{}", detail.trim()));
-    }
-    Ok(false)
 }
 
 /// 缩略图统一入口：**优先内嵌封面**（元数据），没有封面流才抽帧。
@@ -177,15 +175,11 @@ pub fn extract_thumb(
     on_log(crate::exec::display_command("ffmpeg", &args));
     let mut cmd = resolver.command(Tool::Ffmpeg).map_err(|e| e.to_string())?;
     cmd.args(&args);
-    // stderr 必须 pipe：未 pipe 时 wait_with_output 拿到的 stderr 恒为空，
-    // 报错只剩"抽帧失败："后面什么都没有
-    cmd.stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped());
-    let child = ChildGuard::spawn(&mut cmd).map_err(|e| e.to_string())?;
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    if !out.status.success() || !dest.is_file() {
-        let detail = crate::exec::decode_text(&out.stderr);
-        return Err(format!("抽帧失败：{}", detail.trim()));
+    // stderr 由 run_capture_deadline 统一 pipe + 排空；非零退出/超时的报错信息
+    // 会带在错误里（不再是"抽帧失败："后面什么都没有）。
+    run_capture_deadline(cmd, THUMB_TIMEOUT).map_err(|e| format!("抽帧失败：{e}"))?;
+    if !dest.is_file() {
+        return Err("抽帧失败：未生成输出文件".into());
     }
     Ok(())
 }

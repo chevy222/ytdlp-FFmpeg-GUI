@@ -283,6 +283,10 @@ pub struct ToolDownloader {
     pub temp_dir: PathBuf,
     /// 取消标志（下载中点"取消"置 true → kill curl）
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// 应用代理地址（设置-网络）。工具维护流量（github.com / gyan.dev）统一走它：
+    /// 这两个域通常不在用户的"下载站点分流"白名单里，而被墙时依赖下载/更新必须仍
+    /// 可用。留空 = 直连（curl 仍会自行读取 HTTP(S)_PROXY 环境变量）。
+    pub proxy: Option<String>,
 }
 
 impl ToolDownloader {
@@ -292,6 +296,20 @@ impl ToolDownloader {
             tools_dir: tools_dir.into(),
             temp_dir: temp_dir.into(),
             cancel: None,
+            proxy: None,
+        }
+    }
+
+    /// 设置应用代理（空串视为未设置）。
+    pub fn with_proxy(mut self, proxy: Option<String>) -> Self {
+        self.proxy = proxy.filter(|p| !p.trim().is_empty());
+        self
+    }
+
+    /// 给 curl 命令附加代理（未配置则不加）。
+    fn apply_proxy(&self, cmd: &mut std::process::Command) {
+        if let Some(p) = &self.proxy {
+            cmd.args(["--proxy", p]);
         }
     }
 
@@ -322,6 +340,7 @@ impl ToolDownloader {
                 let mut cmd = std::process::Command::new("curl");
                 // --max-time：版本查询跑在"下载/更新"的前置判断里，卡住就等于整个按钮无响应
                 cmd.args(["-sS", "--fail", "--max-time", "20", url]);
+                self.apply_proxy(&mut cmd);
                 crate::exec::hide_console(&mut cmd);
                 let out = cmd.output().ok()?;
                 if !out.status.success() {
@@ -347,6 +366,7 @@ impl ToolDownloader {
                     .arg(&head)
                     .args(["-w", "%{url_effective}"])
                     .arg(url);
+                self.apply_proxy(&mut cmd);
                 crate::exec::hide_console(&mut cmd);
                 let out = cmd.output().ok();
                 let _ = std::fs::remove_file(&head);
@@ -364,6 +384,7 @@ impl ToolDownloader {
         let url = kind.sha_url()?;
         let mut cmd = std::process::Command::new("curl");
         cmd.args(["-L", "--fail", "-sS", "--max-time", "20", url]);
+        self.apply_proxy(&mut cmd);
         crate::exec::hide_console(&mut cmd);
         let output = cmd.output().ok()?;
         if !output.status.success() {
@@ -491,6 +512,7 @@ impl ToolDownloader {
         // -sS 已静默进度，出错才输出，短文本不会撑爆管道缓冲。
         cmd.stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped());
+        self.apply_proxy(&mut cmd);
         crate::exec::hide_console(&mut cmd);
         let mut child = cmd.spawn().map_err(|e| format!("无法调用 curl：{e}"))?;
         // curl -sS 自身不输出进度，这里按已写入的字节数估算百分比上报，
@@ -559,6 +581,7 @@ impl ToolDownloader {
     fn remote_size(&self, url: &str) -> Option<u64> {
         let mut cmd = std::process::Command::new("curl");
         cmd.args(["-sIL", "--fail", "--max-time", "20", url]);
+        self.apply_proxy(&mut cmd);
         crate::exec::hide_console(&mut cmd);
         let out = cmd.output().ok()?;
         if !out.status.success() {

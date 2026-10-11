@@ -570,58 +570,23 @@ pub fn tool_version(resolver: &ToolResolver, tool: Tool) -> Option<String> {
     tool_version_at(tool, &resolver.resolve(tool).ok()?)
 }
 
-/// 需要脱敏取值的选项：其**下一个**参数是密钥，展示时必须替换为 `***`。
-/// `--proxy` 的凭据由 [`redact_proxy_credentials`] 单独处理。
-const SECRET_FLAGS: &[&str] = &["--po-token", "--password", "--username", "--proxy-user"];
-
 /// 把程序名与参数拼成一条可读、可复制、可直接粘贴执行的单行命令。
 /// 含空白/引号/空串的参数加双引号并转义内部引号，其余原样。
+///
+/// **如实回显**：不对任何参数做脱敏（代理凭据、PO-Token 等一律原样），
+/// 保证日志里看到的就是真正执行的命令。注意这些内容会随条目日志写入
+/// `config/history.json`，请自行妥善保管该文件。
 pub fn display_command(program: &str, args: &[String]) -> String {
     let mut s = program.to_string();
-    // 敏感选项的值不进日志：条目日志会随 history.json 落盘，凭据一旦写入即泄露
-    let mut redact_next = false;
     for a in args {
-        let shown: String = if redact_next {
-            redact_next = false;
-            "***".to_string()
-        } else if SECRET_FLAGS.contains(&a.as_str()) {
-            redact_next = true;
-            a.clone()
-        } else if let Some((flag, _)) = a.split_once('=') {
-            // `--po-token=xxx` 内联形态：只保留选项名
-            if SECRET_FLAGS.contains(&flag) {
-                format!("{flag}=***")
-            } else {
-                redact_proxy_credentials(a)
-            }
-        } else {
-            // 代理地址带凭据时对 `user:pass@` 脱敏（否则明文进日志/history.json）。
-            // 仅作用于"看起来是带凭据的 URL/参数"（含 `://` 且主机段含 `@`），
-            // 不影响普通路径参数的展示。
-            redact_proxy_credentials(a)
-        };
-        if shown.is_empty() || shown.chars().any(|c| c.is_whitespace() || c == '"') {
-            s.push_str(&format!(" \"{}\"", shown.replace('"', "\\\"")));
+        if a.is_empty() || a.chars().any(|c| c.is_whitespace() || c == '"') {
+            s.push_str(&format!(" \"{}\"", a.replace('"', "\\\"")));
         } else {
             s.push(' ');
-            s.push_str(&shown);
+            s.push_str(a);
         }
     }
     s
-}
-
-/// 把 `scheme://user:pass@host/...` 的凭据段替换为 `***:***@`。
-/// 非 URL、或 URL 无凭据段时原样返回。
-fn redact_proxy_credentials(arg: &str) -> String {
-    let Some((scheme, rest)) = arg.split_once("://") else {
-        return arg.to_string();
-    };
-    // 主机段是 rest 里第一个 '/' 之前的部分；凭据 `user:pass@` 必须落在这段内
-    let host_seg = &rest[..rest.find('/').unwrap_or(rest.len())];
-    if let Some(at) = host_seg.find('@') {
-        return format!("{}://***:***@{}", scheme, &rest[at + 1..]);
-    }
-    arg.to_string()
 }
 
 /// Windows 下隐藏子进程控制台窗口（CREATE_NO_WINDOW），避免 GUI 程序
@@ -1024,36 +989,5 @@ mod tests {
         // 后者由 cookies::decode_cookie_file 按文件形态改判，不能把两边合并成一个函数。
         assert_eq!(std::str::from_utf8(&[0xD6, 0xB5]).unwrap(), "\u{5b5}");
         assert_eq!(decode_text(&[0xD6, 0xB5]), "\u{5b5}");
-    }
-
-    #[test]
-    fn display_command_redacts_secrets_and_proxy_creds() {
-        // 敏感选项的取值（PO-Token 等）不得出现在展示命令里（会随 history.json 落盘）
-        let cmd = display_command(
-            "yt-dlp",
-            &[
-                "--po-token".into(),
-                "SECRET.TOKEN.VALUE".into(),
-                "https://x".into(),
-            ],
-        );
-        assert!(cmd.contains("--po-token ***"), "{cmd}");
-        assert!(!cmd.contains("SECRET.TOKEN.VALUE"), "{cmd}");
-        // 内联形态 --po-token=xxx
-        let cmd = display_command("yt-dlp", &["--po-token=SECRET".into()]);
-        assert_eq!(cmd, "yt-dlp --po-token=***");
-        // 代理凭据仍照旧脱敏，普通参数不受影响
-        let cmd = display_command(
-            "yt-dlp",
-            &[
-                "--proxy".into(),
-                "socks5://u:p@127.0.0.1:1080".into(),
-                "-o".into(),
-                "a.mp4".into(),
-            ],
-        );
-        assert!(cmd.contains("socks5://***:***@127.0.0.1:1080"), "{cmd}");
-        assert!(cmd.contains("a.mp4"), "{cmd}");
-        assert!(!cmd.contains("u:p@"), "{cmd}");
     }
 }
