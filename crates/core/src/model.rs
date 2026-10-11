@@ -69,7 +69,7 @@ impl Status {
 ///
 /// 序列化为裸 `u16`（`transparent`），但**反序列化必须过 [`Self::from_degrees`] 归一**：
 /// 手改/旧版本写入的 `45` 等非法值若被直接带进 ffmpeg filtergraph 会产出错误画面，
-/// 且 `rotate_cw` 的加法会溢出 `u16`。因此这里手写 `Deserialize` 而非 derive。
+/// 因此这里手写 `Deserialize` 而非 derive。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct RotAngle(u16);
@@ -94,16 +94,6 @@ impl RotAngle {
 
     pub fn degrees(self) -> u16 {
         self.0
-    }
-
-    /// 顺时针旋转 90°（saturating：非法反序列化值也不得在此溢出）。
-    pub fn rotate_cw(self) -> Self {
-        Self::from_degrees(self.0.saturating_add(90))
-    }
-
-    /// 逆时针旋转 90°（saturating 同 `rotate_cw`）。
-    pub fn rotate_ccw(self) -> Self {
-        Self::from_degrees(self.0.saturating_add(270))
     }
 }
 
@@ -518,24 +508,6 @@ mod tests {
     }
 
     #[test]
-    fn rot_angle_cw_cycles() {
-        let mut a = RotAngle::ZERO;
-        a = a.rotate_cw();
-        assert_eq!(a.degrees(), 90);
-        a = a.rotate_cw();
-        assert_eq!(a.degrees(), 180);
-        a = a.rotate_cw();
-        assert_eq!(a.degrees(), 270);
-        a = a.rotate_cw();
-        assert_eq!(a.degrees(), 0);
-    }
-
-    #[test]
-    fn rot_angle_ccw() {
-        assert_eq!(RotAngle::ZERO.rotate_ccw().degrees(), 270);
-    }
-
-    #[test]
     fn rot_angle_from_degrees_normalizes() {
         assert_eq!(RotAngle::from_degrees(540).degrees(), 180);
         assert_eq!(RotAngle::from_degrees(135).degrees(), 90);
@@ -790,8 +762,6 @@ mod tests {
         // 越界值不得 panic（from_degrees 内部先归一）
         let big = serde_json::from_str::<RotAngle>("65535").unwrap();
         assert_eq!(big.degrees() % 90, 0);
-        // 归一后的角度做旋转不得溢出
-        assert_eq!(big.rotate_cw().degrees() % 90, 0);
     }
 
     #[test]

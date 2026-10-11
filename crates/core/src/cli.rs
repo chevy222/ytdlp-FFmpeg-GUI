@@ -16,17 +16,6 @@ pub struct CliArgs {
     pub deno_path: Option<String>,
 }
 
-impl CliArgs {
-    /// 是否有任何待执行动作（URL 或路径覆盖）。
-    pub fn has_action(&self) -> bool {
-        !self.urls.is_empty()
-            || self.dir.is_some()
-            || self.cookies.is_some()
-            || self.yt_dlp_path.is_some()
-            || self.deno_path.is_some()
-    }
-}
-
 /// 取下一个参数作为选项值。
 ///
 /// 缺值、空值、以及"值其实是另一个选项"（以 `-` 开头）都视为**缺值且不消耗**该
@@ -117,14 +106,12 @@ mod tests {
         assert_eq!(c.cookies.as_deref(), Some("C:\\c.txt"));
         assert_eq!(c.yt_dlp_path.as_deref(), Some("C:\\tools\\yt-dlp.exe"));
         assert_eq!(c.deno_path.as_deref(), Some("C:\\tools\\deno.exe"));
-        assert!(c.has_action());
     }
 
     #[test]
     fn parse_missing_value_ignored() {
         let c = parse_cli_args(&a(&["--dir"]));
         assert_eq!(c.dir, None);
-        assert!(!c.has_action());
     }
 
     #[test]
@@ -137,17 +124,8 @@ mod tests {
     }
 
     #[test]
-    fn has_action_covers_pure_overrides() {
-        // 只带覆盖项（不带 URL）也是"有动作"：主进程要把 --dir 应用到本实例
-        assert!(parse_cli_args(&a(&["--dir", "D:\\out"])).has_action());
-        assert!(parse_cli_args(&a(&["--deno-path", "C:\\deno.exe"])).has_action());
-        assert!(!parse_cli_args(&a(&["--help"])).has_action());
-    }
-
-    #[test]
     fn parse_empty_input() {
         let c = parse_cli_args(&[]);
         assert!(c.urls.is_empty());
-        assert!(!c.has_action());
     }
 }

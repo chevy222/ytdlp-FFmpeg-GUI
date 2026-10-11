@@ -469,22 +469,9 @@ pub fn run_capture_deadline(mut cmd: Command, timeout: Duration) -> crate::Resul
     Ok(out)
 }
 
-/// 等待非零退出的子进程完成（输出缓冲，供版本查询等短命令）。
-pub fn run_capture(mut cmd: Command) -> crate::Result<Output> {
-    let out = cmd.output().map_err(CoreError::Io)?;
-    if !out.status.success() {
-        return Err(CoreError::ProcessFailed {
-            program: cmd.get_program().to_string_lossy().into_owned(),
-            code: out.status.code(),
-            stderr: decode_text(&out.stderr),
-        });
-    }
-    Ok(out)
-}
-
 /// 运行并捕获输出的便捷封装（工具版本查询、产物校验等短命令）。
 ///
-/// 走 [`run_capture_deadline`] 而不是无超时的 [`run_capture`]：调用点散落在解析/
+/// 走 [`run_capture_deadline`] 而不是无超时的捕获：调用点散落在解析/
 /// 任务线程里，任一处的"短命令"挂住都会连带占死一条链路（被安全软件扫描的 exe、
 /// 网络盘上的探测都真实发生过）。
 pub fn run_tool_capture(
@@ -659,19 +646,6 @@ fn decode_utf16(bytes: &[u8], little_endian: bool) -> String {
         })
         .collect();
     String::from_utf16_lossy(&units)
-}
-
-/// 排空子进程 stderr 并收集为字符串（trim 后返回；失败原因收集用，P2-8）。
-///
-/// 用 `read_to_end` + [`decode_text`] 而不是 `read_to_string`：后者遇非 UTF-8
-/// （中文 Windows 下 yt-dlp/ffmpeg 可能输出 cp936）会整段失败，报错信息连同
-/// 已读到的部分一起丢掉，"失败却不知道为什么"。
-/// 前置条件：进程已退出（否则会一直阻塞到 EOF）。
-pub fn drain_stderr(stderr: &mut std::process::ChildStderr) -> String {
-    use std::io::Read;
-    let mut bytes = Vec::new();
-    let _ = stderr.read_to_end(&mut bytes);
-    decode_text(&bytes).trim().to_string()
 }
 
 #[cfg(test)]
@@ -855,13 +829,13 @@ mod tests {
     }
 
     #[test]
-    fn run_capture_success_and_failure() {
+    fn run_capture_deadline_success_and_failure() {
         let mut cmd = Command::new("sh");
         cmd.args(["-c", "exit 0"]);
-        assert!(run_capture(cmd).is_ok());
+        assert!(run_capture_deadline(cmd, Duration::from_secs(5)).is_ok());
         let mut cmd = Command::new("sh");
         cmd.args(["-c", "echo boom >&2; exit 3"]);
-        let err = run_capture(cmd).unwrap_err();
+        let err = run_capture_deadline(cmd, Duration::from_secs(5)).unwrap_err();
         match err {
             CoreError::ProcessFailed { code, stderr, .. } => {
                 assert_eq!(code, Some(3));

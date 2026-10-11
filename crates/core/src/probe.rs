@@ -209,6 +209,9 @@ impl std::fmt::Display for ProbeFailure {
 /// - `cookies_file`：Netscape 临时文件路径（None 则不带）；
 /// - `cancel`：置位后终止 yt-dlp 并返回 [`ProbeErrorKind::Cancelled`]；
 /// - `on_log`：接收实际执行的完整命令行（条目日志展示用）。
+// 参数较多是"解析入口"的固有形态（工具/URL/Cookie/网络/PO-Token/取消/日志）；
+// 与 merge::run_merge / transcode::run_transcode 同款，统一按项目惯例放行该 lint。
+#[allow(clippy::too_many_arguments)]
 pub fn probe_url(
     resolver: &ToolResolver,
     url: &str,
@@ -317,7 +320,7 @@ pub fn probe_local(
     })?;
     cmd.args(&args);
     // run_capture_deadline 自带"到点杀进程树"的看门狗，并在非零退出时把
-    // stderr 带进错误信息（不再需要手动 drain_stderr）
+    // stderr 带进错误信息（无需再手动排空 stderr）
     let out = crate::exec::run_capture_deadline(cmd, PROBE_TIMEOUT).map_err(|e| ProbeFailure {
         kind: ProbeErrorKind::NotVideo,
         message: format!("ffprobe 探测失败：{e}"),
