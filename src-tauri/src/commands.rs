@@ -2002,6 +2002,7 @@ fn begin_transcode(app: AppHandle, ids: Vec<String>, _upscale: bool) -> CmdResul
 /// 逐集在单个后台线程里**顺序**解析：大合集（数百集）若每集各开线程，
 /// 会瞬间并发起等量 yt-dlp 子进程，打满系统资源并容易触发站点风控；
 /// 顺序解析每集就绪即回显（item:update），体验可接受。
+#[allow(clippy::too_many_arguments)]
 fn expand_playlist(
     app: &AppHandle,
     id: &str,
