@@ -176,6 +176,20 @@ pub fn materialize_script(dir: &Path) -> Result<PathBuf> {
 /// 国内直连必败；npmmirror 无需代理即可访问）。
 pub const NPM_REGISTRY: &str = "https://registry.npmmirror.com";
 
+/// 把 socks5 代理地址转成 HTTP 代理地址（同一端口）。
+/// deno 的 `--proxy` 和 `HTTP_PROXY` 环境变量只支持 HTTP 代理，不支持 SOCKS5；
+/// 用户通常配的是 socks5（yt-dlp 支持），同一端口的 HTTP 代理也能用于 deno
+/// （Clash 混合端口、V2RayN 等默认同一端口支持两种协议）。
+pub fn to_http_proxy(proxy: &str) -> String {
+    if let Some(rest) = proxy.strip_prefix("socks5://") {
+        format!("http://{}", rest)
+    } else if let Some(rest) = proxy.strip_prefix("socks5h://") {
+        format!("http://{}", rest)
+    } else {
+        proxy.to_string()
+    }
+}
+
 /// 运行 deno 生成 PO Token（阻塞；调用方需放在工作线程/阻塞线程）。
 ///
 /// 失败（deno 缺失、网络不可达、YouTube 端变化等）返回 Err，由调用方决定回退。
@@ -185,15 +199,17 @@ pub fn generate(
     proxy: Option<&str>,
     timeout: Duration,
 ) -> Result<Pot> {
-    let args = deno_args(script, proxy);
+    // deno 不支持 socks5，自动转成 http（同一端口）
+    let http_proxy = proxy.map(to_http_proxy);
+    let args = deno_args(script, http_proxy.as_deref());
     let mut cmd = resolver.command(Tool::Deno)?;
     cmd.args(&args);
     // npm 依赖下载走国内镜像（jsdom/bgutils-js 体积大，首次下载几十 MB），
     // 即使配了代理也优先用镜像（国内 CDN 更快）；YouTube API 请求走 --proxy。
     cmd.env("DENO_NPM_REGISTRY", NPM_REGISTRY);
-    if let Some(p) = proxy.filter(|s| !s.is_empty()) {
+    if let Some(p) = http_proxy.filter(|s| !s.is_empty()) {
         // deno 自身的模块下载/缓存也走同一代理（脚本内的 fetch 走 --proxy）
-        cmd.env("HTTP_PROXY", p).env("HTTPS_PROXY", p);
+        cmd.env("HTTP_PROXY", &p).env("HTTPS_PROXY", &p);
     }
     let out = run_capture_deadline(cmd, timeout)?;
     parse_output(&decode_text(&out.stdout))
