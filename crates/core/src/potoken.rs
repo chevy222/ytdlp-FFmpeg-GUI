@@ -172,6 +172,10 @@ pub fn materialize_script(dir: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// 国内 npm 镜像（deno 从 registry.npmjs.org 下载 jsdom/bgutils-js 等依赖时，
+/// 国内直连必败；npmmirror 无需代理即可访问）。
+pub const NPM_REGISTRY: &str = "https://registry.npmmirror.com";
+
 /// 运行 deno 生成 PO Token（阻塞；调用方需放在工作线程/阻塞线程）。
 ///
 /// 失败（deno 缺失、网络不可达、YouTube 端变化等）返回 Err，由调用方决定回退。
@@ -184,6 +188,9 @@ pub fn generate(
     let args = deno_args(script, proxy);
     let mut cmd = resolver.command(Tool::Deno)?;
     cmd.args(&args);
+    // npm 依赖下载走国内镜像（jsdom/bgutils-js 体积大，首次下载几十 MB），
+    // 即使配了代理也优先用镜像（国内 CDN 更快）；YouTube API 请求走 --proxy。
+    cmd.env("DENO_NPM_REGISTRY", NPM_REGISTRY);
     if let Some(p) = proxy.filter(|s| !s.is_empty()) {
         // deno 自身的模块下载/缓存也走同一代理（脚本内的 fetch 走 --proxy）
         cmd.env("HTTP_PROXY", p).env("HTTPS_PROXY", p);
