@@ -2977,7 +2977,8 @@ pub async fn check_update(app: AppHandle) -> CmdResult<Option<UpdateInfo>> {
 pub async fn get_version_info(app: AppHandle) -> CmdResult<UpdateInfo> {
     let proxy = {
         let state = app.state::<AppState>();
-        state.config.lock().network.proxy_url.clone()
+        let c = state.config.lock();
+        c.network.proxy_url.clone()
     };
     let current = env!("CARGO_PKG_VERSION").to_string();
     // curl 最长 10s：离开 async worker（A6），并带应用代理
