@@ -135,6 +135,39 @@ fn strip_media_ext(name: &str) -> String {
     name.to_string()
 }
 
+/// Windows 保留设备名（不分大小写，任意扩展名下均非法）：标题恰为
+/// "NUL"/"CON"/"COM1" 时输出 "NUL.mp4" 会让 ffmpeg 以难以理解的错误失败。
+#[cfg(windows)]
+fn is_reserved_windows_name(name: &str) -> bool {
+    // 取首个 '.' 前的段（"CON.mp4" → "CON"；无 '.' 时整串）
+    let base = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
+    matches!(
+        base.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
+}
+
 /// 文件名清洗（Windows 非法字符 / 截断）。
 pub fn sanitize_filename(s: &str) -> String {
     let cleaned: String = s
@@ -147,10 +180,15 @@ pub fn sanitize_filename(s: &str) -> String {
         .collect();
     let t = cleaned.trim().trim_end_matches('.').to_string();
     if t.is_empty() {
-        "未命名".into()
-    } else {
-        t.chars().take(120).collect()
+        return "未命名".into();
     }
+    let t: String = t.chars().take(120).collect();
+    // 保留设备名规避（Windows）：判定放在截断之后，保证判的就是最终输出名
+    #[cfg(windows)]
+    if is_reserved_windows_name(&t) {
+        return format!("_{t}");
+    }
+    t
 }
 
 fn id_hint(title: &str) -> String {
@@ -999,6 +1037,19 @@ mod tests {
         );
         assert_eq!(sanitize_filename("  "), "未命名");
         assert_eq!(sanitize_filename("abc."), "abc");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sanitize_filename_avoids_reserved_device_names() {
+        // S4：保留设备名在任意扩展名下均非法，ffmpeg 会报难以理解的错误
+        assert_eq!(sanitize_filename("CON"), "_CON");
+        assert_eq!(sanitize_filename("nul.mp4"), "_nul.mp4");
+        assert_eq!(sanitize_filename("COM1.log"), "_COM1.log");
+        assert_eq!(sanitize_filename("aux"), "_aux");
+        // 普通标题与"以保留名开头但不等同"的名字不受影响
+        assert_eq!(sanitize_filename("普通标题.mp4"), "普通标题.mp4");
+        assert_eq!(sanitize_filename("CONTENT.mp4"), "CONTENT.mp4");
     }
 
     #[test]
