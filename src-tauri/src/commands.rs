@@ -2027,14 +2027,17 @@ pub fn set_sections(app: AppHandle, id: String, start: String, end: String) -> C
 /// 批量转码（TC-05：按 设置-转码/通用 默认参数执行，不弹确认窗）。
 #[tauri::command(async)]
 pub fn start_transcode(app: AppHandle, ids: Vec<String>) -> CmdResult<()> {
-    begin_transcode(app, ids, false)
+    begin_transcode(app, ids)
 }
 
 /// 批量放大到 1080P：长边<1920 且 短边<1080 的视频等比放大到不超过 1920×1080，
 /// 已达 1080P 及以上不缩放。其余转码参数同 设置-转码/通用。
 #[tauri::command(async)]
 pub fn start_upscale(app: AppHandle, ids: Vec<String>) -> CmdResult<()> {
-    // 先登记 upscale_ids，run_transcode_task 执行时读取并计算 params.force_scale
+    // 先登记 upscale_ids，run_transcode_task 入口消费后即移除（消费语义）。
+    // 登记与消费之间的每一条退出路径（预检跳过 / 排队中被取消 / 任务提前返回）
+    // 都必须移除集合条目：残留的登记会让之后对同一 id 的普通转码被误放大
+    // （历史 bug；清理点见 begin_transcode / cancel_item，消费点见 run_transcode_task）
     {
         let state = app.state::<AppState>();
         let mut set = state.upscale_ids.lock();
@@ -2042,11 +2045,11 @@ pub fn start_upscale(app: AppHandle, ids: Vec<String>) -> CmdResult<()> {
             set.insert(id.clone());
         }
     }
-    begin_transcode(app, ids, true)
+    begin_transcode(app, ids)
 }
 
 /// 转码入口（start_transcode / start_upscale 共用）。
-fn begin_transcode(app: AppHandle, ids: Vec<String>, _upscale: bool) -> CmdResult<()> {
+fn begin_transcode(app: AppHandle, ids: Vec<String>) -> CmdResult<()> {
     let state = app.state::<AppState>();
     if ids.is_empty() {
         return Err("未选择条目".into());
@@ -2104,8 +2107,16 @@ fn begin_transcode(app: AppHandle, ids: Vec<String>, _upscale: bool) -> CmdResul
     for updated in &updated_items {
         let _ = app.emit("item:update", updated);
     }
-    for (id, msg) in skipped {
-        log_item(&app, &id, msg);
+    for (id, msg) in &skipped {
+        log_item(&app, id, msg.as_str());
+    }
+    // 放大意图登记与消费之间：被跳过的条目永远不会进入任务线程，必须在这里把
+    // upscale_ids 里的登记移除，否则残留的 true 会让后续普通转码被误放大
+    {
+        let mut set = state.upscale_ids.lock();
+        for (id, _) in &skipped {
+            set.remove(id);
+        }
     }
     if to_run.is_empty() {
         return Err("没有可转码的条目（需要已解析的本地文件）".into());
@@ -2199,6 +2210,10 @@ fn run_transcode_task(app: AppHandle, id: String) {
         app: app.clone(),
         id: id.clone(),
     };
+    // 放大意图在入口一次性消费：无论后面走哪条提前返回路径（条目被删 /
+    // 无本地文件），登记都已清除；排队中被取消的任务根本进不到这里，由
+    // cancel_item 负责清理。残留登记会让后续普通转码被误放大到 1080P。
+    let upscale = state.upscale_ids.lock().remove(&id);
     // 锁纪律（§11.15）：history 锁内只 clone 条目，config/cli/default_output_dir
     // 一律出锁后再取（P1-3：持 history 锁期间嵌套取 config/cli 锁会让 update_item 卡顿）。
     //
@@ -2260,11 +2275,10 @@ fn run_transcode_task(app: AppHandle, id: String) {
             ),
         );
     }
-    // 放大到 1080P：从 upscale_ids 读取标记，读完即移除。
+    // 放大到 1080P：upscale 标记已在函数入口一次性消费（见上）。
     // 在 Rust 侧用 ffprobe 已探测的分辨率计算固定目标宽高（偶数对齐），
     // 不用 ffmpeg 表达式——表达式里 if()/min() 的逗号会被 filtergraph 解析器
     // 误判为滤波器分隔符（scale_qsv 选项值的单引号不转义逗号），导致 EXIT=127。
-    let upscale = state.upscale_ids.lock().remove(&id);
     let rot_deg = item.rot_angle.degrees();
     let force_scale = if upscale {
         match (meta.width, meta.height) {
@@ -2481,11 +2495,22 @@ pub fn cancel_item(app: AppHandle, win: tauri::WebviewWindow, id: String) -> Cmd
     ensure_main_window(&win)?;
     let state = app.state::<AppState>();
 
+    // 取消即放弃任何待执行的放大意图：排队中被取消的放大任务永远不会进到
+    // 任务线程消费 upscale_ids，不清掉就会让之后对同一 id 的普通转码被误放大
+    state.upscale_ids.lock().remove(&id);
+
     // 合并作业要整批处理：一次合并只把**锚点条目**提交给队列，其余参与条目既不在
     // 等待队列也不在运行集合里。单条取消若不扩成整批，那些条目会永久停在"合并中"
     // （既没有执行体会碰它们，也不是终态、retry 不接受），merge_jobs 里的作业也无人清理。
     let merge_job = state.merge_jobs.lock().get(&id).cloned();
     if let Some(job) = merge_job {
+        // 参与条目同样放弃待执行的放大意图（整批取消/执行都不经过各自的放大登记）
+        {
+            let mut set = state.upscale_ids.lock();
+            for jid in &job.ids {
+                set.remove(jid);
+            }
+        }
         let anchor = job
             .ids
             .first()

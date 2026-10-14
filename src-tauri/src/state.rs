@@ -52,7 +52,9 @@ pub struct AppState {
     /// 合并面板参数（入队等待时保存；低频操作，仅面板内配置，不落 config）
     pub merge_jobs: Mutex<HashMap<String, crate::commands::MergeJob>>,
     /// 放大到 1080P 的任务 id 集合：start_upscale 写入，run_transcode_task
-    /// 读取后计算 TranscodeParams.force_scale（固定目标分辨率），执行完移除。
+    /// 入口消费后移除。**消费语义**：登记与消费之间的所有退出路径
+    /// （begin_transcode 预检跳过 / cancel_item 取消）都必须移除登记，
+    /// 否则残留条目会让后续普通转码被误放大到 1080P。
     pub upscale_ids: Mutex<HashSet<String>>,
     /// CLI 本次调用级覆盖（--dir/--cookies/--yt-dlp-path/--deno-path）
     pub cli: Mutex<CliOverrides>,
