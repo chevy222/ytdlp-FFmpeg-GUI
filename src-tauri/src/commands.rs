@@ -541,11 +541,25 @@ fn fetch_thumb_ytdlp(
     let mut cmd = resolver.command(ytdlp_core::exec::Tool::YtDlp).map_err(|e| e.to_string())?;
     cmd.args(&args);
     ytdlp_core::exec::hide_console(&mut cmd);
-    let output = cmd.output().map_err(|e| format!("启动 yt-dlp 失败：{e}"))?;
-    if !output.status.success() {
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-        let detail = ytdlp_core::exec::decode_text(&output.stderr);
-        return Err(format!("yt-dlp 缩略图下载失败：{}", detail.trim()));
+    // 总超时兜底：--socket-timeout 只管读超时，管不了"连上之后不产数据"的挂起；
+    // 与全项目其它子进程调用同口径（60s 量级）。run_capture_deadline 在非零
+    // 退出时会把 stderr 带进错误信息，无需再手动判退出码。
+    let output = match ytdlp_core::exec::run_capture_deadline(cmd, std::time::Duration::from_secs(60))
+    {
+        Ok(out) => out,
+        Err(CoreError::ProcessFailed { stderr, .. }) => {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            let detail = stderr.trim();
+            return Err(if detail.is_empty() {
+                "yt-dlp 缩略图下载失败".to_string()
+            } else {
+                format!("yt-dlp 缩略图下载失败：{detail}")
+            });
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return Err(format!("yt-dlp 缩略图下载失败：{e}"));
+        }
     }
     // yt-dlp 写出的封面扩展名可能是 webp/jpg/jpeg/png，找到第一个文件即可
     let thumb_file = std::fs::read_dir(&tmp_dir)
