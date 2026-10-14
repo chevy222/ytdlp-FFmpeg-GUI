@@ -149,6 +149,10 @@ fn concat_copy(
 }
 
 /// 模式 B 单段统一转码（H.265 跟随编码器、分辨率统一、音频 aac 48k 立体声）。
+///
+/// `duration`：本段时长（秒），用于把 ffmpeg `out_time_us` 换算成段内百分比；
+/// 调用方（merge_unified）已备好按段时长加权的区间映射，这里必须把时长传下去，
+/// 传 0.0 会让 `run_piped_progress` 的进度换算整体跳过、映射成为死代码。
 #[allow(clippy::too_many_arguments)]
 fn transcode_segment(
     resolver: &ToolResolver,
@@ -157,6 +161,7 @@ fn transcode_segment(
     main_idx: Option<u32>,
     encoder_mode: &str,
     target_h: u32,
+    duration: f64,
     cancel: &Arc<AtomicBool>,
     on_progress: &mut dyn FnMut(f32),
     on_log: &mut dyn FnMut(String),
@@ -219,7 +224,7 @@ fn transcode_segment(
     args.push(out.to_string_lossy().into_owned());
 
     on_log(format!("统一参数转码：{}", input.display()));
-    run_piped_progress(resolver, args, cancel, 0.0, on_progress, on_log)?;
+    run_piped_progress(resolver, args, cancel, duration, on_progress, on_log)?;
     if !out.exists() {
         return Err(CoreError::ProcessFailed {
             program: "ffmpeg".into(),
@@ -362,6 +367,7 @@ fn merge_unified(
             metas[i].video_stream_index,
             &params.encoder_mode,
             target_h,
+            d,
             cancel,
             &mut prog,
             on_log,
