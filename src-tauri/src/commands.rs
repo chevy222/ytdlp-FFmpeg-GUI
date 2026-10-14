@@ -2885,32 +2885,50 @@ pub fn delete_cookie(app: AppHandle, win: tauri::WebviewWindow, host: String) ->
 pub async fn probe_dependencies(app: AppHandle) -> CmdResult<Vec<ToolStatus>> {
     let state = app.state::<AppState>();
     let resolver = state.resolver();
-    // 每个工具要起子进程取版本（yt-dlp --version / ffmpeg -version …，秒级 × 4），
-    // 放 blocking 线程，避免占住 async worker（A6）。
+    // 每个工具要起子进程取版本（yt-dlp --version / ffmpeg -version …，各自带
+    // 截止时间），放 blocking 线程，避免占住 async worker（A6）。
     tauri::async_runtime::spawn_blocking(move || {
-        let mut out = Vec::new();
-        for tool in [
+        // 四个工具并行探测：串行时病态环境下（杀软扫描/网络盘）依赖页最坏要
+        // 等 4×截止时间；并行后最坏约等于单次的截止时间
+        let handles: Vec<_> = [
             ytdlp_core::exec::Tool::YtDlp,
             ytdlp_core::exec::Tool::Ffmpeg,
             ytdlp_core::exec::Tool::Ffprobe,
             ytdlp_core::exec::Tool::Deno,
-        ] {
-            let resolved = resolver.resolve(tool);
-            let (path, version, ok) = match &resolved {
-                Ok(p) => {
-                    let v = ytdlp_core::exec::tool_version(&resolver, tool);
-                    (Some(p.to_string_lossy().into_owned()), v, true)
+        ]
+        .into_iter()
+        .map(|tool| {
+            let resolver = resolver.clone();
+            std::thread::spawn(move || {
+                let resolved = resolver.resolve(tool);
+                let (path, version, ok) = match &resolved {
+                    Ok(p) => {
+                        let v = ytdlp_core::exec::tool_version(&resolver, tool);
+                        (Some(p.to_string_lossy().into_owned()), v, true)
+                    }
+                    Err(_) => (None, None, false),
+                };
+                ToolStatus {
+                    tool: tool.name().to_string(),
+                    path,
+                    version,
+                    ok,
                 }
-                Err(_) => (None, None, false),
-            };
-            out.push(ToolStatus {
-                tool: tool.name().to_string(),
-                path,
-                version,
-                ok,
-            });
-        }
-        Ok(out)
+            })
+        })
+        .collect();
+        // 按原工具顺序汇总；线程 panic（理论上不可达）时给该工位一个占位
+        Ok(handles
+            .into_iter()
+            .map(|h| {
+                h.join().unwrap_or_else(|_| ToolStatus {
+                    tool: "探测线程异常".into(),
+                    path: None,
+                    version: None,
+                    ok: false,
+                })
+            })
+            .collect())
     })
     .await
     .map_err(|e| format!("依赖自检任务异常：{e}"))?
