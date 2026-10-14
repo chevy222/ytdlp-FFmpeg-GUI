@@ -883,7 +883,8 @@ fn run_transcode_once(
         }
     })?;
 
-    on_progress(100.0);
+    // 进度 100% 只在真正成功时上报：失败/取消的层级尝试若先报 100%，UI 会
+    // 出现"100% → 失败"或层级回落时"100% → 下一层级从低百分比往上爬"的回跳
     if outcome.killed || cancel.load(Ordering::Relaxed) {
         // 取消路径的半成品与占位由守卫清理
         return Err(CoreError::Cancelled);
@@ -923,6 +924,7 @@ fn run_transcode_once(
     on_log(format!("转码完成：{}", out.display()));
     // 校验通过的真实产出：解除占位清理
     placeholder.disarm();
+    on_progress(100.0);
     Ok(out)
 }
 
