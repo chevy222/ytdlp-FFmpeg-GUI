@@ -2770,6 +2770,13 @@ pub fn save_config(app: AppHandle, win: tauri::WebviewWindow, mut config: AppCon
     // 越界值会一路流到任务线程里（例如负的 max_gain_db 会让 f32::clamp 直接 panic，
     // 而 panic 发生在任务线程 → 条目卡死 + 并发额度永久少一格）
     config.sanitize();
+    // 依赖路径变更即重置转码层级锁定：用户换了一个有无 QSV 不同的 ffmpeg
+    // 构建后，旧的进程级锁定结论要等到重启才失效（保存设置时主动清掉，
+    // 最坏从头试一层；编码器探测有 TTL 缓存兜底）
+    let deps_changed = {
+        let cur = state.config.lock();
+        cur.dependencies != config.dependencies
+    };
     {
         let mut cur = state.config.lock();
         *cur = config.clone();
@@ -2777,6 +2784,9 @@ pub fn save_config(app: AppHandle, win: tauri::WebviewWindow, mut config: AppCon
     let path = state.paths.config_file();
     let _ = std::fs::create_dir_all(state.paths.config_dir());
     config.save(&path).map_err(err_string)?;
+    if deps_changed {
+        transcode::reset_locked_tier();
+    }
     // 并发上限即时生效：调高并发时若有任务在排队，立刻放行（A4）。
     // 返回本次提升释放出的、应马上启动的等待任务 id 列表。
     let to_launch = state

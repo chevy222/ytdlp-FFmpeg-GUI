@@ -115,7 +115,7 @@ impl GeneralConfig {
 }
 
 /// 依赖段（§3.6 依赖分组：路径输入框留空＝PATH，PO-Token 默认启用）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DependenciesConfig {
     pub yt_dlp_path: Option<String>,

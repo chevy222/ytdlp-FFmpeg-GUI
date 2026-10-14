@@ -37,6 +37,17 @@ fn set_locked_tier(tier: TranscodeTier) {
     }
 }
 
+/// 清除层级锁定（依赖路径/ffmpeg 变更后由保存设置调用）。
+///
+/// 锁定是进程级结论：用户换了一个有无 QSV 不同的 ffmpeg 构建后，旧结论要
+/// 等到重启才失效。保存依赖设置时主动重置，最坏从头试一层（编码器探测有
+/// TTL 缓存兜底，成本一次 `ffmpeg -encoders`）。
+pub fn reset_locked_tier() {
+    if let Some(m) = LOCKED_TIER.get() {
+        *m.lock() = None;
+    }
+}
+
 /// 转码参数（来自 设置-转码/通用/下载 + 条目 rot_angle，TC-05）。
 #[derive(Debug, Clone)]
 pub struct TranscodeParams {
