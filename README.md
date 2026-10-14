@@ -1,10 +1,19 @@
-# 影栈 (ytdlp-FFmpeg-GUI)
+# 🎬 影栈 (ytdlp-FFmpeg-GUI)
+
+![Rust](https://img.shields.io/badge/Rust-1.75+-orange)
+![Tauri](https://img.shields.io/badge/Tauri-v2-blue)
+![Platform](https://img.shields.io/badge/Platform-Windows-0078D4)
+![Single EXE](https://img.shields.io/badge/Single%20EXE-green)
+![License](https://img.shields.io/badge/License-MIT-green)
+![yt-dlp](https://img.shields.io/badge/yt--dlp-latest-red)
 
 **下载 · 转码 · 合并** 融为一体的 Windows 桌面视频工具箱 —— Rust + Tauri v2，绿色便携单 EXE，无安装包、不写注册表。
 
+[快速开始](#-快速开始) · [功能特性](#-功能特性) · [目录结构](#-目录与数据存储exe-同级) · [构建](#-构建) · [技术栈](#-技术栈)
+
 ![影栈主界面](docs/screenshot.png)
 
-## 功能
+## ✨ 功能特性
 
 - **统一列表即工作台**：URL 任务、本地文件、下载产物、转码/合并产物都在同一份列表里，下载 / 转码 / 合并是**作用于条目的动作**，没有分模块页面。行内提供下载 / 转码 / 剪辑 / 取消 / 重试 / 去登录 / 打开目录 / 日志 / 删除；勾选多条后出现批量操作栏（顺逆时针旋转 / 批量转码 / 合并… / 删除），工具栏右侧垃圾桶清空列表。
 - **元数据先行**：条目先以"解析中"入列，解析完成才可操作。
@@ -17,14 +26,14 @@
 - **绿色便携**：所有产生文件都在 exe 同级（`config/` 配置与 Cookie/缓存、`temp/` 任务私有临时目录、`tools/` 工具链），配置与历史以 JSON 原子写；单实例运行（第二个实例把参数转发给已运行实例）。
 - **站点分流代理**：站点白名单——只有勾选"走代理"的站点使用代理，其余一律直连；代理地址为空时全部直连。
 
-## 快速上手
+## 🚀 快速上手
 
 1. **下载**：粘贴视频链接 → 添加 → 自动解析（5 秒倒计时后自动下载，或点"格式选择"手动指定）。需要登录的站点会变"需要登录"，点"去登录"完成后自动重新解析。
 2. **转码**：添加本地文件/目录（支持拖放）→ 解析完变"已就绪"→ 需要的话用封面上的旋转箭头纠正方向 → 勾选 → 批量转码（或行内"转码"）。参数统一在 设置-转码/通用 里配置。
 3. **合并**：勾选多段素材 → 批量操作栏"合并…"→ 排序、选容器/编码器/文件名 → 确认输出。
 4. **设置**：齿轮图标进入——依赖（四个工具路径 + 下载/更新/链接）、网络（代理地址 + 站点分流白名单）、Cookie（列出已保存站点，可删除）、下载（并发分片/重试/仅音频/播放列表/文件名模板/嵌入封面元数据）、转码（分辨率上限/码率封顶/默认编码器/保留封面）、通用（默认输出目录/碰撞策略/音量归一化与增益上限/并发任务数）。依赖页每行"链接"可复制下载地址与构建页——下载慢时可手动下载，再把 exe 路径填进设置。底部状态栏左侧 `运行中 n/并发上限` 显示当前占用并发额度的条目数。
 
-## 目录与数据存储（exe 同级）
+## 📁 目录与数据存储（exe 同级）
 
 ```
 config/     config.json（设置）· history.json（列表/队列/条目日志）· cookies/<host>.txt（站点 Cookie，Netscape 格式）
@@ -43,7 +52,7 @@ logs/       运行日志 logs/app-<日期>.log（按天滚动、保留最近 7 �
 - 可执行文件解析顺序：设置里指定的路径 → exe 同级 `tools\` → 系统 PATH，**前一级取不到自动回退下一级**（首次运行 `tools\` 为空时，PATH 中已安装的工具照常可用）。
 - 依赖页的「下载」固定装到 `tools\`，装完把路径写回设置（之后优先用这份）；「更新」只更新**当前生效的那一份**——设置里填的路径会就地覆盖、托管副本更新 `tools\` 里那份，当前用的是系统 PATH 里的则提示手动更新（不越界改你的安装）。更新前先查有没有新版本（yt-dlp / deno 比版本号，ffmpeg / ffprobe 优先比 gyan.dev release feed 的远端版本与本地版本，安装指纹仅作回退），已是最新会提示"无需更新"。下载中按钮显示"取消 <阶段> <百分比>"（连接 → 下载 → 校验 → 解压 → 安装）；底部状态栏实时显示各工具状态与版本（悬停可看解析到的路径）。
 
-## 构建
+## 🔧 构建
 
 **Windows 本地**（PowerShell 7）：
 
@@ -57,7 +66,7 @@ pwsh ./scripts/build.ps1        # 核心层单测 → Clippy（核心层 + GUI c
 
 **Linux 环境交叉编译 Windows 单 EXE**（cargo-xwin / zig，本地备用通道）：详见 `scripts/cross-build/README.md`。
 
-## 命令行
+## ⌨️ 命令行
 
 ```
 ytdlp-FFmpeg-GUI --url <URL> [--url <URL> ...] [--cookies <path>] [--dir <path>]
@@ -66,7 +75,7 @@ ytdlp-FFmpeg-GUI --url <URL> [--url <URL> ...] [--cookies <path>] [--dir <path>]
 
 裸位置参数按 URL 处理；这些覆盖只对本次调用生效，不写入 config.json。应用未运行则启动执行，已运行则转发给现有实例。
 
-## 技术栈
+## 📊 技术栈
 
 | 层 | 选型 |
 | --- | --- |
@@ -78,7 +87,7 @@ ytdlp-FFmpeg-GUI --url <URL> [--url <URL> ...] [--cookies <path>] [--dir <path>]
 | 内置登录 | WebView2 登录窗 + COM CookieManager 抓取含 HttpOnly 的 Cookie |
 | CI | GitHub Actions（windows-latest） |
 
-## 仓库结构
+## 📂 仓库结构
 
 ```
 crates/core/   平台无关核心层（模型/状态机/配置原子写/历史持久化/探测/下载/转码/合并/工具链，可单测）
@@ -89,12 +98,12 @@ scripts/       build.ps1（本地构建，与 CI 同构）、cross-build/（Linu
 docs/          设计素材（图标源文件）与代码审核报告
 ```
 
-## 实现说明
+## 📝 实现说明
 
 代码实际行为、数据模型、设置项、目录约定以本文件与代码注释为准；改代码前必读的
 外部工具参数约束（yt-dlp / ffmpeg）散见 `crates/core/src/` 各模块头注释。需求
 文档与开发里程碑文档在内部维护，未随本仓库分发。
 
-## License
+## 📄 License
 
 MIT
