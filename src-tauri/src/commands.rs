@@ -2,8 +2,10 @@
 //!
 //! **模块布局**：本文件只保留共享基建（锁/守卫/事件/持久化）与列表、解析、
 //! 登录域；下载/转码/合并三条任务链、工具链、Cookie、设置、杂项按域拆在
-//! `commands/` 子模块，入口在本文件统一 `pub use` 再导出，`commands::X`
-//! 调用路径不变。
+//! `commands/` 子模块。命令经 lib.rs 的 `generate_handler!` 用**定义模块路径**
+//! 注册（`#[tauri::command]` 生成的 `__cmd__X` 伴随项位于定义模块，不随
+//! `pub use` 再导出）；被 Rust 内部按 `commands::X` 引用的非命令项
+//! （`save_cookies_inner` / `MergeJob` / `clear_temp_inner`）在本文件再导出。
 //!
 //! 后台任务用 std::thread + 事件 `item:update`（payload = MediaItem）回推前端；
 //! 关键状态变更才持久化 history.json（进度高频更新只 emit 不落盘）。
@@ -37,16 +39,15 @@ pub mod settings;
 pub mod tools;
 pub mod transcode_task;
 
-// lib.rs 的 generate_handler、login.rs、state.rs 按 `commands::X` 路径引用，
-// 拆分后统一在这里再导出，调用方无需随文件变动改路径。
-pub use cookies::{delete_cookie, list_cookies, save_cookies};
+// 命令本体经 lib.rs 的 generate_handler! 用**定义模块路径**注册：
+// #[tauri::command] 生成的 __cmd__X 隐藏伴随项位于定义模块，pub use 再导出
+// 不会带上它们。这里只再导出被 Rust 内部按 `commands::X` 路径引用的非命令项：
+// - save_cookies_inner：login.rs 登录完成回调直接调用（不走 IPC）
+// - MergeJob：state.rs 合并作业注册表的类型
+// - clear_temp_inner：lib.rs setup 的启动清理
 pub(crate) use cookies::save_cookies_inner;
-pub use download_task::start_download;
-pub use merge_task::{start_merge, MergeJob};
-pub use misc::{check_update, clear_temp, clear_temp_inner, get_version_info, open_url, queue_status};
-pub use settings::{get_config, save_config};
-pub use tools::{cancel_tool_download, download_tool, probe_dependencies, probe_hw_encoders, tool_urls};
-pub use transcode_task::{start_transcode, start_upscale};
+pub use merge_task::MergeJob;
+pub use misc::clear_temp_inner;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -283,11 +284,10 @@ fn fetch_thumb_ytdlp(
     cmd.args(&args);
     ytdlp_core::exec::hide_console(&mut cmd);
     // 总超时兜底：--socket-timeout 只管读超时，管不了"连上之后不产数据"的挂起；
-    // 与全项目其它子进程调用同口径（60s 量级）。run_capture_deadline 在非零
-    // 退出时会把 stderr 带进错误信息，无需再手动判退出码。
-    let output = match ytdlp_core::exec::run_capture_deadline(cmd, std::time::Duration::from_secs(60))
-    {
-        Ok(out) => out,
+    // 与全项目其它子进程调用同口径（60s 量级）。run_capture_deadline 只在退出码
+    // 为 0 时返回 Ok，非零退出的 stderr 由它带进错误信息，无需再手动判退出码。
+    match ytdlp_core::exec::run_capture_deadline(cmd, std::time::Duration::from_secs(60)) {
+        Ok(_) => {}
         Err(CoreError::ProcessFailed { stderr, .. }) => {
             let _ = std::fs::remove_dir_all(&tmp_dir);
             let detail = stderr.trim();

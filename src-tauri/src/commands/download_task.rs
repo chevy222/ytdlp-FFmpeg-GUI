@@ -5,7 +5,7 @@ use ytdlp_core::download::{self, DownloadParams, post_process, run_download};
 use ytdlp_core::model::Status;
 use ytdlp_core::worker::SubmitOutcome;
 use ytdlp_core::{transition, CoreError};
-use super::{CmdResult, SlotGuard, ProgressPayload, update_item, update_progress, transition_in, log_item, log_error_lines, persist, default_output_dir, resolve_cookies, resolve_potoken, ensure_main_window};
+use super::{CmdResult, err_string, SlotGuard, ProgressPayload, update_item, update_progress, transition_in, log_item, log_error_lines, persist, default_output_dir, resolve_cookies, resolve_potoken, ensure_main_window};
 use crate::state::AppState;
 
 #[tauri::command(async)]
