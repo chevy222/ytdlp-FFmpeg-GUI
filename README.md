@@ -1,6 +1,8 @@
-# ytdlp-FFmpeg-GUI（影栈）
+# 影栈 (ytdlp-FFmpeg-GUI)
 
 **下载 · 转码 · 合并** 融为一体的 Windows 桌面视频工具箱 —— Rust + Tauri v2，绿色便携单 EXE，无安装包、不写注册表。
+
+![影栈主界面](docs/screenshot.png)
 
 ## 功能
 
