@@ -13,12 +13,13 @@
 //! 2. 需要 `.await` 拿结果的命令：`#[tauri::command] pub async fn`（注意宏**不带** `(async)`），
 //!    阻塞操作包在 `spawn_blocking(...).await` 里，期间不占用 async worker。
 //!
-//! **硬性约定（A6）**：`#[tauri::command(async)] pub fn` 的函数体内**不得出现** fs / 子进程 /
-//! persist / remove_dir_all 等分钟级阻塞调用——`(async)` 只把命令移出主线程，仍可能占住
-//! tokio 的 async worker（worker 数 ≈ CPU 核数），分钟级阻塞会饿死同文件里真正异步的其它
-//! 命令。凡含 IO / 子进程 / 大序列化 / persist 的命令，统一用「范式 2」：
-//! `pub async fn` + `spawn_blocking(...).await`。已收敛的命令见 `probe_dependencies`、
-//! `probe_hw_encoders`、`clear_temp`、`download_tool`、`add_local`、三处缩略图。
+//! **阻塞调用分流（A6）**：`(async)` 只保证命令不跑在主线程。短 IO（一次 persist 的
+//! fsync、几百字节配置写）在 `(async)` 命令体内直接执行即可——add_url /
+//! start_download / begin_transcode / cancel_item / save_config 等均此口径；
+//! **分钟级**阻塞（子进程、目录递归、大 JSON 序列化、persist 整份 history）
+//! 必须再包一层 `spawn_blocking`，避免占住执行池拖慢同池命令。已收敛的命令见
+//! `probe_dependencies`、`probe_hw_encoders`、`clear_temp`、`download_tool`、
+//! `add_local`、三处缩略图。
 //!
 //! 常见错误：给同步 `pub fn` 加了 `#[tauri::command(async)]` 却又在函数体里 `.await`
 //! （`(async)` 不会把函数变成 async），会直接 E0728 编译失败。
