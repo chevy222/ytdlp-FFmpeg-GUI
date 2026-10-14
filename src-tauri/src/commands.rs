@@ -1118,10 +1118,12 @@ pub fn get_item_log(app: AppHandle, win: tauri::WebviewWindow, id: String) -> Cm
 #[tauri::command(async)]
 pub fn start_download(
     app: AppHandle,
+    win: tauri::WebviewWindow,
     id: String,
     format_id: Option<String>,
     audio_only: bool,
 ) -> CmdResult<()> {
+    ensure_main_window(&win)?;
     let state = app.state::<AppState>();
     // 状态切换必须出锁后 emit item:update：前端 1.5s 轮询有"有 busy 条目才
     // 刷新列表"的优化，若不主动通知，前端永远认为状态是 Ready、永不拉列表，
@@ -1665,12 +1667,14 @@ pub struct MergeJob {
 #[tauri::command(async)]
 pub fn start_merge(
     app: AppHandle,
+    win: tauri::WebviewWindow,
     ids: Vec<String>,
     filename: Option<String>,
     container: Option<String>,
     encoder: Option<String>,
     normalize: Option<bool>,
 ) -> CmdResult<()> {
+    ensure_main_window(&win)?;
     let state = app.state::<AppState>();
     if ids.len() < 2 {
         return Err("合并至少需要 2 个条目".into());
@@ -2016,7 +2020,14 @@ fn finish_merge(
 
 /// 设置时间范围下载（DL-12）：起止 "HH:MM:SS"；空串清除。
 #[tauri::command(async)]
-pub fn set_sections(app: AppHandle, id: String, start: String, end: String) -> CmdResult<()> {
+pub fn set_sections(
+    app: AppHandle,
+    win: tauri::WebviewWindow,
+    id: String,
+    start: String,
+    end: String,
+) -> CmdResult<()> {
+    ensure_main_window(&win)?;
     let valid = |t: &str| {
         if t.is_empty() {
             return true;
@@ -2055,14 +2066,24 @@ pub fn set_sections(app: AppHandle, id: String, start: String, end: String) -> C
 
 /// 批量转码（TC-05：按 设置-转码/通用 默认参数执行，不弹确认窗）。
 #[tauri::command(async)]
-pub fn start_transcode(app: AppHandle, ids: Vec<String>) -> CmdResult<()> {
+pub fn start_transcode(
+    app: AppHandle,
+    win: tauri::WebviewWindow,
+    ids: Vec<String>,
+) -> CmdResult<()> {
+    ensure_main_window(&win)?;
     begin_transcode(app, ids)
 }
 
 /// 批量放大到 1080P：长边<1920 且 短边<1080 的视频等比放大到不超过 1920×1080，
 /// 已达 1080P 及以上不缩放。其余转码参数同 设置-转码/通用。
 #[tauri::command(async)]
-pub fn start_upscale(app: AppHandle, ids: Vec<String>) -> CmdResult<()> {
+pub fn start_upscale(
+    app: AppHandle,
+    win: tauri::WebviewWindow,
+    ids: Vec<String>,
+) -> CmdResult<()> {
+    ensure_main_window(&win)?;
     // 先登记 upscale_ids，run_transcode_task 入口消费后即移除（消费语义）。
     // 登记与消费之间的每一条退出路径（预检跳过 / 排队中被取消 / 任务提前返回）
     // 都必须移除集合条目：残留的登记会让之后对同一 id 的普通转码被误放大
@@ -2663,7 +2684,8 @@ pub fn clear_done(app: AppHandle) -> CmdResult<()> {
 }
 
 #[tauri::command(async)]
-pub fn retry_item(app: AppHandle, id: String) -> CmdResult<()> {
+pub fn retry_item(app: AppHandle, win: tauri::WebviewWindow, id: String) -> CmdResult<()> {
+    ensure_main_window(&win)?;
     let state = app.state::<AppState>();
     {
         let mut hist = state.history.lock();
@@ -3075,7 +3097,13 @@ pub async fn clear_temp(app: AppHandle, win: tauri::WebviewWindow) -> CmdResult<
 
 /// 设置条目旋转角度（UL-12：随条目保存，转码时生效；M2 使用）。
 #[tauri::command(async)]
-pub fn rot_item(app: AppHandle, id: String, degrees: u16) -> CmdResult<()> {
+pub fn rot_item(
+    app: AppHandle,
+    win: tauri::WebviewWindow,
+    id: String,
+    degrees: u16,
+) -> CmdResult<()> {
+    ensure_main_window(&win)?;
     let angle = ytdlp_core::model::RotAngle::from_degrees(degrees);
     update_item(&app, &id, |it| {
         it.rot_angle = angle;
