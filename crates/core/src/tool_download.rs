@@ -611,9 +611,12 @@ impl ToolDownloader {
         let mut entry = archive
             .by_name(&matched)
             .map_err(|e| format!("压缩包内打开 {matched} 失败：{e}"))?;
+        // 临时名带 UUID：同进程内对同一工具的并发解压（下载 + 更新同时进行）
+        // 不会互踩同一个 extract 文件（pid 在同一进程内相同，不足以区分）
         let out = self.temp_dir.join(format!(
-            "extract-{}-{}",
+            "extract-{}-{}-{}",
             std::process::id(),
+            uuid::Uuid::new_v4(),
             std::path::Path::new(&matched)
                 .file_name()
                 .and_then(|s| s.to_str())
