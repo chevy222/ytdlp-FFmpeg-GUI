@@ -221,9 +221,36 @@ pub fn qsv_available(resolver: &ToolResolver) -> Result<bool> {
     Ok(detect_hw_encoders(resolver)?.qsv)
 }
 
+/// 硬件编码器探测缓存（TTL 5 分钟）。
+///
+/// 每个转码任务（乃至每个层级尝试）都跑一次 `ffmpeg -encoders` 是冗余的：
+/// 批量转码 50 个 = 50 次子进程。与 timefmt::local_offset_secs 同口径缓存，
+/// 容忍用户中途更换 ffmpeg（最差 5 分钟后读到新结论；依赖路径变更时的
+/// 主动失效见 reset_locked_tier 的调用方）。
+static HW_ENCODERS_CACHE: std::sync::OnceLock<
+    parking_lot::Mutex<Option<(std::time::Instant, HwEncoders)>>,
+> = std::sync::OnceLock::new();
+
 /// 探测可用硬件编码器（QSV/NVENC/AMF，TC-14）。
 /// 带截止时间：设置页"编码器探测"卡死会连带把探测命令所在线程一起占住。
+/// 结果按 TTL 缓存（见 HW_ENCODERS_CACHE）；探测失败不写缓存，下次重试。
 pub fn detect_hw_encoders(resolver: &ToolResolver) -> Result<HwEncoders> {
+    const TTL: std::time::Duration = std::time::Duration::from_secs(300);
+    let cache = HW_ENCODERS_CACHE.get_or_init(|| parking_lot::Mutex::new(None));
+    // 持锁探测：并发任务同时命中未缓存时只放一个子进程出去，其余等结果
+    let mut cur = cache.lock();
+    if let Some((at, hw)) = cur.as_ref() {
+        if at.elapsed() < TTL {
+            return Ok(*hw);
+        }
+    }
+    let hw = detect_hw_encoders_uncached(resolver)?;
+    *cur = Some((std::time::Instant::now(), hw));
+    Ok(hw)
+}
+
+/// 实际执行 `ffmpeg -encoders` 探测（无缓存路径）。
+fn detect_hw_encoders_uncached(resolver: &ToolResolver) -> Result<HwEncoders> {
     // 如实记录实际执行的命令（工具/设置页均无条目日志上下文，写进程日志）
     crate::log::info(format!(
         "[命令] {}",
