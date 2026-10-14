@@ -392,33 +392,70 @@ pub fn stream_lines(
         })
     });
 
-    let mut reader = std::io::BufReader::new(stdout);
-    let mut buf: Vec<u8> = Vec::new();
-    loop {
-        buf.clear();
-        match std::io::BufRead::read_until(&mut reader, b'\n', &mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-        on_line(decode_text(&buf).trim_end_matches(['\r', '\n']));
-        if cancel.load(Ordering::Relaxed) {
-            killed.store(true, Ordering::Relaxed);
-            guard.kill_tree();
-            break;
+    // 线程收尾守卫：正常返回、`?` 提前返回、on_line panic 三条路径都保证看门狗
+    // 与 stderr 排空线程被 join。少了这一层，deadline=None 的看门狗只认 done
+    // 标志，panic 路径会让它永久自旋泄漏（子进程已被 ChildGuard::drop 杀掉，
+    // 但父进程的线程留在那里）。
+    struct JoinGuard {
+        done: Arc<AtomicBool>,
+        err_thread: Option<std::thread::JoinHandle<()>>,
+        watchdog: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for JoinGuard {
+        fn drop(&mut self) {
+            self.done.store(true, Ordering::Relaxed);
+            if let Some(h) = self.err_thread.take() {
+                let _ = h.join();
+            }
+            if let Some(h) = self.watchdog.take() {
+                let _ = h.join();
+            }
         }
     }
+    let mut join_guard = JoinGuard {
+        done: done.clone(),
+        err_thread: Some(err_thread),
+        watchdog,
+    };
 
-    let status = guard.wait();
+    let mut reader = std::io::BufReader::new(stdout);
+    let mut buf: Vec<u8> = Vec::new();
+    // on_line 是调用方回调：它的 panic 不应把旁路线程一起泄漏。catch 住之后
+    // 先按正常流程收尾（置 done + join），再原样恢复 panic 让上层感知。
+    let read_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        loop {
+            buf.clear();
+            match std::io::BufRead::read_until(&mut reader, b'\n', &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            on_line(decode_text(&buf).trim_end_matches(['\r', '\n']));
+            if cancel.load(Ordering::Relaxed) {
+                killed.store(true, Ordering::Relaxed);
+                guard.kill_tree();
+                break;
+            }
+        }
+        guard.wait()
+    }));
+
     // 必须先置 done + join 再处理 wait() 的错误：wait() 失败时若直接 `?`
     // 提前返回，看门狗线程（deadline=None 时只在 done 上退出）与 stderr
     // 排空线程都会永久泄漏、子进程写端句柄不回收。这条路径只在"管道读错 /
     // 进程状态异常"时走，正是故障时更不能漏。
     done.store(true, Ordering::Relaxed);
-    let _ = err_thread.join();
-    if let Some(w) = watchdog {
-        let _ = w.join();
+    if let Some(h) = join_guard.err_thread.take() {
+        let _ = h.join();
     }
-    let status = status?;
+    if let Some(h) = join_guard.watchdog.take() {
+        let _ = h.join();
+    }
+    let status = match read_result {
+        Ok(s) => s?,
+        // 线程已收尾完，恢复 panic：调用方（任务线程）的 SlotGuard 与 panic hook
+        // 会接手后续（释放并发额度、落盘现场）
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
     let stderr = err_buf.lock().clone();
     Ok(StreamOutcome {
         status,
