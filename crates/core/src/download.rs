@@ -415,6 +415,10 @@ pub fn newest_media_since(dir: &Path, since: std::time::SystemTime) -> Option<Pa
 ///
 /// yt-dlp 正常收到终止信号时会自行清理 `.part`/`.ytdl`，但进程被
 /// `taskkill /T /F` 强杀时往往来不及，这里按同名前缀兜底扫一遍。
+///
+/// `.part`/`.ytdl` 与正式产物同样只删**本任务时间窗内新写的**（is_new）：
+/// 输出目录里可能有浏览器或其它工具留下的同名 `.part`（并非本任务产物），
+/// 不能按前缀一概删除。
 fn cleanup_cancelled_outputs(
     extracted: &[PathBuf],
     dests: &[PathBuf],
@@ -450,7 +454,7 @@ fn cleanup_cancelled_outputs(
                 Some(s) => s.to_string(),
                 None => continue,
             };
-            if en.starts_with(&part_prefix) || en == ytdl_name {
+            if (en.starts_with(&part_prefix) || en == ytdl_name) && is_new(&ep) {
                 let _ = std::fs::remove_file(&ep);
             }
         }
@@ -1221,5 +1225,31 @@ mod tests {
             None
         );
         assert_eq!(parse_extract_audio_path("[download] 1.0% of 1MiB"), None);
+    }
+
+    #[test]
+    fn cleanup_cancelled_outputs_respects_task_time_window() {
+        // R3 回归：`.part` 分片与正式产物一样只删"本任务时间窗内新写的"。
+        // 输出目录里可能有浏览器/其它工具留下的同名 `.part`（并非本任务产物），
+        // 按名前缀一概删除会误伤；更早启动的并发任务的分片同样受时间窗保护
+        // （file_newness 在 Windows 上取创建时间，语义 = "本任务开始后建的"）。
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("video.mp4");
+        std::fs::write(&dest, b"x").unwrap();
+        let part = dir.path().join("video.mp4.part");
+        std::fs::write(&part, b"partial").unwrap();
+
+        // started 取"未来 1 小时"：目录里所有文件都早于它，一律按非本次产物处理
+        let started = std::time::SystemTime::now() + Duration::from_secs(3600);
+        cleanup_cancelled_outputs(&[], &[dest.clone()], &[], started);
+        assert!(dest.exists(), "早于任务开始的正式产物不应被删除");
+        assert!(part.exists(), "早于任务开始的 .part 不应被删除");
+
+        // started 取"过去 1 小时"：目录里的文件都是任务期间新写的，全部清理
+        let started = std::time::SystemTime::now() - Duration::from_secs(3600);
+        cleanup_cancelled_outputs(&[], &[dest.clone()], &[], started);
+        assert!(!dest.exists(), "本任务的正式产物应被清理");
+        assert!(!part.exists(), "本任务时间窗内的 .part 应被清理");
     }
 }
