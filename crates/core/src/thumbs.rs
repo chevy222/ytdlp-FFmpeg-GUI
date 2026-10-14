@@ -69,8 +69,12 @@ fn fetch_to(
         url.to_string(),
     ];
     if let Some(p) = proxy {
+        // curl 的 socks5:// 是本地 DNS 解析，i.ytimg.com 等被墙域名 DNS 污染后
+        // 会连到错误 IP 导致 schannel 握手 RST；socks5h:// 让代理服务器做 DNS，
+        // 与 yt-dlp/Python socks 库行为一致。
+        let p = p.strip_prefix("socks5://").map_or(p.to_string(), |rest| format!("socks5h://{rest}"));
         args.push("--proxy".into());
-        args.push(p.to_string());
+        args.push(p);
     }
     on_log(crate::exec::display_command("curl", &args));
     let mut cmd = std::process::Command::new("curl");
