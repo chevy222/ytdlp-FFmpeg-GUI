@@ -446,19 +446,21 @@ pub fn run_merge(
 
     match result {
         Ok(mut o) => {
-            let _ = std::fs::remove_dir_all(&tmp);
+            // 音量归一化的中间产物也落任务私有临时目录（§3.7：中间产物不进输出
+            // 目录、也不散落 temp/ 根），随 tmp 一并清理
             if params.normalize_audio {
                 match post_normalize(
                     resolver,
                     &o,
                     params.max_gain_db,
                     &params.container,
-                    &params.temp_dir,
+                    &tmp,
                     cancel,
                     &mut on_log,
                 ) {
                     Ok(n) => o = n,
                     Err(CoreError::Cancelled) => {
+                        let _ = std::fs::remove_dir_all(&tmp);
                         let _ = std::fs::remove_file(&o);
                         on_log("音量归一化已取消，清理输出".into());
                         return Err(CoreError::Cancelled);
@@ -468,6 +470,7 @@ pub fn run_merge(
                     }
                 }
             }
+            let _ = std::fs::remove_dir_all(&tmp);
             on_log(format!("合并完成：{}", o.display()));
             Ok(o)
         }
@@ -485,13 +488,14 @@ pub fn run_merge(
 }
 
 /// 合并产物音量归一化（MG-05）：probe 音量 → 增益至峰值 0dBFS（不超过上限），
-/// 视频流 copy、音频重编码 aac；中间文件写在任务临时目录，成功后原子替换。
+/// 视频流 copy、音频重编码 aac；中间文件写在**任务私有临时目录**（调用方传入），
+/// 成功后原子替换，崩溃残留随任务目录清理（不再散落 temp/ 根）。
 fn post_normalize(
     resolver: &ToolResolver,
     input: &Path,
     max_gain_db: f32,
     container: &str,
-    temp_dir: &Path,
+    task_tmp: &Path,
     cancel: &Arc<AtomicBool>,
     on_log: &mut dyn FnMut(String),
 ) -> Result<PathBuf> {
@@ -507,8 +511,8 @@ fn post_normalize(
         return Ok(input.to_path_buf());
     }
     let ext = input.extension().and_then(|e| e.to_str()).unwrap_or("mp4");
-    std::fs::create_dir_all(temp_dir)?;
-    let tmp = temp_dir.join(format!("norm_{}.{}", uuid::Uuid::new_v4(), ext));
+    std::fs::create_dir_all(task_tmp)?;
+    let tmp = task_tmp.join(format!("norm_{}.{}", uuid::Uuid::new_v4(), ext));
     let mut args: Vec<String> = vec![
         "-hide_banner".into(),
         "-i".into(),
