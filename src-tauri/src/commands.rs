@@ -1797,6 +1797,16 @@ fn run_merge_task(app: AppHandle, id: String) {
             cancels.insert(jid.clone(), cancel.clone());
         }
     }
+    // 任务私有临时目录名由本层生成并登记到 AppState.merge_tmp：「清空临时文件」
+    // 据此精确豁免进行中的合并（而不是"有任务在跑就跳过所有 merge_*"），
+    // 崩溃残留在下次启动时清掉。纳秒时间戳足够区分并发合并。
+    let subdir = format!(
+        "merge_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
     let (inputs, params) = {
         let mut inputs = Vec::new();
         let mut anchor = None;
@@ -1819,6 +1829,7 @@ fn run_merge_task(app: AppHandle, id: String) {
             out_dir: default_output_dir(&state),
             // 中间产物一律落在 <exe 同级>\temp\（§3.7），不写进用户输出目录
             temp_dir: state.paths.temp_dir(),
+            temp_subdir: subdir.clone(),
             filename: job.filename.clone(),
             container: job.container.clone(),
             encoder_mode: job.encoder_mode.clone(),
@@ -1846,6 +1857,8 @@ fn run_merge_task(app: AppHandle, id: String) {
         persist(&app);
         return;
     }
+    // 登记后才开始跑：合并结束（无论成败）后移除（目录本身由 run_merge 清理）
+    state.merge_tmp.lock().insert(subdir.clone());
     let app2 = app.clone();
     let id2 = id.clone();
     let result = merge::run_merge(
@@ -1866,6 +1879,8 @@ fn run_merge_task(app: AppHandle, id: String) {
         },
         |line| log_item(&app, &id, line),
     );
+    // 解除临时目录豁免登记
+    state.merge_tmp.lock().remove(&subdir);
     finish_merge(&app, &id, &job.ids, result);
 }
 
@@ -2957,7 +2972,8 @@ fn open_in_explorer(_dir: &Path, _select: Option<&Path>) -> CmdResult<()> {
 ///
 /// 跳过运行中任务的私有目录与在跑的工具下载；只清历史残留，避免把进行中的任务搞坏。
 /// 豁免清单必须覆盖 temp 下**所有**非任务 id 命名的活跃产物：
-/// - `merge_<uuid>/`、`norm_<uuid>.mp4`：进行中的合并与音量归一化
+/// - `merge_<uuid>/`：进行中的合并（AppState.merge_tmp 登记制，精确到目录名；
+///   归一化中间产物随 R4 也落在该目录内，temp/ 根部的 norm_* 一律视为残留可清）
 /// - `tool_dl/`：进行中的工具下载
 /// - `ytdlp-*.txt`、`thumb-*/`：进行中的下载产物定位文件与缩略图 yt-dlp 兜底目录
 ///
@@ -2970,20 +2986,22 @@ pub fn clear_temp_inner(state: &AppState) -> std::io::Result<usize> {
     let active: Vec<String> = state.cancels.lock().keys().cloned().collect();
     let busy = !active.is_empty();
     let tool_dl_busy = active.iter().any(|k| k.starts_with("tool-dl-"));
+    let merge_tmp: Vec<String> = state.merge_tmp.lock().iter().cloned().collect();
     let mut removed = 0usize;
     for e in std::fs::read_dir(&dir)? {
         let e = e?;
         let name = e.file_name().to_string_lossy().into_owned();
+        let path = e.path();
         let skip = active.contains(&name)
             || (tool_dl_busy && name == "tool_dl")
-            || (busy && name.starts_with("merge_"))
-            || (busy && name.starts_with("norm_"))
-            || (busy && name.starts_with("ytdlp-"))
-            || (busy && name.starts_with("thumb-"));
+            // 合并私有目录按登记精确豁免（run_merge_task 登记 / finish 前移除）
+            || merge_tmp.contains(&name)
+            // thumb-*/ytdlp-* 是单次调用内创建、返回前删除的瞬态产物，只有崩溃
+            // 会留下：有任务在跑时保守跳过（体积小，下次启动必清）
+            || (busy && (name.starts_with("thumb-") || name.starts_with("ytdlp-")));
         if skip {
             continue;
         }
-        let path = e.path();
         // 目录与普通文件都要清：旧实现一律用 remove_dir_all，对散落的
         // 临时文件必然失败且被 `let _` 吞掉 —— "清理临时文件"其实一直清不掉它们
         let result = if path.is_dir() {

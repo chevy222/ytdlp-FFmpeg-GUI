@@ -23,6 +23,9 @@ pub struct MergeParams {
     pub out_dir: PathBuf,
     /// 任务私有临时目录根（`<exe 同级>\temp\`，§3.7）——中间产物不得落在输出目录
     pub temp_dir: PathBuf,
+    /// 任务私有临时目录名（`temp/<temp_subdir>/`）：由调用方生成并登记到
+    /// AppState.merge_tmp，供「清空临时文件」精确豁免进行中的合并
+    pub temp_subdir: String,
     /// 输出文件名（可编辑，默认 合并_<时间戳>）
     pub filename: String,
     /// 容器：mp4 | mkv
@@ -416,9 +419,10 @@ pub fn run_merge(
         on_log("输入参数不一致（编码/分辨率/帧率/音频/采样率），按统一模式处理".into());
     }
 
-    // 2) 任务私有临时目录（§3.7：中间产物一律在 <exe 同级>\temp\，不污染输出目录）
-    let task_id = uuid::Uuid::new_v4().to_string();
-    let tmp = params.temp_dir.join(format!("merge_{}", task_id));
+    // 2) 任务私有临时目录（§3.7：中间产物一律在 <exe 同级>\temp\，不污染输出目录）。
+    // 目录名由调用方给定（MergeParams.temp_subdir）并登记在 AppState.merge_tmp：
+    // 「清空临时文件」据此精确豁免，而不是"有任务在跑就跳过所有 merge_*"
+    let tmp = params.temp_dir.join(&params.temp_subdir);
     std::fs::create_dir_all(&tmp)?;
     // 输出名放在最后抢占：output_path 内部 create_new 占位，提前占位会让
     // "探测失败"这类早退路径在用户输出目录留下 0 字节垃圾文件
@@ -645,6 +649,7 @@ mod tests {
             inputs: vec![],
             out_dir: dir.to_path_buf(),
             temp_dir: dir.join("temp"),
+            temp_subdir: "merge_test".into(),
             filename: "合并_x".into(),
             container: "mp4".into(),
             encoder_mode: "auto".into(),

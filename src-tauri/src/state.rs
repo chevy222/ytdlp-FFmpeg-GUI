@@ -51,6 +51,10 @@ pub struct AppState {
     pub cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// 合并面板参数（入队等待时保存；低频操作，仅面板内配置，不落 config）
     pub merge_jobs: Mutex<HashMap<String, crate::commands::MergeJob>>,
+    /// 进行中的合并任务私有临时目录名（`temp/<name>/`）：run_merge_task 登记、
+    /// finish 前移除。「清空临时文件」据此精确豁免活跃合并，避免"有任务在跑就
+    /// 跳过所有 merge_*"导致崩溃残留永远清不掉。
+    pub merge_tmp: Mutex<HashSet<String>>,
     /// 放大到 1080P 的任务 id 集合：start_upscale 写入，run_transcode_task
     /// 入口消费后移除。**消费语义**：登记与消费之间的所有退出路径
     /// （begin_transcode 预检跳过 / cancel_item 取消）都必须移除登记，
@@ -108,6 +112,7 @@ impl AppState {
             queue: Mutex::new(TaskQueue::new(concurrency)),
             cancels: Mutex::new(HashMap::new()),
             merge_jobs: Mutex::new(HashMap::new()),
+            merge_tmp: Mutex::new(HashSet::new()),
             upscale_ids: Mutex::new(HashSet::new()),
             cli: Mutex::new(CliOverrides::default()),
             potoken: Mutex::new(potoken_disk),
