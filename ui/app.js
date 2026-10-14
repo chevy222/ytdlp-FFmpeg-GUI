@@ -1124,9 +1124,11 @@ async function init(){
     refreshDeps();
     // 启动时检查更新（轻量"检查+通知"，不自动下载安装）
     // 异步不阻塞启动；失败静默忽略（网络不通/GitHub 限流都不应影响使用）
-    INVOKE('check_update').then(info => {
+    INVOKE('check_update').then(async info => {
       if (!info) return;
-      if (window.confirm('发现新版本 v' + info.latest_version + '\n当前版本 v' + info.current_version + '\n\n是否前往 GitHub 下载？')) {
+      // 用 askConfirm 而不是 window.confirm：后者会阻塞 WebView2 的 JS 线程
+      // （下载中弹一下，进度事件就全停摆），启动瞬间恰是列表/依赖刷新的窗口
+      if (await askConfirm('发现新版本 v' + info.latest_version + '\n当前版本 v' + info.current_version + '\n\n是否前往 GitHub 下载？', '前往下载')) {
         // Tauri webview 内 window.open 无效，走 open_url 命令调起系统浏览器
         INVOKE('open_url',{url:info.url}).catch(e=>toast('打开链接失败：'+e));
       }
