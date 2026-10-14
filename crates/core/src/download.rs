@@ -830,13 +830,6 @@ pub fn post_process(
         let _ = std::fs::remove_file(&out);
         return Ok((input.to_path_buf(), meta.clone()));
     }
-    // 原子替换：Windows 上 std::fs::rename 直接覆盖已存在目标
-    // （MOVEFILE_REPLACE_EXISTING），不再"先删后改名"——那样中途失败会连原文件一起丢。
-    if let Err(e) = std::fs::rename(&out, input) {
-        on_log(format!("后处理产物替换失败（保留原文件）：{e}"));
-        let _ = std::fs::remove_file(&out);
-        return Ok((input.to_path_buf(), meta.clone()));
-    }
     // 成功路径：把实际应用的增益回写到 meta.audio_volume，否则条目里存的还是
     // 放大前的探测值，用户再点转码会重复放大（音量翻倍）。
     let mut final_meta = meta.clone();
@@ -846,7 +839,48 @@ pub fn post_process(
             final_meta.audio_volume.max_volume_db = Some((v + applied_gain).min(0.0));
         }
     }
-    Ok((input.to_path_buf(), final_meta))
+    // 落地策略按"容器是否变化"分两种：
+    // - 容器不变（mp4→mp4）：rename 覆盖原文件，输出目录不留中间产物。Windows 上
+    //   同目录 rename 才是原子替换（MOVEFILE_REPLACE_EXISTING），不再"先删后改名"
+    //   ——那样中途失败会连原文件一起丢；
+    // - 容器变化（mp3→m4a / webm→mp4）：不能把新容器内容盖回旧扩展名——文件类型
+    //   与扩展名错配，资源管理器/播放器都会误判。改为以正确扩展名落地，并删除本次
+    //   下载的原始产物（preexisting 场景不会进后处理，删的永远是本任务刚下载的文件）。
+    let final_ext = if audio_only { "m4a" } else { "mp4" };
+    let same_ext = input
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case(final_ext))
+        .unwrap_or(false);
+    if same_ext {
+        if let Err(e) = std::fs::rename(&out, input) {
+            on_log(format!("后处理产物替换失败（保留原文件）：{e}"));
+            let _ = std::fs::remove_file(&out);
+            return Ok((input.to_path_buf(), meta.clone()));
+        }
+        return Ok((input.to_path_buf(), final_meta));
+    }
+    // 容器变化：优先落到"同 stem + 正确扩展名"；目标已被占用时保留 processed 中间名
+    let renamed = input.with_extension(final_ext);
+    let final_path = if renamed.exists() {
+        out.clone()
+    } else if let Err(e) = std::fs::rename(&out, &renamed) {
+        on_log(format!(
+            "后处理产物改名失败（保留中间产物 {}）：{e}",
+            out.display()
+        ));
+        return Ok((out.clone(), final_meta));
+    } else {
+        renamed
+    };
+    // 删除本次下载的原始产物（容器已被替换）；失败只告警不阻断
+    if let Err(e) = std::fs::remove_file(input) {
+        on_log(format!(
+            "原始下载产物删除失败（可手动删除 {}）：{e}",
+            input.display()
+        ));
+    }
+    Ok((final_path, final_meta))
 }
 
 /// 产物校验：ffprobe 能解析且存在主流（视频产物查 v:0，纯音频产物查 a:0）。
