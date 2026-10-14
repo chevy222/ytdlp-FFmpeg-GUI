@@ -786,6 +786,35 @@ pub fn run_transcode(
     unreachable!("层级序列非空")
 }
 
+/// 输出占位清理守卫。
+///
+/// `TranscodeParams::output_path()` 用 `create_new` 在输出目录留下 0 字节占位文件
+/// （防两个并发任务抢同一输出路径，TOCTOU）。任务任何提前返回/panic 路径（管道
+/// 读错、取消、ffmpeg 失败、产物校验失败）都必须删掉它，否则用户输出目录里会留下
+/// 一个打不开的 0 字节"产物"。只有校验通过的真实产出会 `disarm` 保留。
+struct PlaceholderGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl PlaceholderGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PlaceholderGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 fn run_transcode_once(
     resolver: &ToolResolver,
     params: &TranscodeParams,
@@ -801,6 +830,9 @@ fn run_transcode_once(
     let args = build_args_for_tier(resolver, params, meta, tier)?;
     let mut cmd = resolver.command(Tool::Ffmpeg)?;
     let out = params.output_path()?;
+    // 占位文件 RAII 清理：此后任何提前返回（含 stream_lines 的 `?`）都会删掉
+    // 0 字节占位；只有校验通过的产物会 disarm 保留
+    let mut placeholder = PlaceholderGuard::new(out.clone());
     on_log(format!(
         "转码 {} → {}（{}，{}）",
         params
@@ -825,11 +857,8 @@ fn run_transcode_once(
 
     let mut guard = match ChildGuard::spawn(&mut cmd) {
         Ok(g) => g,
-        Err(e) => {
-            // 起不来就把占位文件清掉，不在用户输出目录留 0 字节垃圾
-            let _ = std::fs::remove_file(&out);
-            return Err(e);
-        }
+        // 起不来的清理交给占位守卫（Drop），不在用户输出目录留 0 字节垃圾
+        Err(e) => return Err(e),
     };
 
     let duration = meta.duration_secs.unwrap_or(0.0);
@@ -856,7 +885,7 @@ fn run_transcode_once(
 
     on_progress(100.0);
     if outcome.killed || cancel.load(Ordering::Relaxed) {
-        let _ = std::fs::remove_file(&out);
+        // 取消路径的半成品与占位由守卫清理
         return Err(CoreError::Cancelled);
     }
     if !outcome.status.success() {
@@ -872,7 +901,7 @@ fn run_transcode_once(
                 on_log(l.to_string());
             }
         }
-        let _ = std::fs::remove_file(&out);
+        // 半成品与占位由守卫清理
         return Err(CoreError::ProcessFailed {
             program: "ffmpeg".into(),
             code: outcome.status.code(),
@@ -885,7 +914,6 @@ fn run_transcode_once(
         .map(|m| m.len() >= 1024)
         .unwrap_or(false);
     if !out_ok {
-        let _ = std::fs::remove_file(&out);
         return Err(CoreError::ProcessFailed {
             program: "ffmpeg".into(),
             code: None,
@@ -893,6 +921,8 @@ fn run_transcode_once(
         });
     }
     on_log(format!("转码完成：{}", out.display()));
+    // 校验通过的真实产出：解除占位清理
+    placeholder.disarm();
     Ok(out)
 }
 
