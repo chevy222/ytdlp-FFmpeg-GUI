@@ -84,13 +84,14 @@ src-tauri/     Tauri v2 应用壳（命令桥接、后台任务、登录窗、CL
 ui/            前端静态资源（index.html 结构+样式、app.js 逻辑，无构建步骤）
 scripts/       build.ps1（本地构建，与 CI 同构）、cross-build/（Linux 交叉编译）
 .github/       windows CI（build.yml 门禁 + release.yml 打包发布）
-docs/          实现说明 / 工程与构建说明 / 效果图 / 架构总览图 / 主要功能流程图
+docs/          设计素材（图标源文件）与代码审核报告
 ```
 
 ## 实现说明
 
-代码实际行为、数据模型、设置项、目录约定，以及**改代码前必读的外部工具参数约束**，见 `docs/ytdlp-FFmpeg-GUI-doubao-需求文档.md`；
-构建与 CI 细节见 `docs/ytdlp-FFmpeg-GUI-开发里程碑.md`。
+代码实际行为、数据模型、设置项、目录约定以本文件与代码注释为准；改代码前必读的
+外部工具参数约束（yt-dlp / ffmpeg）散见 `crates/core/src/` 各模块头注释。需求
+文档与开发里程碑文档在内部维护，未随本仓库分发。
 
 ## License
 
