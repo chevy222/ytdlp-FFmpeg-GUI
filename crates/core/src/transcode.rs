@@ -931,11 +931,8 @@ fn run_transcode_once(
     cmd.arg(&out);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    let mut guard = match ChildGuard::spawn(&mut cmd) {
-        Ok(g) => g,
-        // 起不来的清理交给占位守卫（Drop），不在用户输出目录留 0 字节垃圾
-        Err(e) => return Err(e),
-    };
+    // 起不来的清理交给占位守卫（Drop），不在用户输出目录留 0 字节垃圾
+    let mut guard = ChildGuard::spawn(&mut cmd)?;
 
     let duration = meta.duration_secs.unwrap_or(0.0);
     if duration <= 0.0 {

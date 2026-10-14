@@ -1242,13 +1242,13 @@ mod tests {
 
         // started 取"未来 1 小时"：目录里所有文件都早于它，一律按非本次产物处理
         let started = std::time::SystemTime::now() + Duration::from_secs(3600);
-        cleanup_cancelled_outputs(&[], &[dest.clone()], &[], started);
+        cleanup_cancelled_outputs(&[], std::slice::from_ref(&dest), &[], started);
         assert!(dest.exists(), "早于任务开始的正式产物不应被删除");
         assert!(part.exists(), "早于任务开始的 .part 不应被删除");
 
         // started 取"过去 1 小时"：目录里的文件都是任务期间新写的，全部清理
         let started = std::time::SystemTime::now() - Duration::from_secs(3600);
-        cleanup_cancelled_outputs(&[], &[dest.clone()], &[], started);
+        cleanup_cancelled_outputs(&[], std::slice::from_ref(&dest), &[], started);
         assert!(!dest.exists(), "本任务的正式产物应被清理");
         assert!(!part.exists(), "本任务时间窗内的 .part 应被清理");
     }
