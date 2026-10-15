@@ -327,12 +327,19 @@ const PERSIST_DEBOUNCE_MS: u64 = 500;
 
 /// 持久化（状态迁移后调用）。
 ///
-/// 去抖：距上次写盘 >= 500ms 立即写；< 500ms 则 spawn 一个延迟任务，
+/// **永远异步写盘**：命令线程不能被同步 IO 阻塞——history.json 随条目数增长
+/// 可达数 MB，机械硬盘上同步写能卡 1-2 秒，用户点"取消/重试"会明显感觉延迟。
+/// state.persist() 内部有序列号去重（persist_req/persist_done），并发写安全。
+///
+/// 去抖：距上次写盘 >= 500ms 立即 spawn 写；< 500ms 则 spawn 延迟任务，
 /// 500ms 后合并写。`pending_flush` 保证同一窗口内只有一个延迟任务。
 fn persist(app: &AppHandle) {
     let state = app.state::<AppState>();
     if state.ms_since_last_persist() >= PERSIST_DEBOUNCE_MS {
-        state.persist();
+        let app = app.clone();
+        std::thread::spawn(move || {
+            app.state::<AppState>().persist();
+        });
         return;
     }
     // 去抖窗口内：确保有且仅有一个延迟 flush 任务
