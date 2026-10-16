@@ -300,7 +300,13 @@ pub(super) fn run_download_task(app: AppHandle, id: String, format_id: Option<St
             Ok((final_path, meta)) => {
                 outcome.output_paths = vec![final_path];
                 update_item(&app, &id, |it| {
+                    // ffprobe 探测的本地文件 meta 不含 uploader/title（yt-dlp 解析时才有），
+                    // 覆盖前先保留这两个字段
+                    let saved_uploader = it.meta.uploader.clone();
+                    let saved_title = it.meta.title.clone();
                     it.meta = meta;
+                    it.meta.uploader = saved_uploader;
+                    it.meta.title = saved_title;
                 });
                 // 不在这里落盘：finish_download 收尾时会写一次（同样的快照），
                 // 每次 persist 都是 clone + 序列化 + fsync 整份 history
