@@ -40,8 +40,6 @@ pub struct UrlProbe {
     pub host: Option<String>,
     /// 是否合集/多 P
     pub is_playlist: bool,
-    /// 缩略图 URL（缓存/封面用）
-    pub thumbnail_url: Option<String>,
 }
 
 /// 本地解析结果。
@@ -474,7 +472,6 @@ pub fn parse_ytdlp_json(text: &str) -> Result<UrlProbe> {
         site,
         host,
         is_playlist,
-        thumbnail_url: thumbnail,
     })
 }
 
@@ -685,10 +682,9 @@ mod tests {
         assert_eq!(p.meta.duration_secs, Some(332.5));
         assert_eq!(p.host.as_deref(), Some("www.youtube.com"));
         assert_eq!(p.site.as_deref(), Some("youtube"));
-        assert_eq!(
-            p.thumbnail_url.as_deref(),
-            Some("https://i.ytimg.com/vi/abc123/maxresdefault.jpg")
-        );
+        // thumbnail 字段现在只折算为 has_cover（远程 URL 本身已不再随身携带，
+        // 封面由解析/下载链路经 yt-dlp --write-thumbnail 落盘）
+        assert!(p.meta.has_cover, "thumbnail 字段应折算为 has_cover");
         assert!(!p.is_playlist);
     }
 

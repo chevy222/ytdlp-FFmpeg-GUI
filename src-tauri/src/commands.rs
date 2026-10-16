@@ -234,11 +234,11 @@ fn log_item(app: &AppHandle, id: &str, line: impl Into<String>) {
     let _ = app.emit("item:log", serde_json::json!({ "id": id, "line": line }));
 }
 
-/// 用 yt-dlp 兜底下载缩略图（curl 直连失败时）。
+/// 用 yt-dlp 拉远程缩略图（解析链路取封面的唯一路径）。
 ///
-/// curl 不走 Windows 系统代理（WinINET），用户开 TUN/系统代理时直连 i.ytimg.com
-/// 必然失败；yt-dlp 会自动读取系统代理/环境变量，与主下载同口径，作为兜底最可靠。
-/// `--write-thumbnail --skip-download` 只拉封面不下载视频，速度快。
+/// 不走 curl：curl 不走 Windows 系统代理（WinINET），且 schannel + socks5 兼容性差
+/// （经常 server closed abruptly）；yt-dlp 与主下载共用同一套代理/cookies/TLS
+/// （openssl），行为最一致。`--write-thumbnail --skip-download` 只拉封面不下载视频。
 fn fetch_thumb_ytdlp(
     resolver: &ToolResolver,
     video_url: &str,
@@ -302,11 +302,23 @@ fn fetch_thumb_ytdlp(
             return Err(format!("yt-dlp 缩略图下载失败：{e}"));
         }
     }
-    // yt-dlp 写出的封面扩展名可能是 webp/jpg/jpeg/png，找到第一个文件即可
-    let thumb_file = std::fs::read_dir(&tmp_dir)
-        .ok()
-        .and_then(|mut rd| rd.find_map(|e| e.ok()))
-        .map(|e| e.path());
+    // yt-dlp 写出的封面扩展名可能是 webp/jpg/jpeg/png（取决于源）。
+    // 只按扩展名白名单挑：目录里可能还躺着 .part/点文件等其它条目，而 read_dir
+    // 顺序不定 —— "随便取第一个"会把非封面文件复制过去。
+    let thumb_file = std::fs::read_dir(&tmp_dir).ok().and_then(|rd| {
+        rd.flatten()
+            .map(|e| e.path())
+            .find(|p| {
+                p.is_file()
+                    && matches!(
+                        p.extension()
+                            .and_then(|e| e.to_str())
+                            .map(str::to_ascii_lowercase)
+                            .as_deref(),
+                        Some("webp" | "jpg" | "jpeg" | "png")
+                    )
+            })
+    });
     let Some(thumb_file) = thumb_file else {
         let _ = std::fs::remove_dir_all(&tmp_dir);
         return Err("yt-dlp 未生成缩略图文件".into());
@@ -648,7 +660,6 @@ fn run_probe(app: AppHandle, id: String) {
                 site: Some("本地文件".into()),
                 host: None,
                 is_playlist: false,
-                thumbnail_url: None,
             }
         })
     };
@@ -660,7 +671,6 @@ fn run_probe(app: AppHandle, id: String) {
             update_item(&app, &id, |it| {
                 it.meta = p.meta;
                 it.site = p.site.clone();
-                it.thumbnail_url = p.thumbnail_url.clone();
                 if p.host.is_some() {
                     it.host = p.host.clone();
                 }
@@ -670,7 +680,7 @@ fn run_probe(app: AppHandle, id: String) {
                 it.push_log("解析完成，已就绪".to_string());
             });
                 // 封面缩略图（异步生成，不阻塞就绪）。
-                // spawn_blocking：里面是 curl 网络下载 + ffmpeg 子进程，全是阻塞调用，
+                // spawn_blocking：里面是 yt-dlp / ffmpeg 子进程（阻塞），
                 // 放在 async 执行器的 worker 上会占住线程（执行器线程数 ≈ CPU 核数）
                 {
                     let app2 = app.clone();
