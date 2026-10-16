@@ -27,82 +27,11 @@ pub fn collect_written_thumbnail(output_path: &Path) -> Option<PathBuf> {
     None
 }
 
-/// 从远程缩略图 URL 下载到 dest。
-///
-/// 有代理时直接走代理（直连国内必超时 10s，白等）；无代理时直连。
-/// `on_log`：如实回传实际执行的 curl 命令行。
-pub fn save_remote_thumb(
-    url: &str,
-    dest: &Path,
-    proxy: Option<&str>,
-    on_log: &mut dyn FnMut(String),
-) -> Result<(), String> {
-    ensure_parent(dest).map_err(|e| e.to_string())?;
-    // 有代理直接用代理（避免国内直连超时 10s）；无代理才直连
-    let proxy = proxy.filter(|p| !p.is_empty());
-    fetch_to(url, dest, proxy, on_log)
-}
-
-fn fetch_to(
-    url: &str,
-    dest: &Path,
-    proxy: Option<&str>,
-    on_log: &mut dyn FnMut(String),
-) -> Result<(), String> {
-    // 临时名带 UUID：同一 dest 被并发请求时不会互踩（固定名会让其中一个 rename 失败）
-    let tmp = dest.with_file_name(format!(".thumb-{}.tmp", uuid::Uuid::new_v4()));
-    let tmp_str = tmp.to_string_lossy().into_owned();
-    // URL 来自三方元数据（yt-dlp 返回的 thumbnail），必须有上限：
-    // --max-time 防止假死连接占住线程，--max-filesize 防止写爆 cache 目录
-    let mut args: Vec<String> = vec![
-        "-L".into(),
-        "--fail".into(),
-        "-sS".into(),
-        "--connect-timeout".into(),
-        "10".into(),
-        "--max-time".into(),
-        "30".into(),
-        "--max-filesize".into(),
-        "20971520".into(),
-        "-o".into(),
-        tmp_str.clone(),
-        url.to_string(),
-    ];
-    if let Some(p) = proxy {
-        // curl 的 socks5:// 是本地 DNS 解析，i.ytimg.com 等被墙域名 DNS 污染后
-        // 会连到错误 IP 导致 schannel 握手 RST；socks5h:// 让代理服务器做 DNS，
-        // 与 yt-dlp/Python socks 库行为一致。
-        let p = p.strip_prefix("socks5://").map_or(p.to_string(), |rest| format!("socks5h://{rest}"));
-        args.push("--proxy".into());
-        args.push(p);
-    }
-    on_log(crate::exec::display_command("curl", &args));
-    let mut cmd = std::process::Command::new("curl");
-    cmd.args(&args);
-    // GUI 程序启动控制台子进程会弹出一个黑窗（一闪而过）；这里与其它调用点
-    // 保持一致，显式隐藏控制台。
-    crate::exec::hide_console(&mut cmd);
-    let output = cmd
-        .output()
-        .map_err(|e| format!("无法调用 curl（需要 Windows 10+ 自带的 curl.exe）：{e}"))?;
-    if !output.status.success() || !tmp.is_file() {
-        let _ = std::fs::remove_file(&tmp);
-        // curl 的报错在 stderr（-sS 保证有输出）：带出来才能分辨是网络还是代理问题
-        let detail = crate::exec::decode_text(&output.stderr);
-        return Err(if detail.trim().is_empty() {
-            "缩略图下载失败".to_string()
-        } else {
-            format!("缩略图下载失败：{}", detail.trim())
-        });
-    }
-    let size = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
-    if size == 0 {
-        let _ = std::fs::remove_file(&tmp);
-        return Err("缩略图为空".into());
-    }
-    std::fs::rename(&tmp, dest).map_err(|e| e.to_string())?;
-    Ok(())
-}
+// 注：这里曾有一个 curl 版「远程缩略图 URL → 本地」下载函数
+// （save_remote_thumb / fetch_to，含 socks5→socks5h 归一化）。解析链路改用
+// yt-dlp --write-thumbnail 取封面后（src-tauri/src/commands.rs 的
+// fetch_thumb_ytdlp、下载链路的 collect_written_thumbnail），它失去全部调用方，
+// 已删除以免误导；要恢复请连超时/大小上限与代理归一化一起恢复。
 
 /// 抽取文件**内嵌封面**（attached_pic，元数据）——与桌面/播放器显示的封面同源，
 /// 不重新截帧。无封面流时返回 `Ok(false)`，由调用方回退抽帧。

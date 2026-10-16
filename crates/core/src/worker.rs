@@ -103,10 +103,6 @@ impl TaskQueue {
         self.running.contains(id)
     }
 
-    pub fn is_queued(&self, id: &str) -> bool {
-        self.waiting.iter().any(|w| w == id)
-    }
-
     /// 当前占用总和（running + waiting）。
     pub fn total(&self) -> usize {
         self.running.len() + self.waiting.len()
