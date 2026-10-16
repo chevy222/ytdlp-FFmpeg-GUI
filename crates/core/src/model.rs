@@ -132,6 +132,9 @@ pub struct AudioVolume {
 #[serde(default)]
 pub struct MediaMeta {
     pub title: Option<String>,
+    /// 上传者/频道名（yt-dlp JSON 的 uploader/channel）
+    #[serde(default)]
+    pub uploader: Option<String>,
     pub duration_secs: Option<f64>,
     /// 容器格式，如 MP4 / MKV
     pub container: Option<String>,

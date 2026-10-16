@@ -66,7 +66,11 @@ function fmtMeta(it){
 }
 
 function subline(it){
-  if(it.url){ const s=it.site||'站点'; return esc(s+' · '+it.url); }
+  const uploader = it.meta && it.meta.uploader;
+  if(it.url){
+    const s = it.site||'站点';
+    return uploader ? esc(uploader+' · '+s) : esc(s+' · '+it.url);
+  }
   if(it.path) return esc('本地文件 · '+it.path);
   return '';
 }

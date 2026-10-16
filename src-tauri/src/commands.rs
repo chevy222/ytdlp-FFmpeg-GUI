@@ -669,10 +669,16 @@ fn run_probe(app: AppHandle, id: String) {
             let url_src = item.url.is_some();
             let cover_idx = p.meta.cover_stream_index;
             update_item(&app, &id, |it| {
+                // 先取标题再 move meta
+                let meta_title = p.meta.title.clone();
                 it.meta = p.meta;
                 it.site = p.site.clone();
                 if p.host.is_some() {
                     it.host = p.host.clone();
+                }
+                // 解析出视频标题后同步到条目标题（前端名称列显示）
+                if let Some(t) = meta_title {
+                    it.title = t;
                 }
                 transition_in(it, Status::Ready);
                 it.percent = 0.0;

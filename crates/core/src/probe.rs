@@ -391,6 +391,7 @@ pub fn probe_volume(
 pub fn parse_ytdlp_json(text: &str) -> Result<UrlProbe> {
     let v: Value = serde_json::from_str(text)?;
     let title = v["title"].as_str().map(str::to_string);
+    let uploader = v["uploader"].as_str().or(v["channel"].as_str()).map(str::to_string);
     let duration = v["duration"].as_f64();
     let thumbnail = v["thumbnail"].as_str().map(str::to_string);
     let is_playlist = v["_type"].as_str() == Some("playlist")
@@ -456,6 +457,7 @@ pub fn parse_ytdlp_json(text: &str) -> Result<UrlProbe> {
 
     let meta = MediaMeta {
         title: title.clone(),
+        uploader: uploader.clone(),
         duration_secs: duration,
         height: formats
             .iter()
