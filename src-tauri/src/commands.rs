@@ -676,7 +676,6 @@ fn run_probe(app: AppHandle, id: String) {
                     let app2 = app.clone();
                     let id2 = id.clone();
                     let cache_dir = state.paths.cache_dir();
-                    let thumb_url = p.thumbnail_url.clone();
                     let local_path = item.path.clone();
                     let video_url = item.url.clone();
                     // 本地文件优先取内嵌封面（元数据），与桌面缩略图同源
@@ -691,32 +690,17 @@ fn run_probe(app: AppHandle, id: String) {
                     let thumb_tmp_root = state.paths.temp_dir();
                     tauri::async_runtime::spawn_blocking(move || {
                     let dest = ytdlp_core::thumbs::thumb_path(&cache_dir, &id2);
-                    let r = if let Some(u) = thumb_url {
-                        if u.is_empty() {
-                            Ok(())
-                        } else if thumb_proxy.is_none() {
-                            // 无代理：curl 不走 WinINET/TUN，直连必败，直接 yt-dlp 兜底
-                            log_item(&app2, &id2, "无站点代理，缩略图直接用 yt-dlp 下载…");
-                            if let Some(vurl) = &video_url {
-                                fetch_thumb_ytdlp(&resolver2, vurl, &dest, &thumb_tmp_root,
-                                    None, thumb_cookies.as_deref(), &mut |l| log_item(&app2, &id2, l))
-                            } else {
-                                Err("无代理且无视频 URL".into())
-                            }
+                    // URL 视频：直接用 yt-dlp --write-thumbnail --skip-download 下载缩略图。
+                    // 与下载视频走同一套代理/cookies/TLS(openssl)，不走 curl（schannel
+                    // + socks5 兼容性差，经常 server closed abruptly）。
+                    // 本地文件：优先取内嵌封面（ffmpeg），无封面流才抽帧。
+                    let r = if video_url.is_some() {
+                        if let Some(vurl) = &video_url {
+                            fetch_thumb_ytdlp(&resolver2, vurl, &dest, &thumb_tmp_root,
+                                thumb_proxy.as_deref(), thumb_cookies.as_deref(),
+                                &mut |l| log_item(&app2, &id2, l))
                         } else {
-                            // 有代理：先 curl（快），失败再 yt-dlp 兜底
-                            match ytdlp_core::thumbs::save_remote_thumb(&u, &dest, thumb_proxy.as_deref(), &mut |l| log_item(&app2, &id2, l)) {
-                                Ok(()) => Ok(()),
-                                Err(e) => {
-                                    log_item(&app2, &id2, format!("缩略图 curl 下载失败（{}），尝试 yt-dlp 兜底…", e));
-                                    if let Some(vurl) = &video_url {
-                                        fetch_thumb_ytdlp(&resolver2, vurl, &dest, &thumb_tmp_root,
-                                            thumb_proxy.as_deref(), thumb_cookies.as_deref(), &mut |l| log_item(&app2, &id2, l))
-                                    } else {
-                                        Err(e)
-                                    }
-                                }
-                            }
+                            Ok(())
                         }
                     } else if let Some(p) = local_path {
                         ytdlp_core::thumbs::ensure_thumb(
