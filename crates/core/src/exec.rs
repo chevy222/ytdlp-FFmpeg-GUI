@@ -439,6 +439,15 @@ pub fn stream_lines(
         guard.wait()
     }));
 
+    // panic 路径必须**先杀进程再 join**：子进程活着就握着 stderr 写端，排空
+    // 线程读不到 EOF，err_thread.join() 会一直等到它自然结束（长下载/长转码
+    // 可达数十分钟；卡死在写满的 stdout 管道上则永久挂起）。而真正杀进程树的
+    // ChildGuard::drop 要等 panic 传播出函数才执行 —— 卡在 join 上就永远等不到，
+    // 任务线程跟着永不返回、SlotGuard 不释放（并发额度泄漏）。
+    // 先 kill_tree，排空线程/看门狗立刻能收尾，再把 panic 原样抛出。
+    if read_result.is_err() {
+        guard.kill_tree();
+    }
     // 必须先置 done + join 再处理 wait() 的错误：wait() 失败时若直接 `?`
     // 提前返回，看门狗线程（deadline=None 时只在 done 上退出）与 stderr
     // 排空线程都会永久泄漏、子进程写端句柄不回收。这条路径只在"管道读错 /
@@ -955,6 +964,32 @@ mod tests {
         assert!(
             spent < Duration::from_secs(4),
             "取消应在看门狗周期内生效，实际耗时 {spent:?}"
+        );
+    }
+
+    #[test]
+    fn stream_lines_panic_does_not_wait_for_child() {
+        // R4 回归：on_line panic 时若"先 join 后杀进程"，子进程活着就握着 stderr
+        // 写端，err_thread.join() 会一直等它自然退出（这里 sleep 30 = 必挂 30s，
+        // 真实长任务可达数十分钟），任务线程永不返回、SlotGuard 不释放。
+        // 正确顺序：先 kill_tree 再 join。用 panic 恢复到返回的耗时卡住这条回归线。
+        let mut cmd = Command::new("sh");
+        // 先吐一行触发 on_line → panic，再让进程继续存活（实现顺序错误就卡在这）
+        cmd.arg("-c").arg("echo trigger; exec sleep 30");
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut guard = ChildGuard::spawn(&mut cmd).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let t0 = Instant::now();
+        // panic 消息由默认 hook 打到测试 stderr（仅失败时展示），这里只验时序
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = stream_lines(&mut guard, &cancel, None, |_| panic!("on_line panic（回归测试）"));
+        }));
+        let spent = t0.elapsed();
+        assert!(caught.is_err(), "panic 必须原样传播给调用方");
+        assert!(
+            spent < Duration::from_secs(10),
+            "panic 收尾不应等待子进程自然结束，实际耗时 {spent:?}"
         );
     }
 
