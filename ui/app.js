@@ -3,6 +3,17 @@ const S = { items: [], selected: new Set(), config: null, cdTimer: {}, cdSecs: {
 const INVOKE = (cmd, args) => window.__TAURI__.core.invoke(cmd, args || {});
 const LISTEN = window.__TAURI__.event.listen;
 
+function copyText(text){
+  if(!text) return;
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text).then(()=>toast('已复制到剪贴板')).catch(()=>{
+      try{document.execCommand('copy');toast('已复制到剪贴板');}catch(e){toast('复制失败');}
+    });
+  } else {
+    toast('当前环境不支持剪贴板');
+  }
+}
+
 let toastTimer = null;
 function toast(msg) {
   const t = document.getElementById('toast');
@@ -67,8 +78,15 @@ function fmtMeta(it){
 
 function subline(it){
   const uploader = it.meta && it.meta.uploader;
-  if(uploader) return esc(uploader);
-  if(it.url){ const s=it.site||'站点'; return esc(s+' · '+it.url); }
+  if(uploader){
+    let h = '<span class="copyable" data-copy="'+esc(uploader)+'" title="点击复制上传者">'+esc(uploader)+'</span>';
+    if(it.url) h += ' · <span class="copyable" data-copy="'+esc(it.url)+'" title="点击复制URL">'+esc(it.url)+'</span>';
+    return h;
+  }
+  if(it.url){
+    const s=it.site||'站点';
+    return esc(s)+' · <span class="copyable" data-copy="'+esc(it.url)+'" title="点击复制URL">'+esc(it.url)+'</span>';
+  }
   if(it.path) return esc('本地文件 · '+it.path);
   return '';
 }
@@ -321,6 +339,9 @@ const CMDS = {
 document.addEventListener('click', e=>{
   // 点遮罩关窗（原先写在 #urlModal 的内联 handler 上）
   if(e.target&&e.target.id==='urlModal'){closeUrlModal();return;}
+  // 点击复制 uploader / URL
+  const cp=e.target&&e.target.closest?e.target.closest('[data-copy]'):null;
+  if(cp){copyText(cp.dataset.copy);return;}
   const el=e.target&&e.target.closest?e.target.closest('[data-cmd]'):null;
   if(!el)return;
   const fn=CMDS[el.dataset.cmd];
