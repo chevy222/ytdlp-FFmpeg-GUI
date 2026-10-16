@@ -17,7 +17,7 @@ pub fn start_transcode(
     ids: Vec<String>,
 ) -> CmdResult<()> {
     ensure_main_window(&win)?;
-    begin_transcode(app, ids)
+    begin_transcode(app, ids, false)
 }
 
 /// 批量放大到 1080P：长边<1920 且 短边<1080 的视频等比放大到不超过 1920×1080，
@@ -29,22 +29,16 @@ pub fn start_upscale(
     ids: Vec<String>,
 ) -> CmdResult<()> {
     ensure_main_window(&win)?;
-    // 先登记 upscale_ids，run_transcode_task 入口消费后即移除（消费语义）。
-    // 登记与消费之间的每一条退出路径（预检跳过 / 排队中被取消 / 任务提前返回）
-    // 都必须移除集合条目：残留的登记会让之后对同一 id 的普通转码被误放大
-    // （历史 bug；清理点见 begin_transcode / cancel_item，消费点见 run_transcode_task）
-    {
-        let state = app.state::<AppState>();
-        let mut set = state.upscale_ids.lock();
-        for id in &ids {
-            set.insert(id.clone());
-        }
-    }
-    begin_transcode(app, ids)
+    // 放大意图的登记放在 begin_transcode 里、与"状态成功改到 Transcoding"同一处
+    // （只有真正会入队的 id 才登记）：预检跳过 / 条目不存在 / 早退的 id 从不登记，
+    // 从根上消除"登记了但没人消费"的残留（历史 bug：残留的 true 会让之后对同一
+    // id 的普通转码被误放大）。清理点见 cancel_item，消费点见 run_transcode_task 入口。
+    begin_transcode(app, ids, true)
 }
 
 /// 转码入口（start_transcode / start_upscale 共用）。
-fn begin_transcode(app: AppHandle, ids: Vec<String>) -> CmdResult<()> {
+/// `upscale=true` 时把通过的 id 登记进 `AppState.upscale_ids`。
+fn begin_transcode(app: AppHandle, ids: Vec<String>, upscale: bool) -> CmdResult<()> {
     let state = app.state::<AppState>();
     if ids.is_empty() {
         return Err("未选择条目".into());
@@ -83,6 +77,11 @@ fn begin_transcode(app: AppHandle, ids: Vec<String>) -> CmdResult<()> {
             }
             match transition(item.status, Status::Transcoding) {
                 Ok(to) => {
+                    // 放大意图与"真正入队"绑定登记（见 start_upscale 的注释）：
+                    // 登记与消费之间不存在被跳过/早退的悬空窗口
+                    if upscale {
+                        state.upscale_ids.lock().insert(id.clone());
+                    }
                     // 进入新任务前进度归零：否则上一轮下载/转码的 100% 会一直挂在进度列
                     let updated = MediaItem {
                         status: to,
@@ -104,14 +103,6 @@ fn begin_transcode(app: AppHandle, ids: Vec<String>) -> CmdResult<()> {
     }
     for (id, msg) in &skipped {
         log_item(&app, id, msg.as_str());
-    }
-    // 放大意图登记与消费之间：被跳过的条目永远不会进入任务线程，必须在这里把
-    // upscale_ids 里的登记移除，否则残留的 true 会让后续普通转码被误放大
-    {
-        let mut set = state.upscale_ids.lock();
-        for (id, _) in &skipped {
-            set.remove(id);
-        }
     }
     if to_run.is_empty() {
         return Err("没有可转码的条目（需要已解析的本地文件）".into());

@@ -147,11 +147,19 @@ pub fn parse_output(stdout: &str) -> Result<Pot> {
 }
 
 /// 是否 YouTube 系 URL（自动生成/下发 PO Token 只对 YouTube 有意义）。
+///
+/// 只判 **host 段**（含子域），不做全串 `contains`：`https://example.com/?u=youtube.com`
+/// 这类只在路径/查询里出现关键词的 URL 不该触发 PO Token 生成链路（deno 冷启动可达分钟级）。
 pub fn is_youtube_url(url: &str) -> bool {
-    let u = url.to_ascii_lowercase();
-    ["youtube.com", "youtu.be", "youtube-nocookie.com"]
+    const HOSTS: [&str; 3] = ["youtube.com", "youtu.be", "youtube-nocookie.com"];
+    // 取 host：`scheme://[userinfo@]host[:port]/...`；无 scheme 时按裸 host/path 处理
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let host_port = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = host_port.rsplit('@').next().unwrap_or(""); // 去掉 userinfo
+    let host = host.split(':').next().unwrap_or(host).to_ascii_lowercase(); // 去掉端口
+    HOSTS
         .iter()
-        .any(|h| u.contains(h))
+        .any(|h| host == *h || host.ends_with(&format!(".{h}")))
 }
 
 /// 组装 yt-dlp `--extractor-args` 的值（youtube 提取器）：
@@ -301,6 +309,13 @@ mod tests {
         assert!(is_youtube_url("https://music.youtube.com/watch?v=x"));
         assert!(!is_youtube_url("https://www.bilibili.com/video/x"));
         assert!(!is_youtube_url(""));
+        // 只认 host：路径/查询里出现关键词不算（避免无谓触发 deno 生成链路）
+        assert!(!is_youtube_url("https://example.com/path?u=youtube.com"));
+        assert!(!is_youtube_url("https://youtube.com.evil.com/watch"));
+        assert!(!is_youtube_url("https://evil-youtube.com/watch"));
+        // 端口 / userinfo 不影响判定；无 scheme 的裸域名也能识别
+        assert!(is_youtube_url("https://www.youtube.com:443/watch?v=x"));
+        assert!(is_youtube_url("youtube.com/watch?v=x"));
     }
 
     #[test]
