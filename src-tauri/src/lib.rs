@@ -100,7 +100,7 @@ fn fatal_dialog(title: &str, text: &str) {
 }
 
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             // 第二实例：解析 argv 并把 URL/覆盖转发给已运行实例（§UL-09 单实例转发）。
@@ -198,6 +198,15 @@ pub fn run() {
             state.persist();
             Ok(())
         })
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .expect("Tauri 应用启动失败");
+    // 退出兜底（异步 persist 的补丁）：命令层的 persist 已全部改为异步写盘
+    // （spawn 线程 + 500ms 去抖，不为写盘延迟卡住 UI 线程），进程退出不会等
+    // 这些线程。这里在退出请求时同步写一次（单次 fsync，毫秒级），保证
+    // "点取消/旋转后立即关窗口"的最后一批状态不丢。
+    app.run(|app_handle, event| {
+        if let tauri::RunEvent::ExitRequested { .. } = event {
+            app_handle.state::<state::AppState>().persist();
+        }
+    });
 }
