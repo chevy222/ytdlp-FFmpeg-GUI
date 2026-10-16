@@ -702,7 +702,9 @@ fn run_probe(app: AppHandle, id: String) {
                     let thumb_proxy = video_url
                         .as_deref()
                         .and_then(|u| network.resolve_proxy(u));
-                    let thumb_cookies = netscape.clone();
+                    // 缩略图下载不传 cookies：缩略图是 CDN 资源，解析已成功说明视频可公开访问；
+                    // 传 cookies 会导致 yt-dlp 退出时 save_cookies 到 temp 文件，
+                    // 若 temp 目录已被清理则 FileNotFoundError（即使缩略图已下载成功）。
                     let thumb_tmp_root = state.paths.temp_dir();
                     tauri::async_runtime::spawn_blocking(move || {
                     let dest = ytdlp_core::thumbs::thumb_path(&cache_dir, &id2);
@@ -713,7 +715,7 @@ fn run_probe(app: AppHandle, id: String) {
                     let r = if video_url.is_some() {
                         if let Some(vurl) = &video_url {
                             fetch_thumb_ytdlp(&resolver2, vurl, &dest, &thumb_tmp_root,
-                                thumb_proxy.as_deref(), thumb_cookies.as_deref(),
+                                thumb_proxy.as_deref(), None,
                                 &mut |l| log_item(&app2, &id2, l))
                         } else {
                             Ok(())
