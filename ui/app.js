@@ -802,7 +802,7 @@ function renderSetPage(){
       '<button class="proto-tag" data-proxy-fill="http://127.0.0.1:7890" title="Clash 混合端口（HTTP/SOCKS5 通用）">Clash · 7890</button>'+
       '<button class="proto-tag" data-proxy-fill="socks5://127.0.0.1:10808" title="V2RayN 默认 SOCKS 端口">V2RayN · 10808</button>'+
       '<button class="proto-tag" data-proxy-fill="socks5://127.0.0.1:1080" title="Shadowsocks 默认 SOCKS 端口">SS · 1080</button>'+
-      '</div>','仅对站点分流中勾选的站点生效；留空 = 全部直连（yt-dlp 可能被系统代理接管）');
+      '</div>','仅对站点分流中勾选的站点生效；留空 = 勾选站点用默认代理 socks5://127.0.0.1:10808（不是直连），其余站点一律直连');
     const smap=n.site_proxy||{};
     h+='<div class="set-hd">站点分流（勾选 = 走代理，其余直连）</div><div class="set-row"><div class="v grow">'+
       '<div class="'+(Object.keys(smap).length?'site-list':'site-empty')+'" id="siteList">'+renderSiteList(smap)+'</div>'+

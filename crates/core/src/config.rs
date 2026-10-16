@@ -124,8 +124,15 @@ pub struct DependenciesConfig {
     pub deno_path: Option<String>,
     /// PO-Token 服务总开关（YouTube 风控验证令牌），默认启用
     pub potoken_enabled: bool,
-    /// PO-Token 值（字符串或文件路径）。留空时即使启用也不传入 --po-token；
-    /// yt-dlp 支持直接传 token 字符串或指向 token 文件的路径。
+    /// 手动 PO-Token 值（可选，优先于自动生成）：
+    /// - 裸 token → 自动补 `web.gvs+` 前缀（yt-dlp 需要 client.context 元信息）；
+    /// - 已带 `client.context+`（含 `+`）→ 原样使用；
+    /// - 存在的文件路径 → 读取内容后按上面规则处理（yt-dlp 的 po_token 配置
+    ///   不接受路径，填路径只是本程序的输入便利）。
+    ///
+    /// 启用且留空时由内置 deno 脚本自动生成并缓存（见 `crate::potoken`）。
+    /// 下发形式为 `--extractor-args "youtube:visitor_data=..;po_token=.."`；
+    /// yt-dlp 没有 `--po-token` 参数。
     pub po_token: String,
 }
 

@@ -343,6 +343,15 @@ fn merge_unified(
 ) -> Result<()> {
     let seg_total = total_duration(metas);
     let target_h = metas.iter().filter_map(|m| m.height).max().unwrap_or(1080);
+    // 多音轨提示：模式 B 的 transcode_segment 固定 `-map 0:a:0?`（只保留主音轨），
+    // 与下载后处理 / 转码链路同属"静默丢数据"场景——那两处都有日志，这里不能漏。
+    let multi_track = metas.iter().filter(|m| m.audio_tracks.unwrap_or(0) > 1).count();
+    if multi_track > 0 {
+        on_log(format!(
+            "统一转码只保留各段主音轨：{multi_track}/{} 段源含多音轨（其余音轨不进入产物）",
+            metas.len()
+        ));
+    }
     let segs: Vec<PathBuf> = (0..params.inputs.len())
         .map(|i| tmp.join(format!("seg_{:02}.mp4", i)))
         .collect();

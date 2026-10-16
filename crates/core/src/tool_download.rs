@@ -285,7 +285,10 @@ pub struct ToolDownloader {
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// 应用代理地址（设置-网络）。工具维护流量（github.com / gyan.dev）统一走它：
     /// 这两个域通常不在用户的"下载站点分流"白名单里，而被墙时依赖下载/更新必须仍
-    /// 可用。留空 = 直连（curl 仍会自行读取 HTTP(S)_PROXY 环境变量）。
+    /// 可用。由调用方（commands/tools.rs）传入 `NetworkConfig::effective_proxy()`，
+    /// 即**代理地址留空时回退默认本地代理**（`socks5://127.0.0.1:10808`，见
+    /// [`crate::config::NetworkConfig::effective_proxy`]）；本类型不做任何回退，
+    /// 拿到 None/空值就不加 `--proxy`（curl 仍会自行读取 HTTP(S)_PROXY 环境变量）。
     pub proxy: Option<String>,
 }
 
