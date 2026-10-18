@@ -9,6 +9,13 @@ use crate::cookies::host_from_url;
 use crate::paths::{atomic_write_json, corrupt_backup_path};
 use crate::{CoreError, Result};
 
+/// 默认 User-Agent（Chrome 稳定版，减少 bot 检测）。
+pub const DEFAULT_USER_AGENT: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
+
+/// 默认 Accept-Language（中文优先，兼容 YouTube/B 站等站点的地区检测）。
+pub const DEFAULT_ACCEPT_LANGUAGE: &str = "zh-CN,zh;q=0.9,en;q=0.8";
+
 /// 下载段（§3.6 下载分组 + §7.2）。
 ///
 /// `Default` 返回规范默认值（1080/4/3/true），配合容器级 `#[serde(default)]`：
@@ -114,7 +121,7 @@ impl GeneralConfig {
     pub const HISTORY_LIMIT_MAX: usize = 200;
 }
 
-/// 依赖段（§3.6 依赖分组：路径输入框留空＝PATH，PO-Token 默认启用）。
+/// 依赖段（§3.6 依赖分组：路径输入框留空＝PATH）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DependenciesConfig {
@@ -122,18 +129,6 @@ pub struct DependenciesConfig {
     pub ffmpeg_path: Option<String>,
     pub ffprobe_path: Option<String>,
     pub deno_path: Option<String>,
-    /// PO-Token 服务总开关（YouTube 风控验证令牌），默认启用
-    pub potoken_enabled: bool,
-    /// 手动 PO-Token 值（可选，优先于自动生成）：
-    /// - 裸 token → 自动补 `web.gvs+` 前缀（yt-dlp 需要 client.context 元信息）；
-    /// - 已带 `client.context+`（含 `+`）→ 原样使用；
-    /// - 存在的文件路径 → 读取内容后按上面规则处理（yt-dlp 的 po_token 配置
-    ///   不接受路径，填路径只是本程序的输入便利）。
-    ///
-    /// 启用且留空时由内置 deno 脚本自动生成并缓存（见 `crate::potoken`）。
-    /// 下发形式为 `--extractor-args "youtube:visitor_data=..;po_token=.."`；
-    /// yt-dlp 没有 `--po-token` 参数。
-    pub po_token: String,
 }
 
 impl Default for DependenciesConfig {
@@ -143,8 +138,6 @@ impl Default for DependenciesConfig {
             ffmpeg_path: None,
             ffprobe_path: None,
             deno_path: None,
-            potoken_enabled: true,
-            po_token: String::new(),
         }
     }
 }
@@ -338,7 +331,6 @@ mod tests {
         assert_eq!(c.general.max_gain_db, 24.0);
         assert!(c.general.check_update);
         assert_eq!(c.general.history_limit, 100);
-        assert!(c.dependencies.potoken_enabled);
         assert!(c.dependencies.yt_dlp_path.is_none());
         assert_eq!(c.network.proxy_url, "");
     }
@@ -572,7 +564,6 @@ mod tests {
         assert_eq!(c.general.concurrency, 6);
         assert_eq!(c.download.fragments, 4);
         assert!(c.download.embed_cover);
-        assert!(c.dependencies.potoken_enabled);
         assert_eq!(c.transcode.max_w, 1920);
     }
 }

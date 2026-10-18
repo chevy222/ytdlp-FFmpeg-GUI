@@ -11,7 +11,6 @@ use ytdlp_core::config::AppConfig;
 use ytdlp_core::exec::ToolResolver;
 use ytdlp_core::history::History;
 use ytdlp_core::paths::Paths;
-use ytdlp_core::potoken::{CachedPot, PotCacheDisk};
 use ytdlp_core::worker::TaskQueue;
 
 fn epoch_ms() -> u64 {
@@ -62,10 +61,6 @@ pub struct AppState {
     pub upscale_ids: Mutex<HashSet<String>>,
     /// CLI 本次调用级覆盖（--dir/--cookies/--yt-dlp-path/--deno-path）
     pub cli: Mutex<CliOverrides>,
-    /// PO Token 自动生成缓存（None = 尚未生成/已过期）。带 TTL，过期后重新生成。
-    pub potoken: Mutex<Option<CachedPot>>,
-    /// PO Token 生成串行锁：避免多任务并发触发重复生成（拿到锁后需再查缓存）。
-    pub potoken_gen: Mutex<()>,
     /// 历史写盘串行锁（同一时刻只有一个写入者）
     persist_lock: Mutex<()>,
     /// persist 请求序号（每调用一次 +1）
@@ -97,14 +92,6 @@ impl AppState {
         // 设置页的"历史上限"要真正生效（此前只存在于配置里，UI 只能标注"暂未生效"）
         history.set_limit(config.general.history_limit);
         let concurrency = config.general.concurrency as usize;
-        // PO Token 磁盘缓存：启动时读，未过期则直接用，省一次 deno 冷启动
-        let potoken_disk = std::fs::read(paths.cache_dir().join("potoken.json"))
-            .ok()
-            .and_then(|b| serde_json::from_slice::<PotCacheDisk>(&b).ok())
-            .and_then(|d| d.to_cached());
-        if potoken_disk.is_some() {
-            ytdlp_core::log::info("PO Token 磁盘缓存命中，跳过冷启动生成");
-        }
         Self {
             paths,
             history: Mutex::new(history),
@@ -115,8 +102,6 @@ impl AppState {
             merge_tmp: Mutex::new(HashSet::new()),
             upscale_ids: Mutex::new(HashSet::new()),
             cli: Mutex::new(CliOverrides::default()),
-            potoken: Mutex::new(potoken_disk),
-            potoken_gen: Mutex::new(()),
             persist_lock: Mutex::new(()),
             persist_req: AtomicU64::new(0),
             persist_done: AtomicU64::new(0),

@@ -19,7 +19,6 @@ pub mod log;
 pub mod merge;
 pub mod model;
 pub mod paths;
-pub mod potoken;
 pub mod probe;
 pub mod thumbs;
 pub mod timefmt;

@@ -5,7 +5,7 @@ use ytdlp_core::download::{self, DownloadParams, post_process, run_download};
 use ytdlp_core::model::Status;
 use ytdlp_core::worker::SubmitOutcome;
 use ytdlp_core::{transition, CoreError};
-use super::{CmdResult, err_string, SlotGuard, ProgressPayload, update_item, update_progress, transition_in, log_item, log_error_lines, persist, default_output_dir, resolve_cookies, resolve_potoken, ensure_main_window};
+use super::{CmdResult, err_string, SlotGuard, ProgressPayload, update_item, update_progress, transition_in, log_item, log_error_lines, persist, default_output_dir, resolve_cookies, ensure_main_window};
 use crate::state::AppState;
 
 #[tauri::command(async)]
@@ -112,8 +112,6 @@ pub(super) fn run_download_task(app: AppHandle, id: String, format_id: Option<St
         out_dir,
         template,
         proxy,
-        po_token,
-        visitor_data,
         netscape,
         sections,
         js_runtime,
@@ -141,14 +139,6 @@ pub(super) fn run_download_task(app: AppHandle, id: String, format_id: Option<St
             )
         };
         let resolver = state.resolver();
-        // PO Token（YouTube 风控）：手动填入优先，否则自动生成（带缓存/失败回退）
-        let (po_token, visitor_data) = resolve_potoken(
-            &state,
-            &resolver,
-            &url,
-            proxy.as_deref(),
-            |l| log_item(&app, &id, l),
-        );
         let out_dir = default_output_dir(&state);
         let template = cfg.filename_template.clone();
         let task_tmp = state.paths.task_temp_dir(&id);
@@ -168,8 +158,6 @@ pub(super) fn run_download_task(app: AppHandle, id: String, format_id: Option<St
             out_dir,
             template,
             proxy,
-            po_token,
-            visitor_data,
             netscape,
             sections,
             js_runtime,
@@ -197,8 +185,6 @@ pub(super) fn run_download_task(app: AppHandle, id: String, format_id: Option<St
             .resolve(ytdlp_core::exec::Tool::Ffmpeg)
             .ok()
             .map(|p| p.to_string_lossy().into_owned()),
-        po_token,
-        visitor_data,
     };
 
     let app2 = app.clone();

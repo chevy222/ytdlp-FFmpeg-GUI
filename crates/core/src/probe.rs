@@ -67,8 +67,6 @@ fn ytdlp_args(
     url: &str,
     cookies_file: Option<&Path>,
     network: &NetworkConfig,
-    po_token: Option<&str>,
-    visitor_data: Option<&str>,
     extra: &[&str],
 ) -> Vec<String> {
     let mut args: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
@@ -84,12 +82,14 @@ fn ytdlp_args(
         args.push("--proxy".into());
         args.push(p);
     }
-    // PO Token：yt-dlp 无 --po-token 参数，走 --extractor-args；GVS 场景
-    // poToken 与 visitorData 绑定，成对下发（见 potoken::extractor_args）。
-    if let Some(extra) = crate::potoken::extractor_args(po_token, visitor_data) {
-        args.push("--extractor-args".into());
-        args.push(extra);
-    }
+    // 自定义 UA + Accept-Language：让请求更像真实浏览器，减少 bot 检测
+    args.push("--user-agent".into());
+    args.push(crate::config::DEFAULT_USER_AGENT.to_string());
+    args.push("--add-header".into());
+    args.push(format!(
+        "Accept-Language:{}",
+        crate::config::DEFAULT_ACCEPT_LANGUAGE
+    ));
     args.push(url.to_string());
     args
 }
@@ -106,8 +106,6 @@ pub fn list_playlist_entries(
     url: &str,
     cookies_file: Option<&Path>,
     network: &NetworkConfig,
-    po_token: Option<&str>,
-    visitor_data: Option<&str>,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     mut on_log: impl FnMut(String),
 ) -> std::result::Result<Vec<PlaylistEntry>, ProbeFailure> {
@@ -117,8 +115,6 @@ pub fn list_playlist_entries(
         url,
         cookies_file,
         network,
-        po_token,
-        visitor_data,
         &["-J", "--flat-playlist", "--no-warnings"],
     );
     on_log(crate::exec::display_command("yt-dlp", &args));
@@ -212,7 +208,7 @@ impl std::fmt::Display for ProbeFailure {
 /// - `cookies_file`：Netscape 临时文件路径（None 则不带）；
 /// - `cancel`：置位后终止 yt-dlp 并返回 [`ProbeErrorKind::Cancelled`]；
 /// - `on_log`：接收实际执行的完整命令行（条目日志展示用）。
-// 参数较多是"解析入口"的固有形态（工具/URL/Cookie/网络/PO-Token/取消/日志）；
+// 参数较多是"解析入口"的固有形态（工具/URL/Cookie/网络/取消/日志）；
 // 与 merge::run_merge / transcode::run_transcode 同款，统一按项目惯例放行该 lint。
 #[allow(clippy::too_many_arguments)]
 pub fn probe_url(
@@ -220,8 +216,6 @@ pub fn probe_url(
     url: &str,
     cookies_file: Option<&Path>,
     network: &NetworkConfig,
-    po_token: Option<&str>,
-    visitor_data: Option<&str>,
     playlist: bool,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     mut on_log: impl FnMut(String),
@@ -237,8 +231,6 @@ pub fn probe_url(
         url,
         cookies_file,
         network,
-        po_token,
-        visitor_data,
         extra,
     );
     on_log(crate::exec::display_command("yt-dlp", &args));
