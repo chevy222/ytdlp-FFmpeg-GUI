@@ -122,24 +122,13 @@ impl GeneralConfig {
 }
 
 /// 依赖段（§3.6 依赖分组：路径输入框留空＝PATH）。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DependenciesConfig {
     pub yt_dlp_path: Option<String>,
     pub ffmpeg_path: Option<String>,
     pub ffprobe_path: Option<String>,
     pub deno_path: Option<String>,
-}
-
-impl Default for DependenciesConfig {
-    fn default() -> Self {
-        Self {
-            yt_dlp_path: None,
-            ffmpeg_path: None,
-            ffprobe_path: None,
-            deno_path: None,
-        }
-    }
 }
 
 /// 网络段（§3.6 网络分组：代理地址 + 站点分流）。
