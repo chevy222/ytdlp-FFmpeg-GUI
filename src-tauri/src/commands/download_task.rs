@@ -367,12 +367,8 @@ fn finish_download(app: &AppHandle, id: &str, result: Result<download::DownloadO
             }
         }
     });
-    // 下载完成后：
-    // 1. 始终清理 yt-dlp --write-thumbnail 写出的封面文件（否则残留桌面）；
-    // 2. 条目还没有缩略图时，优先用这张封面做缩略图，兜底 ffmpeg 抽帧。
-    //
-    // 此前只在 need_thumb 时才进清理逻辑——条目已有远程缩略图时整个 block 被
-    // 跳过，封面文件永久残留。
+    // 下载完成后：如果解析阶段缩略图下载失败（item.thumb 为 None），
+    // 用 ffmpeg 从产物提取内嵌封面流，再不行抽首帧。
     if final_status == Status::Done {
         if let Some(out_path) = final_path {
             let (need_thumb, cover_idx) = {
@@ -385,55 +381,13 @@ fn finish_download(app: &AppHandle, id: &str, result: Result<download::DownloadO
                     None => (false, None),
                 }
             };
-            let app2 = app.clone();
-            let id2 = id.to_string();
-            let cache_dir = state.paths.cache_dir();
-            let resolver2 = state.resolver();
-            // spawn_blocking：内部是 std::fs::copy/remove 与 ffmpeg 子进程（阻塞）
-            tauri::async_runtime::spawn_blocking(move || {
-                let out = std::path::Path::new(&out_path);
-                // 优先取 yt-dlp --write-thumbnail 写在输出目录的封面
-                let written = ytdlp_core::thumbs::collect_written_thumbnail(out);
-                let mut thumb_ok = false;
-                if let Some(thumb_file) = written {
-                    // 需要缩略图时复制到缓存；不需要时只清理
-                    if need_thumb {
-                        let dest = ytdlp_core::thumbs::thumb_path(&cache_dir, &id2);
-                        thumb_ok = match std::fs::copy(&thumb_file, &dest) {
-                            Ok(_) => {
-                                log_item(&app2, &id2, format!("缩略图：取自 yt-dlp 封面 {}", thumb_file.display()));
-                                true
-                            }
-                            Err(e) => {
-                                log_item(&app2, &id2, format!("缩略图：复制封面失败（{}），回退 ffmpeg 抽帧", e));
-                                false
-                            }
-                        };
-                        if thumb_ok {
-                            update_item(&app2, &id2, |it| {
-                                it.thumb = Some(dest.to_string_lossy().into_owned());
-                            });
-                            app2.state::<AppState>().persist();
-                        }
-                    }
-                    // 无论是否需要缩略图、复制成功与否，封面文件都不再需要。
-                    // Windows 上刚下载完的文件可能被 AV 锁定，重试 5 次（每次 200ms）。
-                    for attempt in 0..5 {
-                        match std::fs::remove_file(&thumb_file) {
-                            Ok(_) => break,
-                            Err(_) if attempt < 4 => {
-                                std::thread::sleep(std::time::Duration::from_millis(200));
-                            }
-                            Err(e) => {
-                                log_item(&app2, &id2, format!("缩略图：清理封面文件失败（{}），请手动删除 {}", e, thumb_file.display()));
-                            }
-                        }
-                    }
-                } else if need_thumb {
-                    log_item(&app2, &id2, "缩略图：输出目录无封面文件，ffmpeg 抽帧".to_string());
-                }
-                // 兜底：需要缩略图且封面文件不可用时，ffmpeg 从产物抽内嵌封面流，再不行抽首帧
-                if need_thumb && !thumb_ok {
+            if need_thumb {
+                let app2 = app.clone();
+                let id2 = id.to_string();
+                let cache_dir = state.paths.cache_dir();
+                let resolver2 = state.resolver();
+                tauri::async_runtime::spawn_blocking(move || {
+                    let out = std::path::Path::new(&out_path);
                     let dest = ytdlp_core::thumbs::thumb_path(&cache_dir, &id2);
                     if ytdlp_core::thumbs::ensure_thumb(
                         &resolver2,
@@ -449,8 +403,8 @@ fn finish_download(app: &AppHandle, id: &str, result: Result<download::DownloadO
                         });
                         app2.state::<AppState>().persist();
                     }
-                }
-            });
+                });
+            }
         }
     }
     // 任务结束：清理本任务私有临时目录（cookie 导出文件也在这个目录下，一并清理；

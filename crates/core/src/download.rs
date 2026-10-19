@@ -144,9 +144,8 @@ pub fn build_args(url: &str, p: &DownloadParams, cfg: &DownloadConfig) -> Vec<St
     if p.embed_cover {
         args.push("--embed-thumbnail".into());
         args.push("--embed-metadata".into());
-        // --write-thumbnail 把封面（webp/jpg）同时写到输出目录，下载完成后
-        // 直接取这个文件做列表缩略图，避免再跑 ffmpeg 抽帧（thumbs::collect_written_thumbnail）
-        args.push("--write-thumbnail".into());
+        // 不写 --write-thumbnail：解析阶段已独立下载缩略图到 cache/thumbs/，
+        // 下载时传 cookies 反而会 403；--embed-thumbnail 只嵌入 MP4 元数据不写文件
     }
     // 音频仅提取
     if p.audio_only {
