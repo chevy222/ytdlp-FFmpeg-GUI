@@ -30,10 +30,24 @@ fn locked_tier() -> Option<TranscodeTier> {
 
 fn set_locked_tier(tier: TranscodeTier) {
     let mut cur = LOCKED_TIER.get_or_init(|| Mutex::new(None)).lock();
-    // 只由第一个成功的层级写入：并发任务各自"先读后写"时，后来的写入者不得
-    // 覆盖已有结论（两者通常相同，但确定性比"最后写入者胜"更可解释）
-    if cur.is_none() {
-        *cur = Some(tier);
+    match *cur {
+        // 首次成功：记录该层级
+        None => *cur = Some(tier),
+        // 只允许向"更低层级"单调下调：锁定层级在本文件失败、回落到更低层级才成功时，
+        // 说明锁定层级对该文件不可用，后续文件直接从更低层级开始，避免重复试错。
+        // 绝不上调（保持确定性，也避免"最后写入者胜"的抖动）。
+        Some(c) if tier_rank(tier) > tier_rank(c) => *cur = Some(tier),
+        _ => {}
+    }
+}
+
+/// 层级序号（0 = 最高/最优，3 = 最低/最稳）；用于锁定层级的单调下调比较。
+fn tier_rank(t: TranscodeTier) -> u8 {
+    match t {
+        TranscodeTier::GpuQsv => 0,
+        TranscodeTier::HybridQsv => 1,
+        TranscodeTier::SoftwareQsv => 2,
+        TranscodeTier::Software => 3,
     }
 }
 
@@ -286,14 +300,25 @@ static HW_ENCODERS_CACHE: std::sync::OnceLock<
 pub fn detect_hw_encoders(resolver: &ToolResolver) -> Result<HwEncoders> {
     const TTL: std::time::Duration = std::time::Duration::from_secs(300);
     let cache = HW_ENCODERS_CACHE.get_or_init(|| parking_lot::Mutex::new(None));
-    // 持锁探测：并发任务同时命中未缓存时只放一个子进程出去，其余等结果
-    let mut cur = cache.lock();
-    if let Some((at, hw)) = cur.as_ref() {
-        if at.elapsed() < TTL {
-            return Ok(*hw);
+    // 1) 命中缓存：短锁读一下即可
+    {
+        let cur = cache.lock();
+        if let Some((at, hw)) = cur.as_ref() {
+            if at.elapsed() < TTL {
+                return Ok(*hw);
+            }
         }
     }
+    // 2) 锁外探测（子进程最长 30s）：TTL 过期时若持锁跑 `ffmpeg -encoders`，
+    // 并发的其它转码任务会全部阻塞在这把锁上。宁可允许少量并发探测，也不阻塞全局。
     let hw = detect_hw_encoders_uncached(resolver)?;
+    // 3) 回填：探测期间若有其它线程已写入更新鲜的结果，直接复用它（double-check）
+    let mut cur = cache.lock();
+    if let Some((at, cached)) = cur.as_ref() {
+        if at.elapsed() < TTL {
+            return Ok(*cached);
+        }
+    }
     *cur = Some((std::time::Instant::now(), hw));
     Ok(hw)
 }
@@ -655,15 +680,17 @@ pub fn build_args_for_tier(
     args.extend(enc_args);
     if qsv_encode {
         // QSV 编码层码率三件套：源码率（缺省用兜底码率 3500，原设置项已移除），
-        // 封顶截断；maxrate = 1.2×、bufsize = 2×（bat 同款）
+        // 封顶截断；maxrate = 1.2×、bufsize = 2×（bat 同款）。
+        // 源码率 0（探测失败/异常）视为缺失 → 兜底 3500，绝不因 `filter(>0)` 变成
+        // "不写码率参数"而让编码器退到实现默认码控（产物体积/画质不可控）。
         let src = meta
             .vbitrate_kbps
+            .filter(|kb| *kb > 0)
             .or(Some(3500))
             .map(|src| match params.brcap_kbps.filter(|c| *c > 0) {
                 Some(cap) => src.min(cap),
                 None => src,
-            })
-            .filter(|kb| *kb > 0);
+            });
         if let Some(kb) = src {
             let maxkb = kb * 12 / 10;
             args.push("-b:v".into());
@@ -837,6 +864,10 @@ pub fn run_transcode(
         0
     };
     for (i, tier) in all_tiers[start_idx..].iter().enumerate() {
+        // 回落进入新层级：先把进度基线归零，避免上一层级已上报的百分比让 UI 回跳
+        if i > 0 {
+            on_progress(0.0);
+        }
         let r = run_transcode_once(
             resolver,
             params,

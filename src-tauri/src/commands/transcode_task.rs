@@ -105,6 +105,8 @@ fn begin_transcode(app: AppHandle, ids: Vec<String>, upscale: bool) -> CmdResult
         log_item(&app, id, msg.as_str());
     }
     if to_run.is_empty() {
+        // 先落盘再返回：上面的 skipped 日志已写入内存 history，不 persist 会在重启后丢失
+        persist(&app);
         return Err("没有可转码的条目（需要已解析的本地文件）".into());
     }
     for id in to_run {
@@ -112,7 +114,10 @@ fn begin_transcode(app: AppHandle, ids: Vec<String>, upscale: bool) -> CmdResult
             let mut q = state.queue.lock();
             q.submit(&id)
         };
-        if outcome == SubmitOutcome::Queued {
+        if matches!(
+            outcome,
+            SubmitOutcome::Queued | SubmitOutcome::AlreadyRunning
+        ) {
             log_item(&app, &id, "已排队，等待并发 slot…");
         } else {
             log_item(&app, &id, "开始转码…");

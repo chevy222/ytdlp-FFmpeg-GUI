@@ -218,8 +218,8 @@ fn transcode_segment(
     // 清掉源 rotate 标签（-noautorotate 已禁自动旋转，标签残留会让播放器再转一次）
     args.push("-metadata:s:v:0".into());
     args.push("rotate=0".into());
-    args.push("-movflags".into());
-    args.push("+faststart".into());
+    // 中间段恒为 mp4，且随后会被 concat 直拼成最终产物（最终产物在 concat_copy 里
+    // 按容器加 +faststart）。段上加 faststart 只是让中间文件白写一次 moov 重排，故不加。
     args.push("-y".into());
     args.push("-progress".into());
     args.push("pipe:1".into());

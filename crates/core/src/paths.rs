@@ -117,15 +117,15 @@ pub fn safe_component(id: &str) -> String {
     s
 }
 
-/// 损坏备份路径：`<原名>.corrupt-<epoch秒>.json`（config/history 统一口径，
-/// 多次损坏不互相覆盖）。
+/// 损坏备份路径：`<原名>.corrupt-<epoch纳秒>.json`（config/history 统一口径，
+/// 纳秒粒度避免"同一秒内二次损坏互相覆盖"）。
 ///
 /// 用 `OsString` 拼名而不是 `format!("{}", path.display())`：后者对非 UTF-8 路径
 /// 会把非法字节替换成 U+FFFD 再落盘，备份文件凭空改名。
 pub fn corrupt_backup_path(path: &Path) -> PathBuf {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_nanos())
         .unwrap_or(0);
     let mut name = path
         .file_name()
@@ -156,11 +156,14 @@ pub fn atomic_write_json_with<T: serde::Serialize>(
     pretty: bool,
 ) -> crate::Result<()> {
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let stem = path
+    // 用 OsString 拼名（不用 to_string_lossy）：非 UTF-8 路径不会被替换成 U+FFFD，
+    // 与 corrupt_backup_path 同一原则。
+    let mut name = path
         .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "data".to_string());
-    let tmp = path.with_file_name(format!("{stem}.{}.{seq}.tmp", std::process::id()));
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_else(|| std::ffi::OsString::from("data"));
+    name.push(format!(".{}.{}.tmp", std::process::id(), seq));
+    let tmp = path.with_file_name(name);
     let bytes = if pretty {
         serde_json::to_vec_pretty(value)?
     } else {
@@ -181,6 +184,14 @@ pub fn atomic_write_json_with<T: serde::Serialize>(
         // rename 失败（如目标被其他程序占用）时清理 tmp，避免累积 *.tmp 垃圾
         let _ = std::fs::remove_file(&tmp);
         return Err(e.into());
+    }
+    // Unix：rename 后 fsync 父目录，保证"目录项"也落盘。数据页已 sync_all，
+    // 但目录项未 fsync 时，崩溃/掉电可能让 rename 未持久、回退到旧版本文件。
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
     }
     Ok(())
 }
@@ -234,26 +245,33 @@ pub fn unique_output_path(
     policy: &str,
 ) -> crate::Result<PathBuf> {
     let candidate = out_dir.join(format!("{base}.{ext}"));
-    if !candidate.exists() {
-        if try_reserve(&candidate) {
-            return Ok(candidate);
+    match try_reserve(&candidate) {
+        Ok(true) => return Ok(candidate),
+        Ok(false) => {
+            // 已存在：skip 策略直接报错，其余策略落到下面尝试递增名
+            if policy == "skip" {
+                return Err(crate::CoreError::Io(std::io::Error::other(format!(
+                    "输出已存在，按策略跳过：{}",
+                    candidate.display()
+                ))));
+            }
         }
-    } else if policy == "skip" {
-        return Err(crate::CoreError::Io(std::io::Error::other(format!(
-            "输出已存在，按策略跳过：{}",
-            candidate.display()
-        ))));
+        // 目录不可写/不存在等真实 IO 错误：直接上报，不再空转 1000 次后报通用错误
+        Err(e) => return Err(e.into()),
     }
     for i in 1..1000 {
         let p = out_dir.join(format!("{base} ({i}).{ext}"));
-        if try_reserve(&p) {
-            return Ok(p);
-        }
-        if p.exists() && policy == "skip" {
-            return Err(crate::CoreError::Io(std::io::Error::other(format!(
-                "输出已存在，按策略跳过：{}",
-                p.display()
-            ))));
+        match try_reserve(&p) {
+            Ok(true) => return Ok(p),
+            Ok(false) => {
+                if policy == "skip" {
+                    return Err(crate::CoreError::Io(std::io::Error::other(format!(
+                        "输出已存在，按策略跳过：{}",
+                        p.display()
+                    ))));
+                }
+            }
+            Err(e) => return Err(e.into()),
         }
     }
     Err(crate::CoreError::Io(std::io::Error::other(
@@ -262,16 +280,19 @@ pub fn unique_output_path(
 }
 
 /// 抢占输出名（`create_new` 是原子操作：只有一方能成功）。
-/// 目录不可写时返回 false，由调用方继续尝试或报错。
-fn try_reserve(path: &Path) -> bool {
+///
+/// - `Ok(true)`：抢占成功；
+/// - `Ok(false)`：目标已存在（由调用方按碰撞策略处理）；
+/// - `Err`：目录不可写/不存在等真实 IO 错误（调用方应直接上报，而非继续尝试）。
+fn try_reserve(path: &Path) -> std::io::Result<bool> {
     match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)
     {
-        Ok(_) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
-        Err(_) => false,
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e),
     }
 }
 

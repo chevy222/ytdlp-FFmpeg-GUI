@@ -118,7 +118,6 @@ pub fn clear_temp_inner(state: &AppState) -> std::io::Result<usize> {
 #[tauri::command]
 pub async fn clear_temp(app: AppHandle, win: tauri::WebviewWindow) -> CmdResult<()> {
     ensure_main_window(&win)?;
-    let _state = app.state::<AppState>();
     // 大临时目录 remove_dir_all 是秒级阻塞，放 blocking 线程（A6）
     tauri::async_runtime::spawn_blocking(move || {
         let st = app.state::<AppState>();
@@ -282,6 +281,12 @@ fn version_greater(a: &str, b: &str) -> bool {
         if na != nb {
             return na > nb;
         }
+    }
+    // 数字段完全相等时，含预发布后缀（'-'）的一方视为更旧（如 1.2.3-beta < 1.2.3）
+    let a_pre = a.contains('-');
+    let b_pre = b.contains('-');
+    if a_pre != b_pre {
+        return !a_pre;
     }
     false
 }

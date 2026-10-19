@@ -74,7 +74,7 @@ fn apply_cli_args(app: &tauri::AppHandle, args: Vec<String>) {
         // 出现一次同步磁盘写把窗口卡住。
         let app2 = app.clone();
         std::thread::spawn(move || {
-            let _ = commands::add_url(app2, cli.urls);
+            let _ = commands::add_url_inner(&app2, cli.urls);
         });
     }
 }
@@ -100,7 +100,7 @@ fn fatal_dialog(title: &str, text: &str) {
 }
 
 pub fn run() {
-    let app = tauri::Builder::default()
+    let app = match tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             // 第二实例：解析 argv 并把 URL/覆盖转发给已运行实例（§UL-09 单实例转发）。
@@ -199,7 +199,14 @@ pub fn run() {
             Ok(())
         })
         .build(tauri::generate_context!())
-        .expect("Tauri 应用启动失败");
+    {
+        Ok(a) => a,
+        Err(e) => {
+            // GUI 无控制台：启动失败必须有可见提示，而不是静默 panic（日志 + 弹窗）
+            fatal_dialog("启动失败", &format!("Tauri 应用启动失败：{e}"));
+            std::process::exit(1);
+        }
+    };
     // 退出兜底（异步 persist 的补丁）：命令层的 persist 已全部改为异步写盘
     // （spawn 线程 + 500ms 去抖，不为写盘延迟卡住 UI 线程），进程退出不会等
     // 这些线程。这里在退出请求时同步写一次（单次 fsync，毫秒级），保证

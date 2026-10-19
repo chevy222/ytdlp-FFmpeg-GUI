@@ -127,7 +127,10 @@ pub fn start_merge(
             log_item(&app, id, "随本批合并作业一起执行…");
         }
     }
-    if outcome == SubmitOutcome::Queued {
+    if matches!(
+        outcome,
+        SubmitOutcome::Queued | SubmitOutcome::AlreadyRunning
+    ) {
         log_item(&app, &anchor, "已排队，等待并发 slot…");
     } else {
         log_item(&app, &anchor, "开始合并…");

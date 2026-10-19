@@ -116,14 +116,7 @@ impl History {
             self.items.push(item);
         }
         while self.items.len() > self.limit {
-            // 先找最旧终态；找不到再找最旧的非活跃条目（Ready/NeedLogin/Unknown）。
-            // 此前只用 is_terminal 判定，导致全是 Ready 时永远裁不动、limit 形同失效。
-            let pos = self
-                .items
-                .iter()
-                .position(|i| i.status.is_terminal())
-                .or_else(|| self.items.iter().position(|i| !i.status.is_active()));
-            match pos {
+            match self.oldest_trimmable() {
                 Some(pos) => {
                     self.items.remove(pos);
                 }
@@ -140,6 +133,31 @@ impl History {
                 }
             }
         }
+    }
+
+    /// 最旧的可裁剪条目下标：先在所有**终态**里取 `updated_at` 最小者；
+    /// 没有终态时，在所有**非活跃**条目（Ready/NeedLogin/Unknown）里取最小的。
+    /// 活跃任务（Probing/处理中）永不裁剪。
+    ///
+    /// 用 `updated_at` 而非插入顺序：长驻条目（早期插入、最近才完成）位置仍在队首，
+    /// 按位置裁剪会优先删掉"刚完成的长任务"；按时间戳则删真正最旧的。
+    /// 空 `updated_at`（旧版本条目）字典序最小，视为最旧优先裁。
+    fn oldest_trimmable(&self) -> Option<usize> {
+        let oldest = |only_terminal: bool| -> Option<usize> {
+            self.items
+                .iter()
+                .enumerate()
+                .filter(|(_, i)| {
+                    if only_terminal {
+                        i.status.is_terminal()
+                    } else {
+                        !i.status.is_active()
+                    }
+                })
+                .min_by(|(_, a), (_, b)| a.updated_at.cmp(&b.updated_at))
+                .map(|(idx, _)| idx)
+        };
+        oldest(true).or_else(|| oldest(false))
     }
 
     /// 删除条目（仅终态可删，调用方保证）。
@@ -189,7 +207,9 @@ impl History {
                 // 用户全部历史与运行中任务状态消失。这里降级为逐条容错：
                 // 坏条目跳过并计数，好条目保留。
                 let recovered = recover_partial_history(&text);
-                if let Some(partial) = recovered {
+                // 仅当**确实救回至少一条**时才按"部分恢复"返回；若 kept==0（每条都坏），
+                // 不当作加载成功（否则 UI 直接空表却以为正常），落到下面的损坏分支。
+                if let Some(partial) = recovered.filter(|p| p.kept > 0) {
                     crate::log::warn(format!(
                         "history.json 存在无法解析的条目，已跳过 {} 条、保留 {} 条（其余字段损坏部分已尽力恢复）",
                         partial.skipped, partial.kept
@@ -199,9 +219,8 @@ impl History {
                         .limit
                         .clamp(1, crate::config::GeneralConfig::HISTORY_LIMIT_MAX);
                     // 备份原文件，让用户能找回被跳过条目的数据
-                    if let Some(backup) = crate::paths::corrupt_backup_path(path).into() {
-                        let _ = std::fs::copy(path, &backup);
-                    }
+                    let backup = crate::paths::corrupt_backup_path(path);
+                    let _ = std::fs::copy(path, &backup);
                     return Ok(h);
                 }
                 let backup = crate::paths::corrupt_backup_path(path);

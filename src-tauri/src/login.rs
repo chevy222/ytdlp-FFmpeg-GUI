@@ -269,9 +269,10 @@ fn login_inject_script() -> String {
       'border:none;cursor:pointer;font-size:14px;font-weight:600;color:#ffffff;' +
       'background:#0f766e;padding:8px 22px;border-radius:6px;box-shadow:0 0 0 1px rgba(255,255,255,0.5);');
     btn.onclick = function () {
-      var cookies = encodeURIComponent(document.cookie);
-      var host = encodeURIComponent(location.hostname);
-      window.location.href = 'http://127.0.0.1/ytdlp-login-done?host=' + host + '&cookies=' + cookies;
+      // 只导航到固定魔法 URL 触发"登录完成"；Cookie 由 Rust 侧经 WebView2 COM
+      // 直接抓取（不接受 URL 载荷）。不再把 document.cookie 拼进地址——
+      // 那样只是把明文 Cookie 冗余地写进 location 字符串，无任何收益。
+      window.location.href = 'http://127.0.0.1/ytdlp-login-done';
     };
     var hint = document.createElement('div');
     hint.id = 'ytdlp-login-hint';

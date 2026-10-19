@@ -54,7 +54,12 @@ impl CookieStore {
             uuid::Uuid::new_v4()
         ));
         std::fs::write(&tmp, netscape_format(&cookies))?;
-        std::fs::rename(&tmp, &f)?;
+        // rename 失败（目标被占用，Windows 常见）时清掉 UUID 命名的 tmp，
+        // 否则这些 .tmp 会在 cookies 目录里长期累积（与 atomic_write_json 同口径）。
+        if let Err(e) = std::fs::rename(&tmp, &f) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         Ok(())
     }
 
@@ -161,7 +166,8 @@ fn netscape_format(cookies: &[CookieEntry]) -> String {
             Some(e) => format!("{}", e as i64),
             None => String::new(),
         };
-        let value = c.value.replace(['\t', '\n'], " ");
+        // 制表/换行/回车都会破坏 Netscape 行的字段结构，统一替换为空格
+        let value = c.value.replace(['\t', '\n', '\r'], " ");
         // HttpOnly 用 `#HttpOnly_` 前缀标记（curl / yt-dlp / MozillaCookieJar
         // 的通行写法），与 netscape_parse 的识别对称，否则 http_only 标志在
         // 第一次保存后永久丢失
@@ -292,11 +298,16 @@ pub fn host_from_url(url: &str) -> Option<String> {
     Some(u.host_str()?.to_lowercase())
 }
 
-/// 文件名安全化（host 中不允许的字符替换）。
+/// 文件名安全化（host 中不允许的字符替换，并把字母统一小写）。
+///
+/// 小写化保证"存/删/取"用同一文件名：`host_from_url` 已返回小写，但 `save_host`/
+/// `list_hosts`/`delete_host` 的外部入参未必，大小写不一致会生成两份文件、匹配落空。
 pub fn sanitize_host(host: &str) -> String {
     host.chars()
         .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else if c == '.' || c == '-' {
                 c
             } else {
                 '_'

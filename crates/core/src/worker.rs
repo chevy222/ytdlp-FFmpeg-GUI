@@ -5,13 +5,16 @@
 
 use std::collections::{HashSet, VecDeque};
 
-/// 提交结果：立即启动或进入等待。
+/// 提交结果：立即启动、进入等待、或该任务已在运行/排队。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubmitOutcome {
     /// 有并发 slot，调用方应立刻启动任务
     StartNow,
     /// 已排队，等待 slot 释放
     Queued,
+    /// 该任务**已在运行或已在等待队列**：调用方不得再启动一次（幂等提交）。
+    /// 与 [`SubmitOutcome::Queued`] 区分开——后者是"本次刚入队"，前者是"本来就已在处理"。
+    AlreadyRunning,
 }
 
 /// 并发任务队列（按 id 管理；同一任务重复提交不重复排队）。
@@ -51,10 +54,11 @@ impl TaskQueue {
         to_launch
     }
 
-    /// 提交任务。返回 StartNow 时该任务已占用 slot。
+    /// 提交任务。返回 StartNow 时该任务已占用 slot；若任务已在运行/排队，
+    /// 返回 [`SubmitOutcome::AlreadyRunning`]（调用方不应再启动一次）。
     pub fn submit(&mut self, id: &str) -> SubmitOutcome {
         if self.running.contains(id) || self.waiting.iter().any(|w| w == id) {
-            return SubmitOutcome::Queued;
+            return SubmitOutcome::AlreadyRunning;
         }
         if self.running.len() < self.concurrency {
             self.running.insert(id.to_string());
@@ -140,7 +144,7 @@ mod tests {
     fn duplicate_submit_no_op() {
         let mut q = TaskQueue::new(1);
         assert_eq!(q.submit("a"), SubmitOutcome::StartNow);
-        assert_eq!(q.submit("a"), SubmitOutcome::Queued);
+        assert_eq!(q.submit("a"), SubmitOutcome::AlreadyRunning);
         assert_eq!(q.running_count(), 1);
     }
 

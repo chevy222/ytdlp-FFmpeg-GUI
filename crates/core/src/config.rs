@@ -290,7 +290,11 @@ impl AppConfig {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        atomic_write_json(path, self)
+        // 落盘前先在副本上 sanitize：把"load 与 save 都必须调用 sanitize"的契约
+        // 收进函数内部，不再依赖调用方纪律——越界值（如负 max_gain_db）绝不会写进文件。
+        let mut normalized = self.clone();
+        normalized.sanitize();
+        atomic_write_json(path, &normalized)
     }
 }
 

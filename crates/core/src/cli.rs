@@ -31,6 +31,22 @@ fn take_value(it: &mut std::slice::Iter<'_, String>) -> Option<String> {
     Some(v.clone())
 }
 
+/// 命令行用法（`--help` 输出）。
+const USAGE: &str = "\
+ytdlp-FFmpeg-GUI — 下载/转码/合并一体的本地视频工具箱
+
+用法：
+  ytdlp-FFmpeg-GUI [URL ...] [选项]
+
+选项：
+  --url, -u <URL>        添加下载链接（可重复；也可直接给裸 URL）
+  --dir <路径>           本次调用的输出目录（不写入配置）
+  --cookies <路径>       本次调用的 cookie 文件（Netscape 格式）
+  --yt-dlp-path <路径>   本次调用的 yt-dlp 可执行文件
+  --deno-path <路径>     本次调用的 deno 可执行文件（YouTube JS 运行时）
+  --help, -h             显示本帮助
+  --version, -v          显示版本";
+
 /// 解析命令行参数（不含 argv[0]）。
 ///
 /// 支持：`--url <u>`（可多次）/ `--cookies <p>` / `--dir <p>` /
@@ -49,7 +65,11 @@ pub fn parse_cli_args(args: &[String]) -> CliArgs {
             "--dir" => out.dir = take_value(&mut it),
             "--yt-dlp-path" => out.yt_dlp_path = take_value(&mut it),
             "--deno-path" => out.deno_path = take_value(&mut it),
-            "--help" | "-h" | "--version" | "-v" => { /* 参数保留在 urls 外的语义：忽略 */
+            // 帮助/版本：GUI 程序无控制台，写到 stderr 至少让命令行用户看得到，
+            // 不再静默忽略（此前 `-h` 毫无反馈）。
+            "--help" | "-h" => eprintln!("{USAGE}"),
+            "--version" | "-v" => {
+                eprintln!("ytdlp-FFmpeg-GUI {}", env!("CARGO_PKG_VERSION"))
             }
             other => {
                 if !other.is_empty() && !other.starts_with('-') {

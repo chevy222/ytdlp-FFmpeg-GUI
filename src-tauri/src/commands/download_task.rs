@@ -80,7 +80,10 @@ pub fn start_download(
         let mut q = state.queue.lock();
         q.submit(&id)
     };
-    if outcome == SubmitOutcome::Queued {
+    if matches!(
+        outcome,
+        SubmitOutcome::Queued | SubmitOutcome::AlreadyRunning
+    ) {
         log_item(&app, &id, "已排队，等待并发 slot…");
         persist(&app);
         return Ok(());
@@ -354,7 +357,11 @@ fn finish_download(app: &AppHandle, id: &str, result: Result<download::DownloadO
             it.percent
         };
         if let Err(e) = &result {
-            it.error = Some(e.to_string());
+            // 取消不是"错误"：与解析链路（run_probe）一致，不写 error 文案，
+            // 否则 UI 上"已取消"的条目会带一段错误说明，观感不一致。
+            if !matches!(e, ytdlp_core::CoreError::Cancelled) {
+                it.error = Some(e.to_string());
+            }
         }
         if final_status == Status::Done {
             it.speed = None;

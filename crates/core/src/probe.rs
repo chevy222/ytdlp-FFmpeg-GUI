@@ -449,11 +449,7 @@ pub fn parse_ytdlp_json(text: &str) -> Result<UrlProbe> {
                 Some(c) => !matches!(c.to_lowercase().as_str(), "none" | "n/a" | "images"),
             };
             let audio_only = !has_video && acodec.is_some();
-            let note = if f["format_note"].as_str().is_some() {
-                f["format_note"].as_str().map(str::to_string)
-            } else {
-                None
-            };
+            let note = f["format_note"].as_str().map(str::to_string);
             let df = DownloadFormat {
                 label: String::new(),
                 format_id,
@@ -607,9 +603,6 @@ pub fn parse_ffprobe_json(text: &str) -> std::result::Result<MediaMeta, serde_js
         }
     }
     meta.audio_tracks = if has_audio { Some(audio_tracks) } else { None };
-    if meta.acodec.is_some() && meta.audio_tracks == Some(0) {
-        meta.audio_tracks = Some(1);
-    }
     // 视频码率兜底：流级 bit_rate 缺失时用 总比特率-音频比特率 估算（Windows 属性同口径）
     if meta.vbitrate_kbps.is_none() {
         if let Some(fmt_br) = v["format"]["bit_rate"]
@@ -707,7 +700,7 @@ mod tests {
         assert_eq!(p.host.as_deref(), Some("www.youtube.com"));
         assert_eq!(p.site.as_deref(), Some("youtube"));
         // thumbnail 字段现在只折算为 has_cover（远程 URL 本身已不再随身携带，
-        // 封面由解析/下载链路经 yt-dlp --write-thumbnail 落盘）
+        // 封面由解析阶段的 fetch_thumb_ytdlp 经 yt-dlp --write-thumbnail --skip-download 落盘）
         assert!(p.meta.has_cover, "thumbnail 字段应折算为 has_cover");
         assert!(!p.is_playlist);
     }

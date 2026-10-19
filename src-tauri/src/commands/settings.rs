@@ -6,7 +6,7 @@ use ytdlp_core::transcode;
 use super::{CmdResult, ensure_main_window, err_string, launch_next};
 use crate::state::AppState;
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_config(app: AppHandle, win: tauri::WebviewWindow) -> CmdResult<AppConfig> {
     ensure_main_window(&win)?;
     let state = app.state::<AppState>();

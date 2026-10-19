@@ -26,7 +26,10 @@ struct Logger {
 
 static LOGGER: OnceLock<Logger> = OnceLock::new();
 
-/// 初始化日志目录（进程启动时调用一次；重复调用忽略）。
+/// 初始化日志目录（进程启动时调用一次）。
+///
+/// **仅首次生效**：内部用 `OnceLock`，重复调用（含以不同目录再次调用）会被静默忽略，
+/// 日志继续写首次写入的目录。调用方应保证只在启动早期调用一次。
 pub fn init(dir: impl Into<PathBuf>) {
     let dir = dir.into();
     if std::fs::create_dir_all(&dir).is_err() {

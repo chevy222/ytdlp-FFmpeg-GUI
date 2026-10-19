@@ -206,13 +206,12 @@ impl ChildGuard {
 
     /// 等待退出并返回完整输出（已取消时返回 Err(Canceled)）。
     pub fn wait_with_output(mut self) -> crate::Result<Output> {
-        let mut child = self
+        let child = self
             .child
             .take()
             .ok_or_else(|| CoreError::Io(std::io::Error::other("子进程句柄已丢失")))?;
-        if self.cancelled {
-            let _ = child.kill();
-        }
+        // 取消时进程树已由 kill_tree()（Drop/看门狗）终止，这里只需等待回收即可，
+        // 无需再单杀主进程（此前的 `child.kill()` 是冗余分支）。
         let out = child.wait_with_output().map_err(CoreError::Io)?;
         if self.cancelled {
             return Err(CoreError::Cancelled);
@@ -644,8 +643,8 @@ pub fn tool_version(resolver: &ToolResolver, tool: Tool) -> Option<String> {
     tool_version_at(tool, &resolver.resolve(tool).ok()?)
 }
 
-/// 把程序名与参数拼成一条可读、可复制的单行命令。
-/// 含空白/引号/空串的参数加双引号并转义内部引号，其余原样。
+/// 把程序名与参数拼成一条可读的单行命令（**近似回显**，用于日志阅读——
+/// 引号转义不严格等同 cmd/PowerShell 语义，请勿据此当作可直接粘贴的命令）。
 ///
 /// **凭据脱敏**：`--proxy`/`--proxy=...` 的值中 `scheme://user:pass@host` 的
 /// userinfo 会被替换为 `***`（[`redact_proxy_userinfo`]），避免代理账号口令随

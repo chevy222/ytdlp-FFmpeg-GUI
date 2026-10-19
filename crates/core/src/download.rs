@@ -275,7 +275,9 @@ pub fn parse_progress_line(line: &str) -> Option<Progress> {
 /// 百分号也做成可选小数：完成行是 `100% of ... in 00:00:03 at ...`（无小数点）。
 fn full_re() -> regex::Regex {
     regex::Regex::new(
-        r"^(\d+(?:\.\d+)?)%\s+of\s+~?([\d.]+)\s*([KMG]i?B|B)\s+at\s+([\d.]+)\s*([KMG]i?B|B)/s\s+ETA\s+(\d+:\d+)",
+        // ETA 允许 HH:MM:SS（`{1,2}` 个冒号段）：早期 `\d+:\d+` 对 `ETA 1:23:45`
+        // 只贪婪匹配到 `1:23`，超过 1 小时的下载 ETA 显示错误。
+        r"^(\d+(?:\.\d+)?)%\s+of\s+~?([\d.]+)\s*([KMG]i?B|B)\s+at\s+([\d.]+)\s*([KMG]i?B|B)/s\s+ETA\s+(\d+(?::\d+){1,2})",
     )
     .expect("无效正则 full")
 }
@@ -454,6 +456,44 @@ fn cleanup_cancelled_outputs(
     }
 }
 
+/// 失败（非取消）时的残留清理：只删**本任务时间窗内**新写的 `.part`/`.ytdl`
+/// 半成品，绝不动已完成产物（播放列表部分成功时不能误删成功项）。
+fn cleanup_partial_files(
+    extracted: &[PathBuf],
+    dests: &[PathBuf],
+    merged: &[PathBuf],
+    started: std::time::SystemTime,
+) {
+    let is_new = |p: &Path| -> bool {
+        file_newness(p)
+            .map(|t| t >= started)
+            .unwrap_or(false)
+    };
+    for p in extracted.iter().chain(merged.iter()).chain(dests.iter()) {
+        let (Some(dir), Some(name)) = (
+            p.parent(),
+            p.file_name().and_then(|s| s.to_str()),
+        ) else {
+            continue;
+        };
+        let part_prefix = format!("{name}.part");
+        let ytdl_name = format!("{name}.ytdl");
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let ep = entry.path();
+            let en = match ep.file_name().and_then(|s| s.to_str()) {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            if (en.starts_with(&part_prefix) || en == ytdl_name) && is_new(&ep) {
+                let _ = std::fs::remove_file(&ep);
+            }
+        }
+    }
+}
+
 /// 下载结果。
 #[derive(Debug, Clone)]
 pub struct DownloadOutcome {
@@ -494,9 +534,14 @@ pub fn run_download(
     // 两条任务就会读到对方写进去的产物路径 —— 后处理与 path 回填都会指错文件。
     // 用 UUID 也顺带避开"上次崩溃残留 + pid 回收"读到陈旧内容的可能。
     let print_file = temp_dir.join(format!("ytdlp-print-{}.txt", uuid::Uuid::new_v4()));
-    args.push("--print-to-file".into());
-    args.push("after_move:%(filepath)s".into());
-    args.push(print_file.to_string_lossy().into_owned());
+    // build_args 末尾固定是 URL（保持"URL 最后"的 yt-dlp 参数约定）；
+    // 把 --print-to-file 插到它**之前**，而不是追加在其后。
+    if let Some(url_arg) = args.pop() {
+        args.push("--print-to-file".into());
+        args.push("after_move:%(filepath)s".into());
+        args.push(print_file.to_string_lossy().into_owned());
+        args.push(url_arg);
+    }
     on_log(crate::exec::display_command("yt-dlp", &args));
     let mut cmd = resolver.command(Tool::YtDlp)?;
     cmd.args(&args);
@@ -544,6 +589,9 @@ pub fn run_download(
         return Err(CoreError::Cancelled);
     }
     if !outcome.status.success() {
+        // 失败（非取消）：只清 `.part`/`.ytdl` 半成品残留，**不动**已完成的产物 ——
+        // 播放列表可能部分成功，删掉成功项的文件会误伤（与取消语义不同）。
+        cleanup_partial_files(&extracted_paths, &dest_paths, &merged_paths, started);
         let _ = std::fs::remove_file(&print_file);
         return Err(CoreError::ProcessFailed {
             program: "yt-dlp".into(),

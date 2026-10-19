@@ -388,41 +388,58 @@ pub async fn read_clipboard() -> CmdResult<String> {
 }
 
 #[tauri::command(async)]
-pub fn add_url(app: AppHandle, urls: Vec<String>) -> CmdResult<()> {
+pub fn add_url(app: AppHandle, win: tauri::WebviewWindow, urls: Vec<String>) -> CmdResult<()> {
+    // 敏感命令仅允许主窗口调用（与 start_download 等同口径）
+    ensure_main_window(&win)?;
+    add_url_inner(&app, urls)
+}
+
+/// 实际入列逻辑（IPC 命令与 CLI 单实例转发共用；不含窗口守卫）。
+pub(crate) fn add_url_inner(app: &AppHandle, urls: Vec<String>) -> CmdResult<()> {
     let state = app.state::<AppState>();
     // 新条目继承"仅音频默认"（设置-下载）：出 history 锁之前先取，避免嵌套锁
     let default_audio_only = state.config.lock().download.audio_only;
-    let mut hist = state.history.lock();
-    for raw in urls {
-        let url = clean_url(&raw);
-        if url.is_empty() {
-            continue;
+    // 先在锁内收集 id，出锁后再起解析线程：否则新增线程会全部阻塞在 history 锁上
+    let mut ids: Vec<String> = Vec::new();
+    {
+        let mut hist = state.history.lock();
+        for raw in urls {
+            let url = clean_url(&raw);
+            // DL-01：只接受 http(s)://（UI 与 CLI 共用同一校验）
+            if url.is_empty() || (!url.starts_with("http://") && !url.starts_with("https://")) {
+                continue;
+            }
+            let mut item = MediaItem::from_url(url);
+            item.audio_only = default_audio_only;
+            ids.push(item.id.clone());
+            hist.upsert(item);
         }
-        // DL-01：只接受 http(s):// —— UI 与 CLI 两条入口在此共用同一校验，
-        // 否则 CLI 裸参数会把本地文件名当 URL 入列
-        if !url.starts_with("http://") && !url.starts_with("https://") {
-            continue;
-        }
-        let mut item = MediaItem::from_url(url);
-        item.audio_only = default_audio_only;
-        let id = item.id.clone();
-        hist.upsert(item);
-        // 解析线程不占并发 slot（下载/转码/合并才有并发上限），但受解析闸门约束：
-        // 一次粘贴 100 条链接不能瞬间起 100 个 yt-dlp
+    }
+    // 全部非法时给出明确反馈（此前静默丢弃，用户看不出为什么没反应）
+    if ids.is_empty() {
+        return Err("没有可添加的链接（仅支持 http/https 链接）".into());
+    }
+    // 解析线程不占并发 slot，但受解析闸门约束：一次粘贴 100 条不能瞬间起 100 个 yt-dlp
+    for id in ids {
         let app2 = app.clone();
         std::thread::spawn(move || {
             let _slot = ProbeSlot::acquire();
             run_probe(app2, id);
         });
     }
-    drop(hist);
-    persist(&app);
+    persist(app);
     let _ = app.emit("list:changed", ());
     Ok(())
 }
 
 #[tauri::command]
-pub async fn add_local(app: AppHandle, paths: Vec<String>, recursive: bool) -> CmdResult<()> {
+pub async fn add_local(
+    app: AppHandle,
+    win: tauri::WebviewWindow,
+    paths: Vec<String>,
+    recursive: bool,
+) -> CmdResult<()> {
+    ensure_main_window(&win)?;
     // 目录扫描放阻塞线程：递归遍历上万个文件足以让 async worker 肉眼可见地卡住
     let files = tauri::async_runtime::spawn_blocking(move || {
         let mut files: Vec<PathBuf> = Vec::new();
@@ -442,18 +459,23 @@ pub async fn add_local(app: AppHandle, paths: Vec<String>, recursive: bool) -> C
         return Err("没有找到可添加的文件".into());
     }
     let state = app.state::<AppState>();
-    let mut hist = state.history.lock();
-    for f in files {
-        let item = MediaItem::from_path(f.to_string_lossy().into_owned());
-        let id = item.id.clone();
-        hist.upsert(item);
+    // 锁内收集 id，出锁后再起解析线程，避免新线程阻塞在 history 锁上
+    let mut ids: Vec<String> = Vec::new();
+    {
+        let mut hist = state.history.lock();
+        for f in files {
+            let item = MediaItem::from_path(f.to_string_lossy().into_owned());
+            ids.push(item.id.clone());
+            hist.upsert(item);
+        }
+    }
+    for id in ids {
         let app2 = app.clone();
         std::thread::spawn(move || {
             let _slot = ProbeSlot::acquire();
             run_probe(app2, id);
         });
     }
-    drop(hist);
     persist(&app);
     let _ = app.emit("list:changed", ());
     Ok(())
