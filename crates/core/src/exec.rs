@@ -176,6 +176,14 @@ pub struct ChildGuard {
 
 impl ChildGuard {
     pub fn spawn(cmd: &mut Command) -> crate::Result<Self> {
+        // Unix：让子进程自成一个进程组（pgid == pid），取消/超时可用负号 PID
+        // 一次终止整组（yt-dlp 派生的 ffmpeg 等子孙一并杀掉，避免孤儿进程）。
+        // Windows 无进程组概念，走 taskkill /T 终止整棵树（见 kill_tree_of）。
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
         let child = cmd.spawn().map_err(|e| {
             CoreError::Io(std::io::Error::new(
                 e.kind(),
@@ -263,7 +271,7 @@ impl Drop for ChildGuard {
     }
 }
 
-/// 终止子进程树（Windows：taskkill /PID <pid> /T /F；其余：直接 kill）。
+/// 终止子进程树（Windows：taskkill /PID <pid> /T /F；其余：终止整个进程组）。
 fn kill_tree_of(child: &mut Child) {
     // 已退出（含刚被 kill 掉）就不必再 taskkill：否则会打出一堆
     // "错误: 没有找到进程" 的噪音，掩盖真正的失败
@@ -290,8 +298,27 @@ fn kill_tree_of(child: &mut Child) {
     }
     #[cfg(not(windows))]
     {
-        let _ = child.kill();
+        // 子进程以 process_group(0) 启动（见 ChildGuard::spawn），pgid == pid，
+        // 负号 PID 即"整个进程组"，连 ffmpeg 等子孙一起终止。
+        if !kill_process_group(child.id(), true) {
+            let _ = child.kill();
+        }
     }
+}
+
+/// Unix：向 `pid` 所在进程组发信号（`force=true` 用 SIGKILL）。
+///
+/// 复用系统 `kill` 命令而非 libc：core 层保持零平台依赖；失败则回退到只杀主进程
+/// （由调用方处理）。返回是否成功。
+#[cfg(not(windows))]
+fn kill_process_group(pid: u32, force: bool) -> bool {
+    let sig = if force { "-KILL" } else { "-TERM" };
+    // `--` 防止负号 PID 被当作信号选项解析
+    Command::new("kill")
+        .args([sig, "--", &format!("-{pid}")])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// 按 PID 终止进程树（Windows taskkill /T /F）。
@@ -313,8 +340,10 @@ pub fn kill_tree_by_pid(pid: u32) {
     }
     #[cfg(not(windows))]
     {
-        // 非 Windows（开发/测试机）：没有等价内建命令，尽量按 PID 发终止信号
-        let _ = Command::new("kill").args(["-TERM", &pid.to_string()]).status();
+        // 与 kill_tree_of 同口径：负号 PID 终止整个进程组（含子孙），失败回退主进程
+        if !kill_process_group(pid, true) {
+            crate::log::warn(format!("看门狗未能终止进程组（pid {pid}）"));
+        }
     }
 }
 
@@ -340,7 +369,9 @@ pub struct StreamOutcome {
 /// `read_until(b'\n')` + [`decode_text`]。
 ///
 /// - `cancel`：置位后终止整棵进程树（由看门狗线程执行，任务线程无需先收到输出）；
-/// - `deadline`：到点仍无进展也终止（给"探测类短任务"用的兜底，长任务传 None）。
+/// - `deadline`：**绝对墙钟**上限（从进程启动起算，到点即终止）。给"探测类短任务"
+///   用的硬兜底——这类任务（如 `yt-dlp -J`）往往只在结束时才一次性输出，
+///   用"多久没输出"判定会误杀正常的大合集，故取绝对上限；长任务传 None。
 pub fn stream_lines(
     guard: &mut ChildGuard,
     cancel: &Arc<AtomicBool>,
@@ -485,13 +516,16 @@ pub fn run_capture_deadline(mut cmd: Command, timeout: Duration) -> crate::Resul
     let guard = ChildGuard::spawn(&mut cmd)?;
     let pid = guard.pid();
     let done = Arc::new(AtomicBool::new(false));
+    let timed_out = Arc::new(AtomicBool::new(false));
     let watchdog = pid.map(|pid| {
         let done = done.clone();
+        let timed_out = timed_out.clone();
         std::thread::spawn(move || {
             let deadline = Instant::now() + timeout;
             while !done.load(Ordering::Relaxed) {
                 if Instant::now() >= deadline {
                     crate::log::warn(format!("命令超时（{:?}），终止进程树 pid {pid}", timeout));
+                    timed_out.store(true, Ordering::Relaxed);
                     kill_tree_by_pid(pid);
                     return;
                 }
@@ -505,6 +539,13 @@ pub fn run_capture_deadline(mut cmd: Command, timeout: Duration) -> crate::Resul
         let _ = w.join();
     }
     let out = out?;
+    // 超时终止与进程自身失败分开：调用方据此区分"工具挂住"与"工具报错"
+    if timed_out.load(Ordering::Relaxed) {
+        return Err(CoreError::Timeout {
+            program: cmd.get_program().to_string_lossy().into_owned(),
+            secs: timeout.as_secs(),
+        });
+    }
     if !out.status.success() {
         return Err(CoreError::ProcessFailed {
             program: cmd.get_program().to_string_lossy().into_owned(),
@@ -603,23 +644,53 @@ pub fn tool_version(resolver: &ToolResolver, tool: Tool) -> Option<String> {
     tool_version_at(tool, &resolver.resolve(tool).ok()?)
 }
 
-/// 把程序名与参数拼成一条可读、可复制、可直接粘贴执行的单行命令。
+/// 把程序名与参数拼成一条可读、可复制的单行命令。
 /// 含空白/引号/空串的参数加双引号并转义内部引号，其余原样。
 ///
-/// **如实回显**：不对任何参数做脱敏（代理凭据、PO-Token 等一律原样），
-/// 保证日志里看到的就是真正执行的命令。注意这些内容会随条目日志写入
-/// `config/history.json`，请自行妥善保管该文件。
+/// **凭据脱敏**：`--proxy`/`--proxy=...` 的值中 `scheme://user:pass@host` 的
+/// userinfo 会被替换为 `***`（[`redact_proxy_userinfo`]），避免代理账号口令随
+/// 条目日志写入 `config/history.json`；其余参数如实回显（日志与真实执行一致）。
 pub fn display_command(program: &str, args: &[String]) -> String {
     let mut s = program.to_string();
+    // `--proxy <值>` 是分离写法：下一个参数才是需要脱敏的值
+    let mut expect_proxy_value = false;
     for a in args {
-        if a.is_empty() || a.chars().any(|c| c.is_whitespace() || c == '"') {
-            s.push_str(&format!(" \"{}\"", a.replace('"', "\\\"")));
+        let shown: String = if expect_proxy_value {
+            expect_proxy_value = false;
+            redact_proxy_userinfo(a)
+        } else if a == "--proxy" {
+            expect_proxy_value = true;
+            a.clone()
+        } else if let Some(v) = a.strip_prefix("--proxy=") {
+            format!("--proxy={}", redact_proxy_userinfo(v))
+        } else {
+            a.clone()
+        };
+        if shown.is_empty() || shown.chars().any(|c| c.is_whitespace() || c == '"') {
+            s.push_str(&format!(" \"{}\"", shown.replace('"', "\\\"")));
         } else {
             s.push(' ');
-            s.push_str(a);
+            s.push_str(&shown);
         }
     }
     s
+}
+
+/// 遮蔽 URL 中的 userinfo（`user:pass@host` → `***@host`），用于日志脱敏。
+///
+/// 同时兼容有 scheme（`socks5://user:pass@host:port`）与无 scheme
+/// （`user:pass@host`）两种代理写法；只处理 host 段里的 `@`，path 中的 `@` 不动。
+fn redact_proxy_userinfo(v: &str) -> String {
+    let (prefix, rest) = match v.find("://") {
+        Some(i) => (&v[..i + 3], &v[i + 3..]),
+        None => ("", v),
+    };
+    let host_part = rest.split('/').next().unwrap_or(rest);
+    if let Some(at) = host_part.find('@') {
+        format!("{prefix}***{}", &rest[at..])
+    } else {
+        v.to_string()
+    }
 }
 
 /// Windows 下隐藏子进程控制台窗口（CREATE_NO_WINDOW），避免 GUI 程序
@@ -863,6 +934,26 @@ mod tests {
             parse_version_line(Tool::Ffmpeg, "ffmpeg version"),
             "ffmpeg version"
         );
+    }
+
+    #[test]
+    fn display_command_redacts_proxy_credentials() {
+        // 分离写法：--proxy 的值 userinfo 被遮蔽
+        let a = vec!["--proxy".to_string(), "socks5://user:pass@1.2.3.4:1080".to_string()];
+        assert_eq!(
+            display_command("yt-dlp", &a),
+            "yt-dlp --proxy socks5://***@1.2.3.4:1080"
+        );
+        // 等号写法
+        let b = vec!["--proxy=http://alice:secret@proxy.local:8080".to_string()];
+        assert_eq!(
+            display_command("yt-dlp", &b),
+            "yt-dlp --proxy=http://***@proxy.local:8080"
+        );
+        // 无 scheme
+        assert_eq!(redact_proxy_userinfo("bob:pw@host"), "***@host");
+        // 无 userinfo：原样（path 里的 @ 不动）
+        assert_eq!(redact_proxy_userinfo("http://host/a@b"), "http://host/a@b");
     }
 
     #[test]

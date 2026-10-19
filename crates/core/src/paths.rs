@@ -87,9 +87,34 @@ impl Paths {
     }
 
     /// 任务私有临时目录（temp/<task_id>/，任务结束清理，§3.7/UL-08）。
+    ///
+    /// `task_id` 会经 [`safe_component`] 净化：条目 id 虽由 `Uuid` 生成，但
+    /// `history.json` 可被用户手改、损坏条目又会被逐条恢复，若 id 含 `..`/分隔符，
+    /// `join` 会逃出 `temp/`，而任务结束会对该目录执行 `remove_dir_all` → 误删数据。
     pub fn task_temp_dir(&self, task_id: &str) -> PathBuf {
-        self.temp_dir().join(task_id)
+        self.temp_dir().join(safe_component(task_id))
     }
+}
+
+/// 把任意字符串净化成**单个安全的路径组件**：仅保留 `[A-Za-z0-9-_]`，
+/// 其余字符（含 `/`、`\`、`.`、`:`）一律替换为 `_`，空串回退为 `_`。
+///
+/// 用途：`temp/<id>/`、`cache/thumbs/<id>.jpg` 等"用 id 拼路径"的位置，
+/// 阻断来自被篡改/损坏的 `history.json` 的路径穿越（UL-08 清理安全）。
+/// UUID 形态的 id 不含非法字符，净化后与原值一致。
+pub fn safe_component(id: &str) -> String {
+    let mut s = String::with_capacity(id.len());
+    for c in id.chars() {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+            s.push(c);
+        } else {
+            s.push('_');
+        }
+    }
+    if s.is_empty() {
+        s.push('_');
+    }
+    s
 }
 
 /// 损坏备份路径：`<原名>.corrupt-<epoch秒>.json`（config/history 统一口径，

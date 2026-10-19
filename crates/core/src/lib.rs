@@ -43,6 +43,8 @@ pub enum CoreError {
     ConfigCorrupt(String),
     #[error("任务已取消")]
     Cancelled,
+    #[error("进程执行超时（{program}，超过 {secs} 秒被终止）")]
+    Timeout { program: String, secs: u64 },
     #[error("进程执行失败 ({program}): code={code:?} stderr={stderr}")]
     ProcessFailed {
         program: String,

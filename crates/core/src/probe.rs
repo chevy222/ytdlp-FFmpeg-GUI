@@ -70,6 +70,9 @@ fn ytdlp_args(
     extra: &[&str],
 ) -> Vec<String> {
     let mut args: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
+    // 忽略用户级/便携级 yt-dlp 配置文件：否则 config.txt 可能覆盖 -o/--proxy/--paths
+    // 等关键参数，GUI 行为变得不确定（输出写到意外目录）。
+    args.push("--ignore-config".into());
     if let Ok(deno) = resolver.resolve(Tool::Deno) {
         args.push("--js-runtimes".into());
         args.push(format!("deno:{}", deno.to_string_lossy()));
@@ -168,19 +171,32 @@ pub fn list_playlist_entries(
         }
     };
     let mut out = Vec::new();
+    let mut skipped = 0usize;
     if let Some(entries) = v["entries"].as_array() {
         for e in entries {
-            let u = e["url"]
+            // flat 模式下 `webpage_url` 常缺失，`url` 在部分 extractor（如抖音）
+            // 下是**裸视频 ID** 而非完整 URL。优先取完整 URL；拿不到完整 URL 的
+            // 条目无法直接下载，跳过并计数（不再用裸 ID 去构造下载命令）。
+            let raw = e["webpage_url"]
                 .as_str()
-                .or_else(|| e["webpage_url"].as_str())
-                .unwrap_or_default()
-                .to_string();
-            if u.is_empty() {
+                .filter(|s| !s.is_empty())
+                .or_else(|| e["url"].as_str())
+                .unwrap_or_default();
+            if raw.is_empty() || !raw.contains("://") {
+                skipped += 1;
                 continue;
             }
             let title = e["title"].as_str().unwrap_or("").to_string();
-            out.push(PlaylistEntry { url: u, title });
+            out.push(PlaylistEntry {
+                url: raw.to_string(),
+                title,
+            });
         }
+    }
+    if skipped > 0 {
+        on_log(format!(
+            "播放列表有 {skipped} 条未提供完整 URL（flat 模式限制），已跳过"
+        ));
     }
     Ok(out)
 }
@@ -325,12 +341,24 @@ pub fn probe_local(
     cmd.args(&args);
     // run_capture_deadline 自带"到点杀进程树"的看门狗，并在非零退出时把
     // stderr 带进错误信息（无需再手动排空 stderr）
-    let out = crate::exec::run_capture_deadline(cmd, PROBE_TIMEOUT).map_err(|e| ProbeFailure {
-        kind: ProbeErrorKind::NotVideo,
-        message: format!("ffprobe 探测失败：{e}"),
+    let out = crate::exec::run_capture_deadline(cmd, PROBE_TIMEOUT).map_err(|e| {
+        // 区分"探测本身失败"（超时/IO 错误：网络盘、被安全软件拦截、文件被锁）
+        // 与"文件不是可解码的视频"（ffprobe 明确报错退出）。前者报 Failed 让用户
+        // 重试，后者才是 NotVideo；此前一律 NotVideo 会误导用户以为文件损坏。
+        let kind = match e {
+            crate::CoreError::Io(_) | crate::CoreError::Timeout { .. } => ProbeErrorKind::Failed,
+            _ => ProbeErrorKind::NotVideo,
+        };
+        ProbeFailure {
+            kind,
+            message: format!("ffprobe 探测失败：{e}"),
+        }
     })?;
     let text = decode_text(&out.stdout);
-    let mut meta = parse_ffprobe_json(&text);
+    let mut meta = parse_ffprobe_json(&text).map_err(|e| ProbeFailure {
+        kind: ProbeErrorKind::Failed,
+        message: format!("ffprobe 输出无法解析（可能被截断）：{e}"),
+    })?;
     meta.size_bytes = std::fs::metadata(path).ok().map(|m| m.len());
 
     // 2) volumedetect（有音频流时）
@@ -470,11 +498,11 @@ pub fn parse_ytdlp_json(text: &str) -> Result<UrlProbe> {
 }
 
 /// 解析 ffprobe JSON → MediaMeta（纯函数）。
-pub fn parse_ffprobe_json(text: &str) -> MediaMeta {
-    let v: Value = match serde_json::from_str(text) {
-        Ok(v) => v,
-        Err(_) => return MediaMeta::default(),
-    };
+///
+/// 返回 `Result` 而非静默 `Default`：解析失败（输出被截断/损坏）必须让上层感知，
+/// 否则 `probe_local` 会"成功"返回一份空元数据，后处理的分辨率/音轨判据全部失真。
+pub fn parse_ffprobe_json(text: &str) -> std::result::Result<MediaMeta, serde_json::Error> {
+    let v: Value = serde_json::from_str(text)?;
     let mut meta = MediaMeta::default();
     if let Some(fmt) = v["format"].as_object() {
         meta.container = fmt.get("format_name").and_then(|x| x.as_str()).map(|s| {
@@ -596,7 +624,7 @@ pub fn parse_ffprobe_json(text: &str) -> MediaMeta {
         }
     }
     // 无主视频流（如纯音频文件）：不给出映射索引，调用方按 `0:v:0?` 兜底
-    meta
+    Ok(meta)
 }
 
 /// 解析 volumedetect 输出 → AudioVolume（纯函数）。
@@ -642,7 +670,9 @@ fn classify_ytdlp_error(stderr: &str) -> ProbeFailure {
     {
         ProbeErrorKind::InvalidLink
     } else if lower.contains("video unavailable") || lower.contains("unavailable") {
-        ProbeErrorKind::NeedLogin
+        // 下架/删除/地区受限：属于链接失效或不可用，不是"需要登录"。
+        // （`private`/`members only`/`sign in` 已在上面归为 NeedLogin。）
+        ProbeErrorKind::InvalidLink
     } else {
         ProbeErrorKind::Failed
     };
@@ -722,7 +752,7 @@ mod tests {
           ],
           "format": {"format_name":"mov,mp4,m4a","duration":"332.000000","size":"35651584"}
         }"#;
-        let m = parse_ffprobe_json(json);
+        let m = parse_ffprobe_json(json).unwrap();
         assert_eq!(m.height, Some(1080));
         // 宽度采集（MD-02/P0-2）：竖屏源 short_edge 与画质列都依赖它
         assert_eq!(m.width, Some(1920));
@@ -741,7 +771,7 @@ mod tests {
     #[test]
     fn parse_ffprobe_json_attached_pic_cover() {
         let json = r#"{"streams":[{"codec_type":"video","codec_name":"mjpeg","disposition":{"attached_pic":1}},{"codec_type":"video","codec_name":"hevc","height":1080},{"codec_type":"audio","codec_name":"aac"}]}"#;
-        let m = parse_ffprobe_json(json);
+        let m = parse_ffprobe_json(json).unwrap();
         assert!(m.has_cover);
         assert_eq!(m.height, Some(1080));
     }
@@ -755,7 +785,7 @@ mod tests {
             {"index":2,"codec_type":"video","codec_name":"mjpeg","disposition":{"attached_pic":1}}
           ]
         }"#;
-        let m = parse_ffprobe_json(json);
+        let m = parse_ffprobe_json(json).unwrap();
         assert_eq!(m.video_stream_index, Some(0));
         assert_eq!(m.cover_stream_index, Some(2));
         assert_eq!(m.extradata.as_deref(), Some("0a0b0c"));
@@ -772,7 +802,7 @@ mod tests {
           {"index":1,"codec_type":"video","codec_name":"hevc","height":1080},
           {"index":2,"codec_type":"audio","codec_name":"aac"}
         ]}"#;
-        let m = parse_ffprobe_json(json);
+        let m = parse_ffprobe_json(json).unwrap();
         assert_eq!(m.cover_stream_index, Some(0));
         assert_eq!(m.video_stream_index, Some(1));
         assert_eq!(m.height, Some(1080));
@@ -783,7 +813,7 @@ mod tests {
     fn parse_ffprobe_json_missing_index_falls_back_to_position() {
         // 不带 index 字段（老样本）时按出现顺序回退，保证映射不丢
         let json = r#"{"streams":[{"codec_type":"video","codec_name":"h264","height":720},{"codec_type":"audio","codec_name":"aac"}]}"#;
-        let m = parse_ffprobe_json(json);
+        let m = parse_ffprobe_json(json).unwrap();
         assert_eq!(m.video_stream_index, Some(0));
         assert_eq!(m.cover_stream_index, None);
     }
@@ -814,6 +844,9 @@ mod tests {
         let e = classify_ytdlp_error("ERROR: Unable to download webpage: timed out");
         assert_eq!(e.kind, ProbeErrorKind::Network);
         let e = classify_ytdlp_error("ERROR: This video does not exist");
+        assert_eq!(e.kind, ProbeErrorKind::InvalidLink);
+        // 下架/不可用（无 private/sign-in 关键词）属链接失效，不再误判为需要登录
+        let e = classify_ytdlp_error("ERROR: This video is unavailable");
         assert_eq!(e.kind, ProbeErrorKind::InvalidLink);
         let e = classify_ytdlp_error("ERROR: something else happened");
         assert_eq!(e.kind, ProbeErrorKind::Failed);

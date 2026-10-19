@@ -27,6 +27,12 @@ pub enum Status {
     Canceled,
     /// 需要登录（可恢复：WebView2 登录后续传）
     NeedLogin,
+    /// 无法识别的状态名（serde 兜底）。
+    ///
+    /// 旧版本或未来版本写下的未知状态名不再让**整条**历史反序列化失败被丢弃，
+    /// 而是降级为 Unknown 保留其余字段（UI 视为"未知/待处理"）。
+    #[serde(other)]
+    Unknown,
 }
 
 impl Status {
@@ -61,6 +67,7 @@ impl Status {
             Self::Failed => "失败",
             Self::Canceled => "已取消",
             Self::NeedLogin => "需要登录",
+            Self::Unknown => "未知状态",
         }
     }
 }
@@ -114,6 +121,9 @@ pub enum ItemKind {
     TranscodeOut,
     /// 合并产物（回到列表）
     MergeOut,
+    /// 无法识别的来源类型（serde 兜底，避免旧/新版本条目整条丢弃）
+    #[serde(other)]
+    Unknown,
 }
 
 /// 音频音量探测结果（volumedetect，供转码增益决策，§MD-02/MD-06/TC-07）。
@@ -408,11 +418,13 @@ impl MediaItem {
 /// ```text
 /// Probing -> Ready | Failed | Canceled | NeedLogin
 /// Ready   -> Downloading | Transcoding | Merging | Canceled
-/// Downloading -> PostProcessing | Failed | Canceled | NeedLogin
+/// Downloading -> PostProcessing | Failed | Canceled | NeedLogin | Done
 /// PostProcessing -> Done | Failed | Canceled
 /// Transcoding -> Done | Failed | Canceled | Ready(任务结束恢复)
 /// Merging -> Done | Failed | Canceled | Ready(任务结束恢复)
+/// Done -> Transcoding | Merging | Probing
 /// Done/Failed/Canceled -> Probing (重试/重新解析)
+/// Canceled -> Ready | Done (取消竞态下任务实际已完成/回落到就绪)
 /// Failed -> NeedLogin (登录后转解析)
 /// NeedLogin -> Probing (登录完成自动重新解析)
 /// ```
@@ -452,6 +464,10 @@ pub fn transition(from: Status, to: Status) -> Result<Status, crate::CoreError> 
         | (Status::Failed, Status::Probing)
         | (Status::Failed, Status::NeedLogin)
         | (Status::Canceled, Status::Probing)
+        // 取消竞态：用户在任务落盘前点了取消，但子进程实际已完成/回落到就绪，
+        // 收尾需允许 Canceled -> Done/Ready（此前靠调用方直接改字段绕过状态机）
+        | (Status::Canceled, Status::Done)
+        | (Status::Canceled, Status::Ready)
         | (Status::NeedLogin, Status::Probing) => true,
         _ => false,
     };

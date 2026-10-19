@@ -133,8 +133,13 @@ fn ensure_parent(dest: &Path) -> std::io::Result<()> {
 }
 
 /// thumb 目录 + 条目文件路径。
+///
+/// id 经 [`crate::paths::safe_component`] 净化，避免被篡改/损坏的条目 id
+/// （含 `..`/分隔符）拼出越界路径导致读写/删除逃出 `thumbs/`。
 pub fn thumb_path(cache_dir: &Path, id: &str) -> PathBuf {
-    cache_dir.join("thumbs").join(format!("{id}.jpg"))
+    cache_dir
+        .join("thumbs")
+        .join(format!("{}.jpg", crate::paths::safe_component(id)))
 }
 
 /// 删除某条目的缩略图缓存（删除条目/清空列表时调用）。

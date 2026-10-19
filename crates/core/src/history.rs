@@ -105,8 +105,10 @@ impl History {
     }
 
     /// 追加或按 id 更新；超过上限时优先裁剪**最旧的终态条目**
-    /// （Done/Failed/Canceled），避免把仍在处理中的活跃任务裁掉
-    /// （任务完成 upsert 会"复活"被裁条目，造成列表闪烁）。
+    /// （Done/Failed/Canceled）；若没有终态，则退而裁剪其他**非活跃**条目
+    /// （Ready/NeedLogin/Unknown，不占用子进程、裁剪安全）；仅当全部都是
+    /// 活跃任务（解析中/下载中/转码中/合并中）时才临时超限，
+    /// 避免把仍在运行的条目裁掉（任务完成 upsert 会"复活"被裁条目，造成列表闪烁）。
     pub fn upsert(&mut self, item: MediaItem) {
         if let Some(existing) = self.items.iter_mut().find(|i| i.id == item.id) {
             *existing = item;
@@ -114,18 +116,28 @@ impl History {
             self.items.push(item);
         }
         while self.items.len() > self.limit {
-            if let Some(pos) = self.items.iter().position(|i| i.status.is_terminal()) {
-                self.items.remove(pos);
-            } else {
-                // 全部都是非终态（运行中/待命）：**宁可临时超限也不裁**。
-                // 否则正在下载/转码/合并的条目会被挤出列表 → update_item 返回
-                // None 静默 no-op → 产物路径永久丢失、取消按钮消失，而子进程
-                // 还在写盘。等有任务变终态后下次 upsert 自然裁剪。
-                crate::log::warn(format!(
-                    "历史上限 {} 触发时无终态条目可裁，临时保留 {} 条运行中条目（不裁剪，避免丢失活跃任务）",
-                    self.limit, self.items.len()
-                ));
-                break;
+            // 先找最旧终态；找不到再找最旧的非活跃条目（Ready/NeedLogin/Unknown）。
+            // 此前只用 is_terminal 判定，导致全是 Ready 时永远裁不动、limit 形同失效。
+            let pos = self
+                .items
+                .iter()
+                .position(|i| i.status.is_terminal())
+                .or_else(|| self.items.iter().position(|i| !i.status.is_active()));
+            match pos {
+                Some(pos) => {
+                    self.items.remove(pos);
+                }
+                None => {
+                    // 全部都是活跃任务（运行中）：**宁可临时超限也不裁**。
+                    // 否则正在下载/转码/合并的条目会被挤出列表 → update_item 返回
+                    // None 静默 no-op → 产物路径永久丢失、取消按钮消失，而子进程
+                    // 还在写盘。等有任务结束变非活跃后下次 upsert 自然裁剪。
+                    crate::log::warn(format!(
+                        "历史上限 {} 触发时全部条目均为活跃任务，临时保留 {} 条（不裁剪，避免丢失运行中任务）",
+                        self.limit, self.items.len()
+                    ));
+                    break;
+                }
             }
         }
     }

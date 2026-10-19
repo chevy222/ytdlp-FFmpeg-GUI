@@ -95,6 +95,9 @@ pub const SORT_SPEC: &str = "vcodec:h264,lang,quality,res,fps,acodec:aac,size,pr
 /// 构造 yt-dlp 下载参数（纯函数）。
 pub fn build_args(url: &str, p: &DownloadParams, cfg: &DownloadConfig) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
+    // 忽略用户级/便携级 yt-dlp 配置：避免 config.txt 覆盖 -o/--proxy/--paths 等，
+    // 使 GUI 下载行为不确定、产物写到意外目录。
+    args.push("--ignore-config".into());
     // 格式
     let format = match &p.format_id {
         Some(fid) if !fid.is_empty() => {
@@ -144,8 +147,10 @@ pub fn build_args(url: &str, p: &DownloadParams, cfg: &DownloadConfig) -> Vec<St
     if p.embed_cover {
         args.push("--embed-thumbnail".into());
         args.push("--embed-metadata".into());
-        // 不写 --write-thumbnail：解析阶段已独立下载缩略图到 cache/thumbs/，
-        // 下载时传 cookies 反而会 403；--embed-thumbnail 只嵌入 MP4 元数据不写文件
+        // 不写 --write-thumbnail：避免在输出目录多留一份封面文件（列表预览用的是
+        // 解析阶段另存到 cache/thumbs/ 的缩略图，两者互不影响）。
+        // 注意：--embed-thumbnail 仍会让 yt-dlp 自行获取一次封面用于嵌入，
+        // 并不会复用 cache/thumbs/ 的缓存；此处的 --cookies 是给下载/嵌入用的。
     }
     // 音频仅提取
     if p.audio_only {
@@ -767,7 +772,15 @@ pub fn post_process(
         }
     }
     args.push("-c:a".into());
-    if need_gain {
+    // MP4 容器不支持 opus/vorbis/flac 等音频编码，源音轨不兼容（如 webm/opus）时
+    // `-c:a copy` 会让 ffmpeg 报 "codec not currently supported in container"，
+    // 而失败会被静默吞成"保留原文件"→ 降分辨率被悄悄跳过。按容器做兼容性判定，
+    // 不兼容则重编码 aac（与 transcode 链路同款口径）。
+    let mp4_audio_ok = matches!(
+        meta.acodec.as_deref(),
+        Some("aac" | "mp3" | "ac3" | "eac3" | "alac" | "mp2")
+    );
+    if need_gain || !mp4_audio_ok {
         args.push("aac".into());
         // 音频码率跟随源，clamp 64-192k（MediaMeta::audio_bitrate_kbps，bat 同款）
         let abr = meta.audio_bitrate_kbps();
