@@ -110,7 +110,14 @@ unsafe fn get_wide(c: &ICoreWebView2Cookie, idx: u8) -> String {
         _ => c.Path(&mut p),
     };
     if ok.is_ok() && !p.is_null() {
-        p.to_string().unwrap_or_default()
+        let s = p.to_string().unwrap_or_default();
+        // COM 返回的宽字符串由 CoTaskMemAlloc 分配，调用方必须用 CoTaskMemFree 释放
+        // （PWSTR 没有 Drop）。否则每次抓取每个 cookie 的 Name/Value/Domain/Path
+        // 都泄漏一块原生内存，长时间反复登录会持续累积。
+        unsafe {
+            windows::Win32::System::Com::CoTaskMemFree(Some(p.0 as *const core::ffi::c_void));
+        }
+        s
     } else {
         String::new()
     }

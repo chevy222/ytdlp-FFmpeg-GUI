@@ -170,7 +170,9 @@ fn transcode_segment(
     on_log: &mut dyn FnMut(String),
 ) -> Result<()> {
     let (enc, mut enc_args) = encoder_args(encoder_mode);
-    if enc == "libx265" {
+    // 段中间产物恒为 mp4：任何 H.265 编码器（libx265 / hevc_nvenc / hevc_amf）都要
+    // hvc1 标签（Apple 兼容）。此前只判 libx265，显式 nvenc/amf 时漏标被写成 hev1。
+    if enc == "libx265" || enc.starts_with("hevc_") {
         enc_args.push("-tag:v:0".into());
         enc_args.push("hvc1".into());
     }
@@ -401,6 +403,27 @@ fn merge_unified(
     )
 }
 
+/// panic 兜底守卫：任务线程 panic 时清理任务临时目录与 0 字节占位产物。
+///
+/// 正常返回仍走 [`run_merge`] 内的显式清理分支；本守卫只保证"异常路径不泄漏"。
+/// 成功时置 `keep_out = true` 保留产物（临时目录仍会在 Drop 时清理）。
+struct MergeCleanupGuard {
+    tmp: PathBuf,
+    out: Option<PathBuf>,
+    keep_out: bool,
+}
+
+impl Drop for MergeCleanupGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.tmp);
+        if !self.keep_out {
+            if let Some(o) = &self.out {
+                let _ = std::fs::remove_file(o);
+            }
+        }
+    }
+}
+
 /// 执行合并，返回输出路径；取消清理临时目录与输出残留（UL-06 适用合并）。
 pub fn run_merge(
     resolver: &ToolResolver,
@@ -433,9 +456,18 @@ pub fn run_merge(
     // 「清空临时文件」据此精确豁免，而不是"有任务在跑就跳过所有 merge_*"
     let tmp = params.temp_dir.join(&params.temp_subdir);
     std::fs::create_dir_all(&tmp)?;
+    // RAII 兜底：正常返回的清理仍走下面的显式分支，但任务线程一旦 panic
+    // （某个 unwrap/clamp 断言），这里保证临时目录与 0 字节占位产物都被清掉，
+    // 不会在用户输出目录留下"空产物"、也不在 temp/ 残留中间文件。
+    let mut guard = MergeCleanupGuard {
+        tmp: tmp.clone(),
+        out: None,
+        keep_out: false,
+    };
     // 输出名放在最后抢占：output_path 内部 create_new 占位，提前占位会让
     // "探测失败"这类早退路径在用户输出目录留下 0 字节垃圾文件
     let out = output_path(params)?;
+    guard.out = Some(out.clone());
     let cleanup = |t: &Path, out: &Path| {
         let _ = std::fs::remove_dir_all(t);
         let _ = std::fs::remove_file(out);
@@ -484,6 +516,7 @@ pub fn run_merge(
                 }
             }
             let _ = std::fs::remove_dir_all(&tmp);
+            guard.keep_out = true;
             on_log(format!("合并完成：{}", o.display()));
             Ok(o)
         }

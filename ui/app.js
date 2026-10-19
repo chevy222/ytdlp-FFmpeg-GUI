@@ -23,8 +23,8 @@ function toast(msg) {
 }
 
 // ===== 渲染 =====
-const ST_CLS = { Probing:'probing', Ready:'ready', Downloading:'downloading', PostProcessing:'working', Transcoding:'working', Merging:'working', Done:'done', Failed:'failed', Canceled:'canceled', NeedLogin:'needlogin' };
-const ST_LABEL = { Probing:'解析中', Ready:'已就绪', Downloading:'下载中', PostProcessing:'后处理中', Transcoding:'转码中', Merging:'合并中', Done:'已完成', Failed:'失败', Canceled:'已取消', NeedLogin:'需要登录' };
+const ST_CLS = { Probing:'probing', Ready:'ready', Downloading:'downloading', PostProcessing:'working', Transcoding:'working', Merging:'working', Done:'done', Failed:'failed', Canceled:'canceled', NeedLogin:'needlogin', Unknown:'canceled' };
+const ST_LABEL = { Probing:'解析中', Ready:'已就绪', Downloading:'下载中', PostProcessing:'后处理中', Transcoding:'转码中', Merging:'合并中', Done:'已完成', Failed:'失败', Canceled:'已取消', NeedLogin:'需要登录', Unknown:'未知状态' };
 // 进行中的状态：后端会拒绝删除这类条目（"请先取消再删除"），兜底轮询与批量删除也按这份清单判断
 const BUSY_STATUS = ['Probing','Downloading','PostProcessing','Transcoding','Merging'];
 

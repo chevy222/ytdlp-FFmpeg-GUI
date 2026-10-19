@@ -425,7 +425,11 @@ pub fn build_args_for_tier(
         };
         pick_encoder(resolver, mode)?
     };
-    if params.container == "mp4" && encoder == "libx265" {
+    // 软件层（libx265 或显式 nvenc/amf）在 mp4 容器下也要 hvc1 标签（Apple 兼容）。
+    // QSV 层的 hvc1 在下方 `qsv_encode` 分支统一处理，这里排除 hevc_qsv 以免重复添加。
+    // 此前只判 `encoder == "libx265"`，导致显式选 nvenc/amf 时漏标、被写成 hev1。
+    let is_hevc = encoder == "libx265" || encoder.starts_with("hevc_");
+    if params.container == "mp4" && is_hevc && encoder != "hevc_qsv" {
         // hvc1 标签（Apple 兼容）。必须带 `:v:0`：不带流后缀的 `-tag:v`
         // 会落到封面流（mjpeg）上，mp4 封装报
         // `Tag hvc1 incompatible with output codec id '7' (mp4v)` 并失败

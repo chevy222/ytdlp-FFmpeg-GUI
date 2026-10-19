@@ -143,6 +143,22 @@ impl AppState {
             .clone()
     }
 
+    /// **原子占用**取消标志：仅当 id 尚不存在时插入并返回 `Some(flag)`；
+    /// 已存在返回 `None`（说明已有同 id 的任务在跑）。
+    ///
+    /// 供"同一工具不允许并发下载"这类需要**原子判定并占用**的场景使用，
+    /// 避免 `cancel_flag().is_some()` 与 `register_cancel()` 之间的 TOCTOU：
+    /// 两次并发调用可能同时通过检查、拿到同一个 flag 各下载一份。
+    pub fn try_register_cancel(&self, id: &str) -> Option<Arc<AtomicBool>> {
+        let mut map = self.cancels.lock();
+        if map.contains_key(id) {
+            return None;
+        }
+        let flag = Arc::new(AtomicBool::new(false));
+        map.insert(id.to_string(), flag.clone());
+        Some(flag)
+    }
+
     pub fn cancel_flag(&self, id: &str) -> Option<Arc<AtomicBool>> {
         self.cancels.lock().get(id).cloned()
     }

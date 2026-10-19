@@ -97,12 +97,12 @@ pub async fn download_tool(
     ensure_main_window(&win)?;
     let kind = ToolKind::from_config_key(&tool).ok_or_else(|| format!("未知工具键：{tool}"))?;
     // 注册取消标志（前端点"取消"置 true）。同一工具不允许并发下载：
-    // 重复注册会覆盖旧标志，导致第一次下载的"取消"指向失效
+    // 用 try_register_cancel **原子**"判定并占用"——已存在即返回 None，
+    // 避免 is_some()+register 之间两次并发调用都拿到同一 flag 各下载一份。
     let cancel_key = format!("tool-dl-{tool}");
-    if state.cancel_flag(&cancel_key).is_some() {
-        return Err("该工具正在下载中".into());
-    }
-    let flag = state.register_cancel(&cancel_key);
+    let flag = state
+        .try_register_cancel(&cancel_key)
+        .ok_or_else(|| "该工具正在下载中".to_string())?;
     let tools_dir = state.paths.tools_dir();
     // 工具维护流量（github.com / gyan.dev）走应用代理：这两个域通常不在用户的
     // "下载站点分流"白名单里，但被墙时依赖下载/更新必须仍可用。

@@ -325,7 +325,11 @@ fn fetch_thumb_ytdlp(
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    std::fs::copy(&thumb_file, dest).map_err(|e| format!("复制缩略图失败：{e}"))?;
+    // 复制失败（磁盘满/权限）也必须清掉临时目录，否则 temp/thumb-<ts>/ 会残留
+    if let Err(e) = std::fs::copy(&thumb_file, dest) {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return Err(format!("复制缩略图失败：{e}"));
+    }
     let _ = std::fs::remove_dir_all(&tmp_dir);
     Ok(())
 }
@@ -865,7 +869,6 @@ pub fn set_sections(
     } else {
         Some((start, end))
     };
-    let state = app.state::<AppState>();
     update_item(&app, &id, |it| {
         it.sections = sections.clone();
         match &sections {
@@ -877,7 +880,9 @@ pub fn set_sections(
             }
         }
     });
-    state.persist();
+    // 走 500ms 去抖 + 后台线程落盘（与同类低频状态变更一致），
+    // 不再同步阻塞命令线程做整份 history 序列化 + fsync。
+    persist(&app);
     Ok(())
 }
 
@@ -1147,7 +1152,12 @@ pub fn retry_item(app: AppHandle, win: tauri::WebviewWindow, id: String) -> CmdR
         hist.upsert(item);
     }
     let app2 = app.clone();
-    std::thread::spawn(move || run_probe(app2, id));
+    std::thread::spawn(move || {
+        // 与 add_url/add_local/expand_playlist 同口径：解析线程也受 ProbeSlot 闸门约束，
+        // 否则批量"重试失败条目"会瞬间起等量 yt-dlp，突破 PROBE_CONCURRENCY。
+        let _slot = ProbeSlot::acquire();
+        run_probe(app2, id);
+    });
     persist(&app);
     Ok(())
 }

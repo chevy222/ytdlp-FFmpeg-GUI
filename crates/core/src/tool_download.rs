@@ -276,6 +276,31 @@ where
         .map(str::to_string)
 }
 
+/// 临时产物兜底清理守卫：`download` 的多条早退路径（SHA 校验失败、远端指纹获取
+/// 失败、解压失败、激活失败）以及任务线程 panic 时，保证下载残包/解压文件被删除，
+/// 不在 `temp/tool_dl/` 残留大体积文件（ffmpeg zip 约百 MB 级）。
+///
+/// 成功返回时同样由 Drop 清理（这些文件本就只是中间产物），无需逐个手动 remove。
+#[derive(Default)]
+struct TempArtifactGuard {
+    paths: Vec<PathBuf>,
+}
+
+impl TempArtifactGuard {
+    /// 登记一个待清理的临时产物路径。
+    fn arm(&mut self, p: &Path) {
+        self.paths.push(p.to_path_buf());
+    }
+}
+
+impl Drop for TempArtifactGuard {
+    fn drop(&mut self) {
+        for p in &self.paths {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 /// 工具托管下载器。
 #[derive(Debug, Clone)]
 pub struct ToolDownloader {
@@ -434,6 +459,9 @@ impl ToolDownloader {
         std::fs::create_dir_all(&self.temp_dir).map_err(|e| format!("创建临时目录失败：{e}"))?;
 
         let (raw, verify_zip) = self.download_artifact(kind, on_progress)?;
+        // 下载残包 + 解压产物的兜底清理（成功/失败/panic 统一由 Drop 处理）
+        let mut guard = TempArtifactGuard::default();
+        guard.arm(&raw);
 
         on_progress("校验".into(), 0.0);
         let digest = sha256_hex(&raw).map_err(|e| format!("计算 SHA-256 失败：{e}"))?;
@@ -448,7 +476,6 @@ impl ToolDownloader {
             None => String::new(),
         };
         if !want.is_empty() && !digest.eq_ignore_ascii_case(&want) {
-            let _ = std::fs::remove_file(&raw);
             return Err(format!(
                 "SHA-256 校验失败：期望 {} 实际 {}",
                 &want[..16.min(want.len())],
@@ -464,13 +491,11 @@ impl ToolDownloader {
                 .ok_or_else(|| "内部错误：zip 型工具缺少目标条目后缀".to_string())?;
             on_progress("解压".into(), 0.0);
             let extracted = self.extract_from_zip(&raw, suffix)?;
+            guard.arm(&extracted);
             on_progress("解压".into(), 1.0);
-            let _ = std::fs::remove_file(&raw);
             self.activate(&extracted, dest, on_progress)?;
-            let _ = std::fs::remove_file(&extracted);
         } else {
             self.activate(&raw, dest, on_progress)?;
-            let _ = std::fs::remove_file(&raw);
         }
         on_progress("完成".into(), 1.0);
         Ok(DownloadedTool {
@@ -650,7 +675,13 @@ impl ToolDownloader {
             .file_name()
             .and_then(|s| s.to_str())
             .ok_or_else(|| format!("无效的目标文件名：{}", dest.display()))?;
-        let tmp = dir.join(format!("{name}.{}.tmp", std::process::id()));
+        // 临时名带进程号 + UUID：同工具并发安装（下载/更新按钮）时不会互相写到
+        // 同一个 `.tmp` 覆盖对方的字节；此前只用 pid，两方在进程内并发会撞名。
+        let tmp = dir.join(format!(
+            "{name}.{}.{}.tmp",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
         std::fs::copy(src, &tmp)
             .map_err(|e| format!("写入 {} 失败（目标目录不可写？）：{e}", tmp.display()))?;
         let mut last_err: Option<std::io::Error> = None;
