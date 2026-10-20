@@ -523,6 +523,14 @@ pub fn run_download(
     // 两条任务就会读到对方写进去的产物路径 —— 后处理与 path 回填都会指错文件。
     // 用 UUID 也顺带避开"上次崩溃残留 + pid 回收"读到陈旧内容的可能。
     let print_file = temp_dir.join(format!("ytdlp-print-{}.txt", uuid::Uuid::new_v4()));
+    // 任何提前返回（含 stream_lines 的 `?`/panic）都要清掉这个临时文件
+    struct TempFileGuard(PathBuf);
+    impl Drop for TempFileGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _print_guard = TempFileGuard(print_file.clone());
     // build_args 末尾固定是 URL（保持"URL 最后"的 yt-dlp 参数约定）；
     // 把 --print-to-file 插到它**之前**，而不是追加在其后。
     if let Some(url_arg) = args.pop() {
@@ -574,14 +582,12 @@ pub fn run_download(
         // 取消：清掉本次已经落盘的产物与分片残留。否则"取消"之后输出目录里
         // 仍会多出一个视频，与用户对"取消"的预期不符。
         cleanup_cancelled_outputs(&extracted_paths, &dest_paths, &merged_paths, started);
-        let _ = std::fs::remove_file(&print_file);
         return Err(CoreError::Cancelled);
     }
     if !outcome.status.success() {
         // 失败（非取消）：只清 `.part`/`.ytdl` 半成品残留，**不动**已完成的产物 ——
         // 播放列表可能部分成功，删掉成功项的文件会误伤（与取消语义不同）。
         cleanup_partial_files(&extracted_paths, &dest_paths, &merged_paths, started);
-        let _ = std::fs::remove_file(&print_file);
         return Err(CoreError::ProcessFailed {
             program: "yt-dlp".into(),
             code: outcome.status.code(),
@@ -621,7 +627,6 @@ pub fn run_download(
             }
         }
     }
-    let _ = std::fs::remove_file(&print_file);
     // 目录扫描是**弱证据**：并发下载（默认并发 3）写同一个输出目录时，"本次之后
     // 新增的最新一个媒体文件"完全可能是别人刚下完的产物。命中它只作提示，不落库、
     // 不做后处理（见 DownloadOutcome::matched_by_scan 与调用方处理）。
@@ -817,7 +822,9 @@ pub fn post_process(
         meta.acodec.as_deref(),
         Some("aac" | "mp3" | "ac3" | "eac3" | "alac" | "mp2")
     );
-    if need_gain || !mp4_audio_ok {
+    // 用实际增益判断：max_gain_db=0 时 need_gain 仍为 true，但 gain=0，
+    // 此时不应无谓地重编码音频（损失质量）。
+    if applied_gain > 0.0 || !mp4_audio_ok {
         args.push("aac".into());
         // 音频码率跟随源，clamp 64-192k（MediaMeta::audio_bitrate_kbps，bat 同款）
         let abr = meta.audio_bitrate_kbps();

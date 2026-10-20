@@ -117,6 +117,17 @@ pub fn safe_component(id: &str) -> String {
     s
 }
 
+/// 读取文本文件：BOM → UTF-8 → GBK → lossy（复用 [`crate::exec::decode_text`]）。
+///
+/// 不能用 `read_to_string`：用户用记事本 ANSI（中文 Windows 即 GBK）或 PowerShell
+/// 重定向（UTF-16LE）编辑 history/config 时，`read_to_string` 会直接返回错误，
+/// 上层回退空历史后又落盘，等于把原文件覆盖掉。这里按内容解码，坏字节最多变成
+/// 替换符，仍能进入 JSON 解析/逐条恢复流程。
+pub fn read_text_file(path: &Path) -> std::io::Result<String> {
+    let bytes = std::fs::read(path)?;
+    Ok(crate::exec::decode_text(&bytes))
+}
+
 /// 损坏备份路径：`<原名>.corrupt-<epoch纳秒>.json`（config/history 统一口径，
 /// 纳秒粒度避免"同一秒内二次损坏互相覆盖"）。
 ///
@@ -350,6 +361,24 @@ mod tests {
         assert_eq!(v["a"], 2);
         // 临时文件不残留
         assert!(!root.path().join("config/config.json.tmp").exists());
+    }
+
+    #[test]
+    fn read_text_file_decodes_common_windows_encodings() {
+        let root = tempdir().unwrap();
+        let p = root.path().join("text.json");
+        // UTF-8 BOM
+        std::fs::write(&p, "\u{feff}{\"a\":1}").unwrap();
+        assert_eq!(read_text_file(&p).unwrap(), "{\"a\":1}");
+        // UTF-16LE（PowerShell 重定向）
+        let mut le: Vec<u8> = vec![0xFF, 0xFE];
+        le.extend("{\"a\":1}".encode_utf16().flat_map(|u| u.to_le_bytes()));
+        std::fs::write(&p, &le).unwrap();
+        assert_eq!(read_text_file(&p).unwrap(), "{\"a\":1}");
+        // GBK（记事本 ANSI）
+        let (gbk, _, _) = encoding_rs::GBK.encode("{\"t\":\"中文\"}");
+        std::fs::write(&p, gbk.as_ref()).unwrap();
+        assert_eq!(read_text_file(&p).unwrap(), "{\"t\":\"中文\"}");
     }
 
     #[test]

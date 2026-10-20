@@ -195,7 +195,13 @@ pub fn run() {
                     }
                 }
             }
-            state.persist();
+            if state.history_load_failed {
+                // 读取失败时 history 只是空占位：此时落盘会把原文件真正覆盖掉。
+                // 备份已由 History::load 尽力生成，等用户产生新数据/显式写盘再覆盖。
+                ytdlp_core::log::warn("history.json 本次未能读取，已跳过启动写盘以保护原文件");
+            } else {
+                state.persist();
+            }
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -213,7 +219,11 @@ pub fn run() {
     // "点取消/旋转后立即关窗口"的最后一批状态不丢。
     app.run(|app_handle, event| {
         if let tauri::RunEvent::ExitRequested { .. } = event {
-            app_handle.state::<state::AppState>().persist();
+            let st = app_handle.state::<state::AppState>();
+            // 读取失败的 history 只是空占位，退出时同样不能拿它覆盖原文件。
+            if !st.history_load_failed {
+                st.persist();
+            }
         }
     });
 }

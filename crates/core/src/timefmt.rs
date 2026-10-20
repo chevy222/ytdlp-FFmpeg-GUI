@@ -94,27 +94,37 @@ pub fn warm_up() {
     let _ = local_offset_secs();
 }
 
+/// 从 `reg query` 输出里解析某个 bias 值（分钟，UTC − 本地）。
+#[cfg(any(windows, test))]
+fn parse_reg_bias(text: &str, key: &str) -> Option<i64> {
+    // 输出行形如：`    ActiveTimeBias    REG_DWORD    0xfffffe20`
+    text.lines()
+        .find(|l| l.contains(key))
+        .and_then(|l| l.split_whitespace().find(|t| t.starts_with("0x")))
+        .and_then(|t| u32::from_str_radix(t.trim_start_matches("0x"), 16).ok())
+        .map(|bias| (-(bias as i32)) as i64 * 60)
+}
+
 #[cfg(windows)]
-fn detect_offset() -> i64 {
+fn query_bias(key: &str) -> Option<i64> {
     let mut cmd = std::process::Command::new("reg");
     cmd.args([
         "query",
         r"HKLM\SYSTEM\CurrentControlSet\Control\TimeZoneInformation",
         "/v",
-        "ActiveTimeBias",
+        key,
     ]);
     crate::exec::hide_console(&mut cmd);
-    let out = match cmd.output() {
-        Ok(o) => o,
-        Err(_) => return 0,
-    };
-    let text = String::from_utf8_lossy(&out.stdout);
-    // 输出行形如：`    ActiveTimeBias    REG_DWORD    0xfffffe20`
-    text.lines()
-        .find(|l| l.contains("ActiveTimeBias"))
-        .and_then(|l| l.split_whitespace().find(|t| t.starts_with("0x")))
-        .and_then(|t| u32::from_str_radix(t.trim_start_matches("0x"), 16).ok())
-        .map(|bias| (-(bias as i32)) as i64 * 60)
+    let out = cmd.output().ok()?;
+    parse_reg_bias(&String::from_utf8_lossy(&out.stdout), key)
+}
+
+#[cfg(windows)]
+fn detect_offset() -> i64 {
+    // ActiveTimeBias 在部分系统/权限下不存在，回退 StandardTimeBias；
+    // 两者都没有才按 UTC（记录值仍比整块偏移 8 小时更少见）。
+    query_bias("ActiveTimeBias")
+        .or_else(|| query_bias("StandardTimeBias"))
         .unwrap_or(0)
 }
 
@@ -147,6 +157,14 @@ mod tests {
         let secs = 1_772_325_000;
         assert_eq!(datetime_str(secs, 0), "2026-03-01 00:30:00");
         assert_eq!(datetime_str(secs, -3600), "2026-02-28 23:30:00");
+    }
+
+    #[test]
+    fn parse_reg_bias_reads_dword() {
+        let text = "\nHKEY_LOCAL_MACHINE\\...\n    ActiveTimeBias    REG_DWORD    0xfffffe20\n    StandardTimeBias    REG_DWORD    0xfffffe20\n";
+        assert_eq!(parse_reg_bias(text, "ActiveTimeBias"), Some(8 * 3600));
+        assert_eq!(parse_reg_bias(text, "StandardTimeBias"), Some(8 * 3600));
+        assert_eq!(parse_reg_bias(text, "Missing"), None);
     }
 
     #[test]

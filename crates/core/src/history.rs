@@ -185,12 +185,21 @@ impl History {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let text = std::fs::read_to_string(path)?;
-        // 剥 UTF-8 BOM：与 config 同一防御（记事本编辑后 serde 会误判损坏）
-        let text = text
-            .strip_prefix('\u{feff}')
-            .map(str::to_string)
-            .unwrap_or(text);
+        // 字节读 + BOM/UTF-8/GBK 解码。`read_to_string` 遇到 GBK/UTF-16 会整个失败，
+        // 上层回退空列表后启动落盘会覆盖原文件 —— 这类文件必须进入逐条恢复流程。
+        let text = match crate::paths::read_text_file(path) {
+            Ok(t) => t,
+            Err(e) => {
+                let backup = crate::paths::corrupt_backup_path(path);
+                let note = match std::fs::copy(path, &backup) {
+                    Ok(_) => format!("已备份到 {}", backup.display()),
+                    Err(err) => format!("备份失败（{err}）：损坏内容仍留在原文件"),
+                };
+                return Err(CoreError::ConfigCorrupt(format!(
+                    "history.json 无法读取（{e}）：{note}"
+                )));
+            }
+        };
         match serde_json::from_str::<History>(&text) {
             Ok(mut h) => {
                 // 文件里的 limit 不可信（手改/旧版本/损坏）：不夹的话列表会无界增长，
@@ -210,17 +219,26 @@ impl History {
                 // 仅当**确实救回至少一条**时才按"部分恢复"返回；若 kept==0（每条都坏），
                 // 不当作加载成功（否则 UI 直接空表却以为正常），落到下面的损坏分支。
                 if let Some(partial) = recovered.filter(|p| p.kept > 0) {
-                    crate::log::warn(format!(
-                        "history.json 存在无法解析的条目，已跳过 {} 条、保留 {} 条（其余字段损坏部分已尽力恢复）",
-                        partial.skipped, partial.kept
-                    ));
                     let mut h = partial.history;
                     h.limit = h
                         .limit
                         .clamp(1, crate::config::GeneralConfig::HISTORY_LIMIT_MAX);
-                    // 备份原文件，让用户能找回被跳过条目的数据
+                    // 备份原文件，让用户能找回被跳过条目的数据。备份失败时不能
+                    // 返回部分列表——上层启动落盘会用部分内容覆盖原文件，坏条目
+                    // 就永久丢了；宁可本次不加载，交给启动保护逻辑保留原文件。
                     let backup = crate::paths::corrupt_backup_path(path);
-                    let _ = std::fs::copy(path, &backup);
+                    if let Err(err) = std::fs::copy(path, &backup) {
+                        return Err(CoreError::ConfigCorrupt(format!(
+                            "history.json 存在无法解析的条目，且备份到 {} 失败（{err}）：为避免覆盖原文件，本次不加载",
+                            backup.display()
+                        )));
+                    }
+                    crate::log::warn(format!(
+                        "history.json 存在无法解析的条目，已跳过 {} 条、保留 {} 条；原文件已备份到 {}",
+                        partial.skipped,
+                        partial.kept,
+                        backup.display()
+                    ));
                     return Ok(h);
                 }
                 let backup = crate::paths::corrupt_backup_path(path);
@@ -399,6 +417,53 @@ mod tests {
         }
         let back = History::load(&p).expect("并发写后文件必须仍是合法 JSON");
         assert_eq!(back.len(), 20);
+    }
+
+    #[test]
+    fn gbk_history_loads() {
+        let root = tempdir().unwrap();
+        let p = root.path().join("history.json");
+        let text = r#"{"items":[{"id":"x","kind":"LocalFile","title":"测试视频","status":"Ready"}],"limit":100}"#;
+        let (gbk, _, _) = encoding_rs::GBK.encode(text);
+        std::fs::write(&p, gbk.as_ref()).unwrap();
+        let h = History::load(&p).unwrap();
+        assert_eq!(h.items[0].title, "测试视频");
+    }
+
+    #[test]
+    fn partial_history_keeps_good_items_and_backs_up() {
+        let root = tempdir().unwrap();
+        let p = root.path().join("history.json");
+        // 第二条缺 status：逐条恢复应保留第一条，并备份原文件
+        std::fs::write(
+            &p,
+            r#"{"items":[{"id":"ok","kind":"LocalFile","title":"好条目","status":"Ready"},{"id":"bad","kind":"LocalFile","title":"坏条目"}],"limit":100}"#,
+        )
+        .unwrap();
+        let h = History::load(&p).unwrap();
+        assert_eq!(h.len(), 1);
+        assert_eq!(h.items[0].title, "好条目");
+        assert!(std::fs::read_dir(root.path())
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().contains("corrupt")));
+    }
+
+    #[test]
+    fn invalid_bytes_history_backed_up_before_error() {
+        let root = tempdir().unwrap();
+        let p = root.path().join("history.json");
+        std::fs::write(&p, [0x81u8]).unwrap();
+        assert!(History::load(&p).is_err());
+        let backups: Vec<_> = std::fs::read_dir(root.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                n.starts_with("history.json.corrupt-")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1, "读取/解码失败也必须先备份");
     }
 
     #[test]

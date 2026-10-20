@@ -14,7 +14,11 @@ use ytdlp_core::transcode;
 /// 硬件编码器探测（TC-16）：QSV/NVENC/AMF 可用性，供设置页标注。
 /// 探测要起 ffmpeg 子进程（秒级），用 `spawn_blocking` 避免占住 async worker（A6）。
 #[tauri::command]
-pub async fn probe_hw_encoders(app: AppHandle) -> CmdResult<serde_json::Value> {
+pub async fn probe_hw_encoders(
+    app: AppHandle,
+    win: tauri::WebviewWindow,
+) -> CmdResult<serde_json::Value> {
+    ensure_main_window(&win)?;
     let state = app.state::<AppState>();
     let resolver = state.resolver();
     tauri::async_runtime::spawn_blocking(move || {
@@ -62,7 +66,8 @@ pub struct ToolUrlInfo {
 
 /// 四个工具的下载/版本检查地址（纯常量，无网络请求）。
 #[tauri::command]
-pub fn tool_urls() -> CmdResult<Vec<ToolUrlInfo>> {
+pub fn tool_urls(win: tauri::WebviewWindow) -> CmdResult<Vec<ToolUrlInfo>> {
+    ensure_main_window(&win)?;
     let keys = ["yt_dlp_path", "ffmpeg_path", "ffprobe_path", "deno_path"];
     let mut out = Vec::with_capacity(keys.len());
     for key in keys {
@@ -274,7 +279,12 @@ fn plan_install(
 
 /// 取消进行中的工具下载（前端点"取消"按钮）。
 #[tauri::command]
-pub fn cancel_tool_download(state: State<'_, AppState>, tool: String) -> CmdResult<()> {
+pub fn cancel_tool_download(
+    win: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    tool: String,
+) -> CmdResult<()> {
+    ensure_main_window(&win)?;
     let key = format!("tool-dl-{tool}");
     if let Some(flag) = state.cancel_flag(&key) {
         flag.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -292,7 +302,11 @@ pub struct ToolStatus {
 }
 
 #[tauri::command]
-pub async fn probe_dependencies(app: AppHandle) -> CmdResult<Vec<ToolStatus>> {
+pub async fn probe_dependencies(
+    app: AppHandle,
+    win: tauri::WebviewWindow,
+) -> CmdResult<Vec<ToolStatus>> {
+    ensure_main_window(&win)?;
     let state = app.state::<AppState>();
     let resolver = state.resolver();
     // 每个工具要起子进程取版本（yt-dlp --version / ffmpeg -version …，各自带

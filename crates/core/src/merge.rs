@@ -59,6 +59,9 @@ fn same_parameters(metas: &[MediaMeta]) -> bool {
     let v = |m: &MediaMeta| {
         (
             m.vcodec.clone(),
+            // 宽度必须参与：同高不同画幅（4:3 与 16:9）直拼会花屏/错位。
+            // extradata 对 H.264/HEVC 通常也覆盖尺寸，但不能只依赖它。
+            m.width,
             m.height,
             m.fps.map(|f| (f * 100.0).round() as i64),
             m.extradata.clone(),
@@ -85,6 +88,29 @@ fn same_parameters(metas: &[MediaMeta]) -> bool {
 /// 各段时长合计（进度换算基准）。
 fn total_duration(metas: &[MediaMeta]) -> f64 {
     metas.iter().filter_map(|m| m.duration_secs).sum()
+}
+
+/// 模式 B 的统一画布：取各段宽/高的最大值并偶数对齐。
+///
+/// 只统一高度不够——不同画幅的宽度仍会不同，concat `-c copy` 会把第二段
+/// 用第一段的 SPS 解码，产物静默损坏。固定宽高 + pad 保比例才能保证每段
+/// 参数一致（实测 720p+1080p 统一到 1920x1080 后可正常解码）。
+fn merge_canvas(metas: &[MediaMeta]) -> (u32, u32) {
+    let h = metas
+        .iter()
+        .filter_map(|m| m.height)
+        .max()
+        .unwrap_or(1080)
+        .max(2)
+        & !1;
+    let fallback_w = (h.saturating_mul(16) / 9).max(2);
+    let w = metas
+        .iter()
+        .filter_map(|m| m.width)
+        .max()
+        .unwrap_or(fallback_w)
+        & !1;
+    (w.max(2), h)
 }
 
 /// 输出路径（碰撞安全命名，同 TC-11；碰撞处理实现在 `paths::unique_output_path`）。
@@ -163,7 +189,9 @@ fn transcode_segment(
     out: &Path,
     main_idx: Option<u32>,
     encoder_mode: &str,
+    target_w: u32,
     target_h: u32,
+    target_fps: Option<f64>,
     duration: f64,
     cancel: &Arc<AtomicBool>,
     on_progress: &mut dyn FnMut(f32),
@@ -176,8 +204,11 @@ fn transcode_segment(
         enc_args.push("-tag:v:0".into());
         enc_args.push("hvc1".into());
     }
-    // 目标高度取偶（奇数高度 + 非偶对齐会让 libx265 报 chroma subsampling 错误）
-    let target_h = if target_h > 0 { target_h & !1 } else { 1080 };
+    // 画布尺寸取偶（奇数宽高会让 libx265 报 chroma subsampling 错误）。
+    // 宽高都必须固定：只统一高度时，不同画幅的宽度仍不同，concat -c copy
+    // 会用第一段的 SPS 解第二段，产物静默损坏（实测）。
+    let target_w = target_w.max(2) & !1;
+    let target_h = target_h.max(2) & !1;
     // 主视频用 ffprobe 的**绝对流索引**映射（§11.1）：yt-dlp 产物的封面流常排在
     // 主视频前，`0:v:0` 会选中 mjpeg 封面，转出来的段就是一张图
     let main_map = main_idx
@@ -198,15 +229,21 @@ fn transcode_segment(
         "-map".into(),
         "0:a:0?".into(),
         "-vf".into(),
-        // 偶数对齐：宽度 -2 自动取偶，高度 min() 封顶 + force_divisible_by=2（§11.5）
+        // 统一画布 + 统一 SAR/像素格式：concat -c copy 的每段必须参数完全一致。
+        // 源小于画布时由 pad 补边（默认黑色），避免为了填满画布而拉伸画面。
         format!(
-            "scale=-2:'min(ih,{})':force_original_aspect_ratio=decrease:force_divisible_by=2",
-            target_h
+            "scale={target_w}:{target_h}:force_original_aspect_ratio=decrease:force_divisible_by=2,\
+             pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p"
         ),
         "-c:v:0".into(),
         enc,
     ];
     args.extend(enc_args);
+    if let Some(fps) = target_fps.filter(|f| f.is_finite() && *f > 0.0) {
+        // 帧率不统一时同样会导致 SPS/level 不一致；模式 B 显式统一。
+        args.push("-r".into());
+        args.push(format!("{fps:.6}"));
+    }
     args.push("-c:a".into());
     args.push("aac".into());
     args.push("-ar".into());
@@ -353,7 +390,15 @@ fn merge_unified(
     on_log: &mut dyn FnMut(String),
 ) -> Result<()> {
     let seg_total = total_duration(metas);
-    let target_h = metas.iter().filter_map(|m| m.height).max().unwrap_or(1080);
+    // 统一画布 + 统一帧率：concat -c copy 要求各段的分辨率/SAR/像素格式/SPS 一致。
+    let (target_w, target_h) = merge_canvas(metas);
+    let target_fps = metas.iter().filter_map(|m| m.fps).reduce(f64::max);
+    on_log(format!(
+        "统一画布：{target_w}×{target_h}{}",
+        target_fps
+            .map(|f| format!("，{f:.2}fps"))
+            .unwrap_or_default()
+    ));
     // 多音轨提示：模式 B 的 transcode_segment 固定 `-map 0:a:0?`（只保留主音轨），
     // 与下载后处理 / 转码链路同属"静默丢数据"场景——那两处都有日志，这里不能漏。
     let multi_track = metas
@@ -392,7 +437,9 @@ fn merge_unified(
             seg,
             metas[i].video_stream_index,
             &params.encoder_mode,
+            target_w,
             target_h,
+            target_fps,
             d,
             cancel,
             &mut prog,
@@ -615,13 +662,26 @@ fn post_normalize(
 fn write_concat_list(path: &Path, inputs: &[PathBuf]) -> Result<()> {
     let mut content = String::new();
     for p in inputs {
-        let s = p.to_string_lossy();
-        // 单引号转义（ffmpeg concat 文件内转义规则）
-        let escaped = s.replace('\'', "'\\''");
+        let escaped = concat_list_path(p);
         content.push_str(&format!("file '{}'\n", escaped));
     }
     std::fs::write(path, content)?;
     Ok(())
+}
+
+/// concat 列表里的路径归一化。
+///
+/// ffmpeg 的 concat 解析器把 `\` 当作转义符：Windows 路径 `C:\temp\a.mp4`
+/// 里的 `\t`/`\a` 会被解释成制表/响铃，实测直接报
+/// `Impossible to open '...concat-test?.mp4'`。因此 Windows 下统一写成 `/`。
+/// 单引号仍按 concat 文件规范转义。
+fn concat_list_path(p: &Path) -> String {
+    let s = p.to_string_lossy();
+    #[cfg(windows)]
+    let s = s.replace('\\', "/");
+    #[cfg(not(windows))]
+    let s = s.into_owned();
+    s.replace('\'', "'\\''")
 }
 
 #[cfg(test)]
@@ -688,6 +748,42 @@ mod tests {
     }
 
     #[test]
+    fn same_params_false_on_width_diff() {
+        // 同高不同宽（4:3 vs 16:9）不能直拼，concat 会花屏
+        let mut a = meta("h264", 1080, 30.0, "aac", 48000, "aabb", 10.0);
+        a.width = Some(1920);
+        let mut b = meta("h264", 1080, 30.0, "aac", 48000, "aabb", 20.0);
+        b.width = Some(1440);
+        assert!(!same_parameters(&[a, b]));
+    }
+
+    #[test]
+    fn merge_canvas_takes_max_and_even() {
+        let mut a = meta("h264", 720, 30.0, "aac", 48000, "aabb", 10.0);
+        a.width = Some(1280);
+        let mut b = meta("h264", 1080, 30.0, "aac", 48000, "aabb", 20.0);
+        b.width = Some(1920);
+        assert_eq!(merge_canvas(&[a, b]), (1920, 1080));
+
+        // 竖屏 + 横屏：取最大宽高，输出正方形画布 + pad
+        let mut portrait = meta("h264", 1920, 30.0, "aac", 48000, "aabb", 10.0);
+        portrait.width = Some(1080);
+        let mut landscape = meta("h264", 1080, 30.0, "aac", 48000, "aabb", 10.0);
+        landscape.width = Some(1920);
+        assert_eq!(merge_canvas(&[portrait, landscape]), (1920, 1920));
+
+        // 奇数尺寸统一收偶
+        let mut odd = meta("h264", 719, 30.0, "aac", 48000, "aabb", 10.0);
+        odd.width = Some(1279);
+        assert_eq!(merge_canvas(&[odd]), (1278, 718));
+    }
+
+    #[test]
+    fn merge_canvas_falls_back_when_dims_missing() {
+        assert_eq!(merge_canvas(&[MediaMeta::default()]), (1920, 1080));
+    }
+
+    #[test]
     fn same_params_false_when_extradata_unknown() {
         // 探测拿不到 SPS/PPS 时不能宣称"参数一致"（否则直拼可能花屏且 ffmpeg 不报错），
         // 必须退回统一转码路径
@@ -743,5 +839,19 @@ mod tests {
         write_concat_list(&list, &[PathBuf::from("a'b.mp4")]).unwrap();
         let s = std::fs::read_to_string(&list).unwrap();
         assert_eq!(s, "file 'a'\\''b.mp4'\n");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn concat_list_uses_forward_slashes_on_windows() {
+        // ffmpeg concat 解析器把反斜杠当转义符：\t / \a 会让列表直接打不开。
+        assert_eq!(
+            concat_list_path(Path::new(r"C:\temp\a.mp4")),
+            "C:/temp/a.mp4"
+        );
+        assert_eq!(
+            concat_list_path(Path::new(r"C:\temp\a'b.mp4")),
+            "C:/temp/a'\\''b.mp4"
+        );
     }
 }

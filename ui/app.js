@@ -35,8 +35,8 @@ function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,
 
 // 画质/格式列：12 项源元数据（容器·分辨率·编码·视频码率·帧率·音频编码·采样率·音频码率·音轨数·最大音量·时长·大小）
 // 画质列由前端渲染（P1-6 定案：后端不产出）。
-// 分辨率按**短边**口径（P0-2 依赖）：竖屏源（rotate_tag 90/270 且有 width）取 min(width,height)
-function shortEdge(m){ if(!m.height)return null; const rot=[90,-90,270,-270].includes(m.rotate_tag); return rot&&m.width?Math.min(m.width,m.height):m.height; }
+// 分辨率按**短边**口径（P0-2 依赖）：有 width 时一律取 min(width,height)
+function shortEdge(m){ if(!m.height)return null; return m.width?Math.min(m.width,m.height):m.height; }
 function resLabel(h){ return h==null?null:(h>=2160?'4K':(h>=1440?'2K':h+'P')); }
 function srLabel(hz){ if(hz<1000)return hz+'Hz'; const k=hz/1000; return (Math.abs(k-Math.round(k))<0.05?String(Math.round(k)):k.toFixed(1))+'kHz'; }
 function qualityLine(m){
@@ -62,13 +62,25 @@ function humanSize(b){
   if(b>=1024)return (b/1024).toFixed(0)+'KB';
   return b+'B';
 }
+// 语义化版本比较（缺段按 0；与 Rust 侧 version_greater 同口径）
+function versionGreater(a,b){
+  const pa=String(a||'').trim().replace(/^v/i,'').split('.').map(x=>parseInt(x,10)||0);
+  const pb=String(b||'').trim().replace(/^v/i,'').split('.').map(x=>parseInt(x,10)||0);
+  for(let i=0;i<Math.max(pa.length,pb.length);i++){
+    const x=pa[i]||0,y=pb[i]||0;
+    if(x!==y)return x>y;
+  }
+  return false;
+}
 
 function fmtMeta(it){
   const m = it.meta || {};
   let html = '<div class="meta">';
-  if (it.kind === 'UrlTask' && it.status === 'Ready' && (m.download_formats||[]).length) {
+  // 列表轮询用轻量快照（download_formats 为空），格式按钮不能依赖列表里的格式数；
+  // 弹窗打开时由 get_item_formats 按需拉取。
+  if (it.kind === 'UrlTask' && it.status === 'Ready') {
     // 用 button 而不是 span：span 不可聚焦，键盘用户完全够不到"格式选择"
-    html += '<button type="button" class="fmt" data-act="fmt" data-id="'+esc(it.id)+'">格式选择 ('+m.download_formats.length+')</button>';
+    html += '<button type="button" class="fmt" data-act="fmt" data-id="'+esc(it.id)+'">格式选择</button>';
   }
   const line = qualityLine(m);
   html += line ? esc(line) : '<span class="none">解析后将显示源元数据</span>';
@@ -119,7 +131,7 @@ function ops(it){
   if (s==='Downloading'||s==='PostProcessing'||s==='Transcoding'||s==='Merging') h += '<button class="btn sm danger" data-act="cancel" data-id="'+id+'">取消</button>';
   if (s==='Failed'||s==='Canceled'||s==='NeedLogin') h += '<button class="btn sm" data-act="retry" data-id="'+id+'">重试</button>';
   if (s==='Done') h += '<button class="btn sm" data-act="open" data-id="'+id+'">打开</button>';
-  if (s==='Done'||s==='Failed'||s==='Canceled') h += '<button class="btn sm" data-act="del" data-id="'+id+'">删除</button>';
+  if (s==='Done'||s==='Failed'||s==='Canceled'||s==='Unknown') h += '<button class="btn sm" data-act="del" data-id="'+id+'">删除</button>';
   // 解析/下载/后处理/转码/合并中后端会拒绝 remove_item（"请先取消再删除"）：
   // 只画一个不可点的删除示意，别让用户点了才发现删不掉
   if (BUSY_STATUS.includes(s)) h += '<button class="btn sm" disabled title="任务正在运行，请先取消再删除">删除</button>';
@@ -313,7 +325,11 @@ function closeConfirm(ok){
 }
 const confirmEl=document.getElementById('confirmModal');
 if(confirmEl)confirmEl.addEventListener('click',e=>{
+  if(e.target===confirmEl){closeConfirm(false);return;}
   const b=e.target.closest('[data-confirm]'); if(b)closeConfirm(b.dataset.confirm==='1');
+});
+document.addEventListener('keydown',e=>{
+  if(e.key==='Escape'&&askResolve)closeConfirm(false);
 });
 
 // ===== 事件委派（取代内联 onclick / onfocus）=====
@@ -569,9 +585,9 @@ function mergeWarn(){
   const list=M.ids.map(id=>byId[id]).filter(Boolean);
   const metas=list.map(it=>it.meta||{});
   if(metas.length<2){el.className='merge-warn warn';el.textContent='部分条目尚未解析，无法对比参数。';return;}
-  // 同参判据与后端 merge.rs::same_parameters 同口径：vcodec/height/fps/acodec/sample_rate
+  // 同参判据与后端 merge.rs::same_parameters 同口径：vcodec/width/height/fps/acodec/sample_rate
   // 一致 且 extradata（SPS/PPS）非空并一致（未知即判不一致，MG-02）
-  const v=m=>m.vcodec+'|'+m.height+'|'+(m.fps?Math.round(m.fps*100):'')+'|'+m.acodec+'|'+(m.sample_rate||'')+'|'+(m.extradata||'');
+  const v=m=>m.vcodec+'|'+(m.width||'')+'|'+m.height+'|'+(m.fps?Math.round(m.fps*100):'')+'|'+m.acodec+'|'+(m.sample_rate||'')+'|'+(m.extradata||'');
   const all=metas.every(m=>m&&m.vcodec&&m.height&&m.extradata);
   if(!all){el.className='merge-warn warn';el.textContent='缺少部分条目参数（编码/分辨率），合并将按统一模式处理。';return;}
   const first=v(metas[0]);
@@ -697,7 +713,8 @@ function openUrlModal(tool){
       urlRowHtml('构建页（查最新版本 / 手动挑文件）',it.check_url,'uCheck')+
       '<div style="font-size:12px;color:var(--ink-48);line-height:1.6">手动下载后：ffmpeg/ffprobe 解压取 bin\\ 里的 exe；把 exe 路径填到依赖页输入框并保存即可，之后程序优先使用这一份。</div>';
     document.getElementById('urlModal').classList.add('show');
-    document.getElementById('urlBody').querySelectorAll('[data-copy]').forEach(b=>b.addEventListener('click',()=>copyInput(b.dataset.copy)));
+    // 阻止冒泡：否则全局 [data-copy] 处理器会把输入框 id 当文本再复制一次
+    document.getElementById('urlBody').querySelectorAll('[data-copy]').forEach(b=>b.addEventListener('click',e=>{e.stopPropagation();copyInput(b.dataset.copy);}));
   }).catch(err=>toast(err));
 }
 function closeUrlModal(){document.getElementById('urlModal').classList.remove('show');}
@@ -871,9 +888,10 @@ function renderSetPage(){
     INVOKE('get_version_info').then(info=>{
       const el=document.getElementById('versionInfo'); if(!el)return;
       if(!info.latest_version){ el.textContent='当前 v'+info.current_version+'（最新版本查询失败）'; return; }
-      const hasNew=info.latest_version!==info.current_version;
+      // 本地版本高于 release / 预发布场景都不能只靠 !== 判断
+      const hasNew=versionGreater(info.latest_version,info.current_version);
       // 点击版本号在系统浏览器打开 Release 页（Tauri webview 内 <a target=_blank> 不生效）
-      el.innerHTML='当前 v'+info.current_version+' / 最新 <span class="ver-link '+ (hasNew?'ver-new':'ver-ok') +'" data-url="'+esc(info.url)+'">v'+info.latest_version+'</span>'+(hasNew?' ← 有新版本':'');
+      el.innerHTML='当前 v'+esc(info.current_version)+' / 最新 <span class="ver-link '+ (hasNew?'ver-new':'ver-ok') +'" data-url="'+esc(info.url)+'">v'+esc(info.latest_version)+'</span>'+(hasNew?' ← 有新版本':'');
       el.querySelectorAll('.ver-link').forEach(s=>{
         s.addEventListener('click',()=>{ INVOKE('open_url',{url:s.dataset.url}).catch(e=>toast('打开链接失败：'+e)); });
       });
@@ -935,7 +953,11 @@ function bindSetEvents(){
   const cookieListEl=page.querySelector('#cookieList');
   if(cookieListEl)cookieListEl.addEventListener('click',e=>{
     const b=e.target.closest('[data-del-cookie]'); if(!b)return;
-    INVOKE('delete_cookie',{host:b.dataset.delCookie}).then(()=>loadCookieList()).catch(err=>toast(err));
+    const host=b.dataset.delCookie||'';
+    askConfirm('删除站点 '+host+' 的 Cookie？').then(ok=>{
+      if(!ok)return;
+      INVOKE('delete_cookie',{host}).then(()=>loadCookieList()).catch(err=>toast(err));
+    });
   });
   page.querySelectorAll('[data-act="tool-dl"],[data-act="tool-up"],[data-act="tool-cancel"]').forEach(b=>b.addEventListener('click',()=>{
     const tool=b.dataset.tool;
@@ -960,7 +982,7 @@ function bindSetEvents(){
           S.config.dependencies[tool]=r.path;
           // 落盘失败不能吞：界面提示"完成"、重启后路径却没了（工具静默回退 PATH）
           INVOKE('save_config',{config:S.config})
-            .catch(err=>toast('工具已装好，但路径未保存（'+err+'）：重启后仍按 PATH 查找'));
+            .catch(err=>toast('工具已装好，但路径未保存（'+err+'）：仍会使用 tools\\ 中的副本'));
         }
         toast(r.message||('完成：'+r.path));
         delete S.toolDl[tool];
@@ -1035,7 +1057,12 @@ function saveSettings(){
     else val=el.value;
     setCfg(path,val);
   });
-  INVOKE('save_config',{config:S.config}).then(()=>{toast('设置已保存');closeSettings();}).catch(err=>toast(err));
+  INVOKE('save_config',{config:S.config}).then(()=>{
+    // 保存成功后同步基线，否则 closeSettings 会立刻误报"未保存修改"
+    S.configSaved=JSON.stringify(S.config);
+    toast('设置已保存');
+    closeSettings();
+  }).catch(err=>toast(err));
 }
 
 // ===== 初始化 =====

@@ -155,11 +155,14 @@ pub fn find_in_path(name: &str) -> Option<PathBuf> {
         }
         #[cfg(windows)]
         {
-            // Windows 上补充 .exe/.cmd/.bat 扩展名
-            for ext in ["exe", "cmd", "bat"] {
-                let cand = dir.join(format!("{}.{}", name, ext));
-                if cand.is_file() {
-                    return Some(cand);
+            // 只对无扩展名的名字补 PATHEXT；`yt-dlp.exe` 再加 `.exe` 只会得到
+            // `yt-dlp.exe.exe`，旧写法实际上从未命中 .cmd/.bat。
+            if std::path::Path::new(name).extension().is_none() {
+                for ext in ["exe", "cmd", "bat"] {
+                    let cand = dir.join(format!("{}.{}", name, ext));
+                    if cand.is_file() {
+                        return Some(cand);
+                    }
                 }
             }
         }

@@ -98,17 +98,20 @@ impl ToolKind {
         }
     }
 
-    /// SHA-256 校验文件 URL（可能不存在，404 时跳过校验）。
-    /// gyan.dev 不提供 `.sha256` 旁路文件 → ffmpeg/ffprobe 下载后不做产物校验，
-    /// "有没有新版本"改由 `release-version` 文本比对保证（见 [`Self::version_feed`]）。
+    /// SHA-256 校验文件 URL。
+    ///
+    /// - yt-dlp / deno：官方只发布汇总/报告式校验文件，**没有** `yt-dlp.exe.sha256`
+    ///   这类单文件旁路资源；拿不到期望值时下载会硬失败（见 [`ToolDownloader::download`]）。
+    /// - ffmpeg/ffprobe：gyan.dev 不提供校验文件 → 返回 None，下载后不做产物校验，
+    ///   "有没有新版本"改由 `release-version` 文本比对保证（见 [`Self::version_feed`]）。
     pub fn sha_url(&self) -> Option<&'static str> {
         match self {
             Self::YtDlp => Some(
-                "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe.sha256",
+                "https://github.com/yt-dlp/yt-dlp/releases/latest/download/SHA2-256SUMS",
             ),
             Self::Ffmpeg | Self::Ffprobe => None,
             Self::Deno => Some(
-                "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip.sha256",
+                "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip.sha256sum",
             ),
         }
     }
@@ -425,28 +428,28 @@ impl ToolDownloader {
         }
     }
 
-    /// 远端产物 SHA-256（`.sha256` 旁路文件；404/网络失败返回 None）。
+    /// 远端产物 SHA-256（校验文件；404/网络失败/格式不识别返回 None）。
     pub fn remote_sha(&self, kind: ToolKind) -> Option<String> {
         let url = kind.sha_url()?;
-        let mut cmd = self.curl(&["-L", "--fail", "-sS", "--max-time", "20", url]);
+        // 校验值拿不到就拒绝安装；短暂限流/抖动用 curl 自身重试兜一下
+        let mut cmd = self.curl(&[
+            "-L",
+            "--fail",
+            "-sS",
+            "--max-time",
+            "20",
+            "--retry",
+            "2",
+            "--retry-delay",
+            "1",
+            url,
+        ]);
         crate::exec::hide_console(&mut cmd);
         let output = cmd.output().ok()?;
         if !output.status.success() {
             return None;
         }
-        let text = String::from_utf8_lossy(&output.stdout).into_owned();
-        // 格式："<64hex>  filename" 或 裸 64hex
-        let hex = text
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        if hex.len() == 64 {
-            Some(hex)
-        } else {
-            None
-        }
+        parse_checksum(kind, &String::from_utf8_lossy(&output.stdout))
     }
 
     /// 下载并安装到 `dest`（目标文件绝对路径：`tools\<工具名>` 或设置里填的位置）。
@@ -720,6 +723,46 @@ impl ToolDownloader {
     }
 }
 
+/// 从校验文件文本里取**目标产物**的 SHA-256。
+///
+/// - yt-dlp：`SHA2-256SUMS` 每行形如 `<hex>  <filename>`，第一行是 `yt-dlp` 本体，
+///   必须按文件名选中 `yt-dlp.exe` 那一行（不能取全文第一个 token）；
+/// - deno：`.sha256sum` 是报告格式（`Algorithm : SHA256` / `Hash : <hex>`），
+///   取 `Hash` 行；
+/// - ffmpeg/ffprobe：没有校验文件。
+fn parse_checksum(kind: ToolKind, text: &str) -> Option<String> {
+    fn hex_64(s: &str) -> Option<String> {
+        let s = s.trim();
+        if s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+            Some(s.to_ascii_lowercase())
+        } else {
+            None
+        }
+    }
+    match kind {
+        ToolKind::YtDlp => text.lines().find_map(|line| {
+            let mut fields = line.split_whitespace();
+            let hash = fields.next()?;
+            // sha256sum 的二进制模式会在文件名前加 `*`
+            let name = fields.next()?.trim_start_matches('*');
+            if name == "yt-dlp.exe" {
+                hex_64(hash)
+            } else {
+                None
+            }
+        }),
+        ToolKind::Deno => text.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            if key.trim().eq_ignore_ascii_case("Hash") {
+                hex_64(value)
+            } else {
+                None
+            }
+        }),
+        ToolKind::Ffmpeg | ToolKind::Ffprobe => None,
+    }
+}
+
 /// 从 curl `-I` 输出里取最后一个 `content-length`。
 /// 带 `-L` 时输出含每一次跳转的响应头，只有最终响应的大小是真实文件大小。
 fn last_content_length(headers: &str) -> Option<u64> {
@@ -776,6 +819,11 @@ mod tests {
         assert_eq!(ToolKind::Ffprobe.url(), FFMPEG_ZIP_URL);
         // gyan.dev 没有 .sha256 旁路文件 → 产物校验跳过，版本靠 release-version 比对
         assert_eq!(ToolKind::Ffmpeg.sha_url(), None);
+        // 官方没有单文件 .sha256 旁路资源，必须指向汇总/报告文件
+        let yt_dlp_sha = ToolKind::YtDlp.sha_url().unwrap();
+        assert!(yt_dlp_sha.ends_with("SHA2-256SUMS"));
+        let deno_sha = ToolKind::Deno.sha_url().unwrap();
+        assert!(deno_sha.ends_with(".zip.sha256sum"));
         assert_eq!(
             ToolKind::Ffmpeg.version_feed(),
             Some(VersionFeed::Text(FFMPEG_VERSION_FEED))
@@ -807,6 +855,44 @@ mod tests {
             Some("deno.exe")
         );
         assert_eq!(select_zip_entry(["a/ffprobe.exe"], "bin/ffmpeg.exe"), None);
+    }
+
+    #[test]
+    fn parse_checksum_selects_target_asset() {
+        let sum = "1".repeat(64);
+        let exe = "2".repeat(64);
+        // SHA2-256SUMS 第一行是 yt-dlp 本体，必须按文件名选 .exe
+        let text = format!("{sum}  yt-dlp\n{exe}  yt-dlp.exe\n{sum}  yt-dlp.tar.gz\n");
+        assert_eq!(
+            parse_checksum(ToolKind::YtDlp, &text).as_deref(),
+            Some(exe.as_str())
+        );
+        // 二进制模式的文件名前缀 `*`
+        let text = format!("{sum}  yt-dlp\n{exe} *yt-dlp.exe\n");
+        assert_eq!(
+            parse_checksum(ToolKind::YtDlp, &text).as_deref(),
+            Some(exe.as_str())
+        );
+    }
+
+    #[test]
+    fn parse_checksum_deno_report_format() {
+        let hash = "a0c3101b4158d1dfb7d6a78a7bf0f3de80c96bb423c152beec8beb22786f2238";
+        // deno 的 .sha256sum 是报告格式，且使用 CRLF
+        let text = format!(
+            "\r\nAlgorithm : SHA256\r\nHash      : {}\r\nPath      : C:\\a\\deno.zip\r\n",
+            hash.to_uppercase()
+        );
+        assert_eq!(parse_checksum(ToolKind::Deno, &text).as_deref(), Some(hash));
+        assert!(parse_checksum(ToolKind::Ffmpeg, &text).is_none());
+    }
+
+    #[test]
+    fn parse_checksum_rejects_bad_hash() {
+        let text = "abc  yt-dlp.exe\n";
+        assert!(parse_checksum(ToolKind::YtDlp, text).is_none());
+        let text = "Hash : not-a-hash\n";
+        assert!(parse_checksum(ToolKind::Deno, text).is_none());
     }
 
     #[test]

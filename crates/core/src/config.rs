@@ -194,16 +194,6 @@ fn site_matches(site: &str, host: &str) -> bool {
     host == site || host.ends_with(&format!(".{site}"))
 }
 
-/// 读取并剥掉 UTF-8 BOM（Windows 记事本编辑过的配置带 BOM，
-/// serde_json 对 BOM 报"expected value"会被误判为损坏）。
-fn read_text_stripping_bom(path: &Path) -> Result<String> {
-    let text = std::fs::read_to_string(path)?;
-    Ok(text
-        .strip_prefix('\u{feff}')
-        .map(str::to_string)
-        .unwrap_or(text))
-}
-
 /// 根配置（§7.2）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -222,7 +212,20 @@ impl AppConfig {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let text = read_text_stripping_bom(path)?;
+        // 字节读 + BOM/UTF-8/GBK 解码：记事本 ANSI / PowerShell 重定向的配置
+        // 不能让整份读取直接失败，否则会静默回退默认值。
+        let text = match crate::paths::read_text_file(path) {
+            Ok(t) => t,
+            Err(e) => {
+                let backup = corrupt_backup_path(path);
+                let detail = if std::fs::copy(path, &backup).is_ok() {
+                    format!("（已备份到 {}）", backup.display())
+                } else {
+                    format!("（备份到 {} 失败）", backup.display())
+                };
+                return Err(CoreError::ConfigCorrupt(format!("读取失败：{e}{detail}")));
+            }
+        };
         let mut cfg: AppConfig = match serde_json::from_str(&text) {
             Ok(c) => c,
             Err(e) => {
@@ -484,6 +487,32 @@ mod tests {
         std::fs::write(&p, "\u{feff}{\"general\":{\"concurrency\":6}}").unwrap();
         let c = AppConfig::load(&p).unwrap();
         assert_eq!(c.general.concurrency, 6);
+    }
+
+    #[test]
+    fn gbk_config_loads() {
+        let root = tempdir().unwrap();
+        let p = root.path().join("config.json");
+        let text = r#"{"download":{"filename_template":"纯标题"}}"#;
+        let (gbk, _, _) = encoding_rs::GBK.encode(text);
+        std::fs::write(&p, gbk.as_ref()).unwrap();
+        let c = AppConfig::load(&p).unwrap();
+        assert_eq!(c.download.filename_template, "纯标题");
+    }
+
+    #[test]
+    fn invalid_bytes_config_backed_up() {
+        let root = tempdir().unwrap();
+        let p = root.path().join("config.json");
+        std::fs::write(&p, [0x81u8]).unwrap();
+        let err = AppConfig::load(&p).unwrap_err();
+        assert!(matches!(err, CoreError::ConfigCorrupt(_)));
+        let backups = std::fs::read_dir(root.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("corrupt"))
+            .count();
+        assert_eq!(backups, 1);
     }
 
     #[test]

@@ -379,6 +379,8 @@ fn finish_download(
         if final_status == Status::Done {
             it.speed = None;
             it.eta = None;
+            // 下载完成后格式列表不再有任何入口使用，清掉可显著缩小 history.json
+            it.meta.download_formats.clear();
             // 产物路径回填（MD-06 / TC-11）：下载产物必须能像本地文件一样
             // 直接进入转码/合并，否则列表里连"转码"按钮都不会出现。
             if let Some(p) = &final_path_str {

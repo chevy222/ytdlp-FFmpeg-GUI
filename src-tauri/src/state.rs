@@ -43,6 +43,8 @@ impl From<ytdlp_core::cli::CliArgs> for CliOverrides {
 
 pub struct AppState {
     pub paths: Paths,
+    /// history.json 本次未能读取（已尽力备份）：启动时禁止用空列表覆盖原文件。
+    pub history_load_failed: bool,
     pub history: Mutex<History>,
     pub config: Mutex<AppConfig>,
     pub queue: Mutex<TaskQueue>,
@@ -85,15 +87,21 @@ impl AppState {
                 AppConfig::default()
             }
         };
-        let mut history = History::load(&paths.history_file()).unwrap_or_else(|e| {
-            ytdlp_core::log::error(format!("history 加载失败（回退空列表）：{e}"));
-            History::default()
-        });
+        let (mut history, history_load_failed) = match History::load(&paths.history_file()) {
+            Ok(h) => (h, false),
+            Err(e) => {
+                ytdlp_core::log::error(format!(
+                    "history 加载失败（回退空列表，启动时不会覆盖原文件）：{e}"
+                ));
+                (History::default(), true)
+            }
+        };
         // 设置页的"历史上限"要真正生效（此前只存在于配置里，UI 只能标注"暂未生效"）
         history.set_limit(config.general.history_limit);
         let concurrency = config.general.concurrency as usize;
         Self {
             paths,
+            history_load_failed,
             history: Mutex::new(history),
             config: Mutex::new(config),
             queue: Mutex::new(TaskQueue::new(concurrency)),

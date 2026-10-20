@@ -11,7 +11,11 @@ use ytdlp_core::log;
 /// 条目的状态不区分"运行中"与"排队中"（都是 Downloading/Transcoding/Merging），
 /// 因此这个数字只能由队列本身给出，否则界面会出现"运行中 5/3"这种自相矛盾的读数。
 #[tauri::command(async)]
-pub fn queue_status(state: State<'_, AppState>) -> CmdResult<serde_json::Value> {
+pub fn queue_status(
+    win: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+) -> CmdResult<serde_json::Value> {
+    ensure_main_window(&win)?;
     let q = state.queue.lock();
     Ok(serde_json::json!({
         "running": q.running_count(),
@@ -21,7 +25,12 @@ pub fn queue_status(state: State<'_, AppState>) -> CmdResult<serde_json::Value> 
 }
 
 #[tauri::command(async)]
-pub fn open_item_dir(state: State<'_, AppState>, id: String) -> CmdResult<()> {
+pub fn open_item_dir(
+    win: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    id: String,
+) -> CmdResult<()> {
+    ensure_main_window(&win)?;
     let hist = state.history.lock();
     let item = hist.get(&id).ok_or("条目不存在")?;
     let target = item
@@ -191,7 +200,11 @@ fn fetch_latest_release(proxy: Option<&str>) -> CmdResult<(String, String)> {
 /// - 有新版时返回 Some(UpdateInfo)，无新版返回 None；
 /// - 失败时返回错误，前端静默忽略（检查更新是可选增强，不应阻塞启动）。
 #[tauri::command]
-pub async fn check_update(app: AppHandle) -> CmdResult<Option<UpdateInfo>> {
+pub async fn check_update(
+    app: AppHandle,
+    win: tauri::WebviewWindow,
+) -> CmdResult<Option<UpdateInfo>> {
+    ensure_main_window(&win)?;
     let (enabled, proxy) = {
         let state = app.state::<AppState>();
         let c = state.config.lock();
@@ -222,7 +235,11 @@ pub async fn check_update(app: AppHandle) -> CmdResult<Option<UpdateInfo>> {
 /// 前端在"启动时检查更新"旁边展示"当前 vX.Y.Z / 最新 vA.B.C"，让用户在
 /// 关闭自动检查时也能手动看到版本状态。查询失败时 latest_version 为空串。
 #[tauri::command]
-pub async fn get_version_info(app: AppHandle) -> CmdResult<UpdateInfo> {
+pub async fn get_version_info(
+    app: AppHandle,
+    win: tauri::WebviewWindow,
+) -> CmdResult<UpdateInfo> {
+    ensure_main_window(&win)?;
     let proxy = {
         let state = app.state::<AppState>();
         let c = state.config.lock();

@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 /// 会让"看着很快"的抽帧命令永久挂住，而调用点在解析/下载收尾链路上）。
 const THUMB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-// 历史：下载命令曾带 `--write-thumbnail` 在输出目录留一份封面，由
-// `collect_written_thumbnail` 收集；现已整合为"解析阶段一次性下载"，
-// 下载命令只 `--embed-thumbnail`（嵌入 MP4 元数据），不再单独写封面文件。
+// 历史：下载命令曾带 `--write-thumbnail` 在输出目录留一份封面，由旧的收集函数处理；
+// 该函数已删除，现已整合为"解析阶段一次性下载"，下载命令只 `--embed-thumbnail`
+// （嵌入元数据），不再单独写封面文件。
 
 /// 抽取文件**内嵌封面**（attached_pic，元数据）——与桌面/播放器显示的封面同源，
 /// 不重新截帧。无封面流时返回 `Ok(false)`，由调用方回退抽帧。

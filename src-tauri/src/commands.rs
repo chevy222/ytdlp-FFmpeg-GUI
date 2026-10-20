@@ -53,7 +53,6 @@ use crate::login;
 use crate::state::AppState;
 use download_task::run_download_task;
 use merge_task::run_merge_task;
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -263,6 +262,8 @@ fn fetch_thumb_ytdlp(
     let out_tmpl = tmp_dir.join("%(id)s.%(ext)s");
     let out_tmpl_str = out_tmpl.to_string_lossy().into_owned();
     let mut args: Vec<String> = vec![
+        // 忽略用户级/便携级配置，避免 -o/--paths 被覆盖（与主下载链路同口径）
+        "--ignore-config".into(),
         "--write-thumbnail".into(),
         "--skip-download".into(),
         "--no-warnings".into(),
@@ -280,6 +281,24 @@ fn fetch_thumb_ytdlp(
         args.push("--cookies".into());
         args.push(c.to_string_lossy().into_owned());
     }
+    if let Ok(deno) = resolver.resolve(ytdlp_core::exec::Tool::Deno) {
+        args.push("--js-runtimes".into());
+        args.push(format!("deno:{}", deno.to_string_lossy()));
+    }
+    if let Ok(ffmpeg) = resolver.resolve(ytdlp_core::exec::Tool::Ffmpeg) {
+        args.push("--ffmpeg-location".into());
+        args.push(ffmpeg.to_string_lossy().into_owned());
+        // dest 固定 .jpg：让 yt-dlp 转成 jpg，避免 webp/png 内容配 .jpg 扩展名
+        args.push("--convert-thumbnails".into());
+        args.push("jpg".into());
+    }
+    args.push("--user-agent".into());
+    args.push(ytdlp_core::config::DEFAULT_USER_AGENT.to_string());
+    args.push("--add-header".into());
+    args.push(format!(
+        "Accept-Language:{}",
+        ytdlp_core::config::DEFAULT_ACCEPT_LANGUAGE
+    ));
     args.push("-o".into());
     args.push(out_tmpl_str);
     args.push(video_url.to_string());
@@ -308,20 +327,30 @@ fn fetch_thumb_ytdlp(
             return Err(format!("yt-dlp 缩略图下载失败：{e}"));
         }
     }
-    // yt-dlp 写出的封面扩展名可能是 webp/jpg/jpeg/png（取决于源）。
+    // 封面扩展名可能是 webp/jpg/jpeg/png/avif（取决于源与转换结果）。
     // 只按扩展名白名单挑：目录里可能还躺着 .part/点文件等其它条目，而 read_dir
     // 顺序不定 —— "随便取第一个"会把非封面文件复制过去。
     let thumb_file = std::fs::read_dir(&tmp_dir).ok().and_then(|rd| {
-        rd.flatten().map(|e| e.path()).find(|p| {
-            p.is_file()
-                && matches!(
-                    p.extension()
-                        .and_then(|e| e.to_str())
-                        .map(str::to_ascii_lowercase)
-                        .as_deref(),
-                    Some("webp" | "jpg" | "jpeg" | "png")
-                )
-        })
+        let mut images: Vec<PathBuf> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_file()
+                    && matches!(
+                        p.extension()
+                            .and_then(|e| e.to_str())
+                            .map(str::to_ascii_lowercase)
+                            .as_deref(),
+                        Some("webp" | "jpg" | "jpeg" | "png" | "avif")
+                    )
+            })
+            .collect();
+        // dest 固定 .jpg：优先 jpg/jpeg（转换后的），避免复制转换前的 webp/png
+        images.sort_by_key(|p| {
+            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+            !ext.eq_ignore_ascii_case("jpg") && !ext.eq_ignore_ascii_case("jpeg")
+        });
+        images.into_iter().next()
     });
     let Some(thumb_file) = thumb_file else {
         let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -382,7 +411,8 @@ fn persist(app: &AppHandle) {
 /// 剪贴板被其它进程占用时 `OpenClipboard` 会阻塞数秒，同步命令跑在主线程会卡窗口，
 /// 因此走 `spawn_blocking`（A6：不得在主线程做阻塞 IO）。
 #[tauri::command]
-pub async fn read_clipboard() -> CmdResult<String> {
+pub async fn read_clipboard(win: tauri::WebviewWindow) -> CmdResult<String> {
+    ensure_main_window(&win)?;
     tauri::async_runtime::spawn_blocking(|| -> CmdResult<String> {
         let mut clipboard =
             arboard::Clipboard::new().map_err(|e| format!("打开剪贴板失败：{e}"))?;
@@ -737,7 +767,11 @@ fn run_probe(app: AppHandle, id: String) {
 /// 轮询一次，留在主线程会周期性卡住窗口。
 /// 轮询请用 [`list_items_lite`]：这一份只用于首次加载（日志弹窗需要历史）。
 #[tauri::command(async)]
-pub fn list_items(state: State<'_, AppState>) -> CmdResult<Vec<MediaItem>> {
+pub fn list_items(
+    win: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+) -> CmdResult<Vec<MediaItem>> {
+    ensure_main_window(&win)?;
     let hist = state.history.lock();
     Ok(hist.items.clone())
 }
@@ -752,18 +786,13 @@ pub fn list_items(state: State<'_, AppState>) -> CmdResult<Vec<MediaItem>> {
 /// ≈ 1.2MB，每 1.5s 轮询一次就是 1MB IPC。它只被"格式选择"弹窗使用，
 /// 打开时通过 [`get_item_formats`] 按需拉取。
 #[tauri::command(async)]
-pub fn list_items_lite(state: State<'_, AppState>) -> CmdResult<Vec<MediaItem>> {
+pub fn list_items_lite(
+    win: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+) -> CmdResult<Vec<MediaItem>> {
+    ensure_main_window(&win)?;
     let hist = state.history.lock();
-    Ok(hist
-        .items
-        .iter()
-        .map(|i| {
-            let mut c = i.clone();
-            c.log = VecDeque::new();
-            c.meta.download_formats.clear();
-            c
-        })
-        .collect())
+    Ok(hist.items.iter().map(MediaItem::to_lite).collect())
 }
 
 /// 取某条目的下载格式列表（格式选择弹窗打开时按需拉取）。
@@ -772,9 +801,11 @@ pub fn list_items_lite(state: State<'_, AppState>) -> CmdResult<Vec<MediaItem>> 
 /// 调此命令取回完整格式列表。
 #[tauri::command(async)]
 pub fn get_item_formats(
+    win: tauri::WebviewWindow,
     state: State<'_, AppState>,
     id: String,
 ) -> CmdResult<Vec<ytdlp_core::model::DownloadFormat>> {
+    ensure_main_window(&win)?;
     let hist = state.history.lock();
     Ok(hist
         .get(&id)
@@ -881,6 +912,29 @@ fn today_stamp() -> String {
     )
 }
 
+/// 解析 "HH:MM:SS" 为秒。空串由上层的"开放区间"语义处理；这里拒绝
+/// 越界分钟/秒、超过 2 位的小时和非数字，避免把 99:99:99 直接传给 yt-dlp。
+fn parse_section_time(t: &str) -> Option<u32> {
+    let mut parts = t.split(':');
+    let h_str = parts.next()?;
+    let m_str = parts.next()?;
+    let s_str = parts.next()?;
+    if parts.next().is_some()
+        || h_str.len() > 2
+        || m_str.len() > 2
+        || s_str.len() > 2
+    {
+        return None;
+    }
+    let h: u32 = h_str.parse().ok()?;
+    let m: u32 = m_str.parse().ok()?;
+    let s: u32 = s_str.parse().ok()?;
+    if h > 99 || m > 59 || s > 59 {
+        return None;
+    }
+    Some(h * 3600 + m * 60 + s)
+}
+
 /// 设置时间范围下载（DL-12）：起止 "HH:MM:SS"；空串清除。
 #[tauri::command(async)]
 pub fn set_sections(
@@ -891,20 +945,21 @@ pub fn set_sections(
     end: String,
 ) -> CmdResult<()> {
     ensure_main_window(&win)?;
-    let valid = |t: &str| {
-        if t.is_empty() {
-            return true;
-        }
-        let parts: Vec<&str> = t.split(':').collect();
-        if parts.len() != 3 {
-            return false;
-        }
-        parts
-            .iter()
-            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) && p.len() <= 2)
+    let err_fmt = "时间格式应为 HH:MM:SS（如 00:01:00）";
+    let start_secs = if start.is_empty() {
+        None
+    } else {
+        Some(parse_section_time(&start).ok_or(err_fmt)?)
     };
-    if !valid(&start) || !valid(&end) {
-        return Err("时间格式应为 HH:MM:SS（如 00:01:00）".into());
+    let end_secs = if end.is_empty() {
+        None
+    } else {
+        Some(parse_section_time(&end).ok_or(err_fmt)?)
+    };
+    if let (Some(s), Some(e)) = (start_secs, end_secs) {
+        if e <= s {
+            return Err("结束时间必须晚于开始时间".into());
+        }
     }
     let sections = if start.is_empty() && end.is_empty() {
         None
@@ -1144,7 +1199,8 @@ pub fn remove_item(app: AppHandle, win: tauri::WebviewWindow, id: String) -> Cmd
 }
 
 #[tauri::command(async)]
-pub fn clear_done(app: AppHandle) -> CmdResult<()> {
+pub fn clear_done(app: AppHandle, win: tauri::WebviewWindow) -> CmdResult<()> {
+    ensure_main_window(&win)?;
     let state = app.state::<AppState>();
     let removed: Vec<String> = {
         let mut hist = state.history.lock();
@@ -1299,4 +1355,32 @@ pub fn rot_item(
     // "随条目保存"必须落盘，否则重启后丢失
     persist(&app);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_section_time;
+
+    #[test]
+    fn section_time_accepts_valid_ranges() {
+        assert_eq!(parse_section_time("00:00:00"), Some(0));
+        assert_eq!(parse_section_time("01:01:01"), Some(3661));
+        assert_eq!(parse_section_time("99:59:59"), Some(359_999));
+    }
+
+    #[test]
+    fn section_time_rejects_invalid_ranges() {
+        for bad in [
+            "100:00:00",
+            "000:00:00",
+            "00:60:00",
+            "00:00:60",
+            "00:00",
+            "00:00:00:00",
+            "aa:00:00",
+            "",
+        ] {
+            assert_eq!(parse_section_time(bad), None, "{bad}");
+        }
+    }
 }

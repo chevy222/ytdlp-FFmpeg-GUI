@@ -470,7 +470,9 @@ pub fn build_args_for_tier(
     let need_gain = meta.needs_audio_gain(params.normalize_audio);
     let gain = if need_gain {
         let max_v = meta.audio_volume.max_volume_db.unwrap_or(0.0);
-        Some((-max_v).clamp(0.0, params.max_gain_db.max(0.0)))
+        let g = (-max_v).clamp(0.0, params.max_gain_db.max(0.0));
+        // gain=0（用户把上限设为 0）不该触发音频重编码
+        (g > 0.1).then_some(g)
     } else {
         None
     };
@@ -752,10 +754,8 @@ pub fn build_args_for_tier(
     args.push(if copy_audio { "copy" } else { "aac" }.into());
     if gain.is_some() || !copy_audio {
         if let Some(g) = gain {
-            if g > 0.1 {
-                args.push("-af".into());
-                args.push(format!("volume={:.2}dB", g));
-            }
+            args.push("-af".into());
+            args.push(format!("volume={:.2}dB", g));
         }
         // 音频码率跟随源，clamp 64-192k（MediaMeta::audio_bitrate_kbps，
         // convert_h265.bat 同款：低码率源不膨胀，高码率源不浪费）
@@ -1183,6 +1183,26 @@ mod tests {
             vf,
             "scale='trunc(iw*min(1,1080/min(iw,ih))/2)*2':'trunc(ih*min(1,1080/min(iw,ih))/2)*2'"
         );
+    }
+
+    #[test]
+    fn zero_gain_limit_keeps_audio_copy() {
+        // max_gain_db=0：需要增益但实际增益为 0，不应重编码音频
+        let mut params = mk();
+        params.normalize_audio = true;
+        params.max_gain_db = 0.0;
+        let meta = MediaMeta {
+            acodec: Some("aac".into()),
+            audio_volume: crate::model::AudioVolume {
+                max_volume_db: Some(-5.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let args = build_args(&ToolResolver::default(), &params, &meta).unwrap();
+        let joined = args.join(" ");
+        assert!(joined.contains("-c:a copy"), "{}", joined);
+        assert!(!joined.contains("-af"), "{}", joined);
     }
 
     #[test]

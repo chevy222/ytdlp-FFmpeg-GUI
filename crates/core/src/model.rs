@@ -226,31 +226,41 @@ impl DownloadFormat {
         }
         if let Some(c) = &self.vcodec {
             let cl = c.to_lowercase();
-            // yt-dlp 的 vcodec 常带 profile 后缀（vp09.00.50.08 / av01.0.08M.08），
-            // 必须前缀匹配而非精确匹配，否则整串塞进标签。
-            let short = if cl.starts_with("av01") {
-                "AV1"
-            } else if cl.starts_with("avc1") || cl.starts_with("h264") || cl.starts_with("h.264") {
-                "H.264"
-            } else if cl.starts_with("hevc") || cl.starts_with("h265") || cl.starts_with("h.265") {
-                "H.265"
-            } else if cl.starts_with("vp9") || cl.starts_with("vp09") {
-                "VP9"
-            } else {
-                c.as_str()
-            };
-            parts.push(short.to_string());
+            if !matches!(cl.as_str(), "none" | "n/a") {
+                // yt-dlp 的 vcodec 常带 profile 后缀（vp09.00.50.08 / av01.0.08M.08），
+                // 必须前缀匹配而非精确匹配，否则整串塞进标签。
+                let short = if cl.starts_with("av01") {
+                    "AV1"
+                } else if cl.starts_with("avc1")
+                    || cl.starts_with("h264")
+                    || cl.starts_with("h.264")
+                {
+                    "H.264"
+                } else if cl.starts_with("hevc")
+                    || cl.starts_with("h265")
+                    || cl.starts_with("h.265")
+                {
+                    "H.265"
+                } else if cl.starts_with("vp9") || cl.starts_with("vp09") {
+                    "VP9"
+                } else {
+                    c.as_str()
+                };
+                parts.push(short.to_string());
+            }
         }
         if let Some(a) = &self.acodec {
             let al = a.to_lowercase();
-            let short = if al.starts_with("mp4a") || al.starts_with("aac") {
-                "AAC"
-            } else if al.starts_with("opus") {
-                "Opus"
-            } else {
-                a.as_str()
-            };
-            parts.push(short.to_string());
+            if !matches!(al.as_str(), "none" | "n/a") {
+                let short = if al.starts_with("mp4a") || al.starts_with("aac") {
+                    "AAC"
+                } else if al.starts_with("opus") {
+                    "Opus"
+                } else {
+                    a.as_str()
+                };
+                parts.push(short.to_string());
+            }
         }
         if let Some(f) = self.filesize_bytes {
             parts.push(human_size(f));
@@ -263,6 +273,34 @@ impl DownloadFormat {
 }
 
 impl MediaMeta {
+    /// 列表轮询用的轻量副本：不复制格式列表（YouTube 单条可达 60 项）。
+    pub fn to_lite(&self) -> Self {
+        Self {
+            title: self.title.clone(),
+            uploader: self.uploader.clone(),
+            duration_secs: self.duration_secs,
+            container: self.container.clone(),
+            height: self.height,
+            vcodec: self.vcodec.clone(),
+            vbitrate_kbps: self.vbitrate_kbps,
+            fps: self.fps,
+            acodec: self.acodec.clone(),
+            abitrate_kbps: self.abitrate_kbps,
+            audio_tracks: self.audio_tracks,
+            audio_channels: self.audio_channels,
+            audio_volume: self.audio_volume.clone(),
+            size_bytes: self.size_bytes,
+            has_cover: self.has_cover,
+            extradata: self.extradata.clone(),
+            sample_rate: self.sample_rate,
+            video_stream_index: self.video_stream_index,
+            cover_stream_index: self.cover_stream_index,
+            rotate_tag: self.rotate_tag,
+            width: self.width,
+            download_formats: Vec::new(),
+        }
+    }
+
     /// 分辨率短边：无论横竖屏，都取 min(宽,高)。
     /// 文档 §8 口径"分辨率(4K/2K/xP)"按短边计（§6.2）。
     pub fn short_edge(&self) -> Option<u32> {
@@ -400,6 +438,33 @@ impl MediaItem {
         let mut it = Self::new(ItemKind::LocalFile, title);
         it.path = Some(path);
         it
+    }
+
+    /// 列表轮询用的轻量副本：不复制日志（最多 300 行）与下载格式列表。
+    pub fn to_lite(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            kind: self.kind,
+            title: self.title.clone(),
+            path: self.path.clone(),
+            url: self.url.clone(),
+            site: self.site.clone(),
+            host: self.host.clone(),
+            status: self.status,
+            percent: self.percent,
+            error: self.error.clone(),
+            speed: self.speed.clone(),
+            eta: self.eta.clone(),
+            file: self.file.clone(),
+            log: VecDeque::new(),
+            meta: self.meta.to_lite(),
+            thumb: self.thumb.clone(),
+            rot_angle: self.rot_angle,
+            format_id: self.format_id.clone(),
+            audio_only: self.audio_only,
+            updated_at: self.updated_at.clone(),
+            sections: self.sections.clone(),
+        }
     }
 
     /// 日志追加，保留最近 `MAX_LOG_LINES` 行（300）。
@@ -713,6 +778,18 @@ mod tests {
     }
 
     #[test]
+    fn label_skips_none_codecs() {
+        let f = DownloadFormat {
+            vcodec: Some("none".into()),
+            acodec: Some("n/a".into()),
+            ..Default::default()
+        };
+        let label = f.make_label();
+        assert!(!label.contains("none"), "{}", label);
+        assert!(!label.contains("n/a"), "{}", label);
+    }
+
+    #[test]
     fn human_size_formats() {
         assert_eq!(human_size(1024), "1.0KB");
         assert_eq!(human_size(1024 * 1024), "1.0MB");
@@ -753,6 +830,23 @@ mod tests {
         assert_eq!(back.rot_angle.degrees(), 90);
         assert_eq!(back.log.front().map(String::as_str), Some("解析完成"));
         assert_eq!(back.meta.audio_volume.max_volume_db, Some(-8.2));
+    }
+
+    #[test]
+    fn lite_clone_drops_logs_and_formats() {
+        let mut it = item();
+        it.push_log("line");
+        it.meta.extradata = Some("aabb".into());
+        it.meta.download_formats = vec![DownloadFormat {
+            format_id: "137".into(),
+            ..Default::default()
+        }];
+        let lite = it.to_lite();
+        assert!(lite.log.is_empty());
+        assert!(lite.meta.download_formats.is_empty());
+        assert_eq!(lite.id, it.id);
+        assert_eq!(lite.title, it.title);
+        assert_eq!(lite.meta.extradata, Some("aabb".into()));
     }
 
     #[test]

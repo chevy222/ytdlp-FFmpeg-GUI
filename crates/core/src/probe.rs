@@ -453,22 +453,39 @@ pub fn parse_ytdlp_json(text: &str) -> Result<UrlProbe> {
             if format_id.is_empty() {
                 continue;
             }
-            let vcodec = f["vcodec"].as_str().map(str::to_string);
-            let acodec = f["acodec"].as_str().map(str::to_string);
+            // yt-dlp 用 "none"/"n/a" 表示该格式没有对应流；必须归一为 None，
+            // 否则格式标签会出现 "none"，storyboard（mhtml + 双 none）也会被当成音频。
+            let codec = |v: &Value| -> Option<String> {
+                v.as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .filter(|s| !matches!(s.to_ascii_lowercase().as_str(), "none" | "n/a"))
+                    .map(str::to_string)
+            };
+            let vcodec = codec(&f["vcodec"]);
+            let acodec = codec(&f["acodec"]);
             let height = f["height"].as_u64().map(|h| h as u32);
             let fps = f["fps"].as_f64();
+            // filesize_approx 常为浮点（tbr × duration 估算），as_u64 会直接丢掉
             let filesize = f.as_object().and_then(|o| {
                 o.get("filesize")
                     .or_else(|| o.get("filesize_approx"))
-                    .and_then(|x| x.as_u64())
+                    .and_then(|x| {
+                        x.as_u64()
+                            .or_else(|| x.as_f64().map(|v| v.max(0.0) as u64))
+                    })
             });
             let tbr = f["tbr"].as_f64().map(|t| t as u32);
             let ext = f["ext"].as_str().map(str::to_string);
-            let has_video = match vcodec.as_deref() {
-                None => false,
-                Some(c) => !matches!(c.to_lowercase().as_str(), "none" | "n/a" | "images"),
-            };
+            let has_video = vcodec
+                .as_deref()
+                .map(|c| !c.eq_ignore_ascii_case("images"))
+                .unwrap_or(false);
             let audio_only = !has_video && acodec.is_some();
+            if !has_video && acodec.is_none() {
+                // mhtml/storyboard/既无视频也无音频的条目，下载会失败
+                continue;
+            }
             let note = f["format_note"].as_str().map(str::to_string);
             let df = DownloadFormat {
                 label: String::new(),
@@ -593,8 +610,9 @@ pub fn parse_ffprobe_json(text: &str) -> std::result::Result<MediaMeta, serde_js
                         if let Some(sd) = s["side_data_list"].as_array() {
                             for item in sd {
                                 if let Some(r) = item["rotation"].as_f64() {
-                                    // rotation 是弧度（如 -1.570796），转成角度
-                                    let deg = (r * 180.0 / std::f64::consts::PI).round() as i32;
+                                    // ffprobe 的 Display Matrix `rotation` 已经是角度
+                                    // （实测 90.0，不是弧度）；再乘 180/π 会把 90° 算成 117°。
+                                    let deg = r.round() as i32;
                                     if deg != 0 {
                                         meta.rotate_tag = Some(deg.rem_euclid(360));
                                         break;
@@ -669,6 +687,9 @@ fn classify_ytdlp_error(stderr: &str) -> ProbeFailure {
         || lower.contains("members only")
         || lower.contains("cookies are needed")
         || lower.contains("fresh cookies")
+        // YouTube 的 bot 校验常以 403 呈现；归到可登录处理的类别
+        || lower.contains("403")
+        || lower.contains("forbidden")
     {
         ProbeErrorKind::NeedLogin
     } else if lower.contains("unable to download webpage")
@@ -739,6 +760,22 @@ mod tests {
         assert!(audio.audio_only);
         assert!(audio.label.contains("仅音频"));
         assert!(audio.label.contains("AAC"));
+    }
+
+    #[test]
+    fn parse_ytdlp_json_skips_storyboards_and_float_sizes() {
+        let text = r#"{"title":"t","formats":[
+          {"format_id":"sb","ext":"mhtml","vcodec":"none","acodec":"none","filesize_approx":12345.0},
+          {"format_id":"v","ext":"mp4","vcodec":"avc1","acodec":"none","height":1080,"filesize_approx":12345.5},
+          {"format_id":"a","ext":"m4a","vcodec":"none","acodec":"mp4a","filesize":999}
+        ]}"#;
+        let p = parse_ytdlp_json(text).unwrap();
+        assert_eq!(p.meta.download_formats.len(), 2);
+        let video = &p.meta.download_formats[0];
+        assert_eq!(video.format_id, "v");
+        assert!(video.acodec.is_none(), "none 不应保留为 acodec");
+        assert_eq!(video.filesize_bytes, Some(12345));
+        assert_eq!(p.meta.download_formats[1].filesize_bytes, Some(999));
     }
 
     #[test]
@@ -823,6 +860,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_ffprobe_json_side_data_rotation_is_degrees() {
+        // ffprobe 输出 rotation 是角度；旧实现按弧度换算，90° 会变成 117°
+        let json = r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"hevc","width":1080,"height":1920,"side_data_list":[{"side_data_type":"Display Matrix","rotation":90}]}]}"#;
+        assert_eq!(parse_ffprobe_json(json).unwrap().rotate_tag, Some(90));
+        let json = r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"hevc","width":1920,"height":1080,"side_data_list":[{"rotation":-90}]}]}"#;
+        assert_eq!(parse_ffprobe_json(json).unwrap().rotate_tag, Some(270));
+    }
+
+    #[test]
     fn parse_ffprobe_json_missing_index_falls_back_to_position() {
         // 不带 index 字段（老样本）时按出现顺序回退，保证映射不丢
         let json = r#"{"streams":[{"codec_type":"video","codec_name":"h264","height":720},{"codec_type":"audio","codec_name":"aac"}]}"#;
@@ -865,6 +911,10 @@ mod tests {
         assert_eq!(e.kind, ProbeErrorKind::Failed);
         let e = classify_ytdlp_error(
             "ERROR: [Douyin] 7686436507753794843: Fresh cookies (not necessarily logged in) are needed",
+        );
+        assert_eq!(e.kind, ProbeErrorKind::NeedLogin);
+        let e = classify_ytdlp_error(
+            "ERROR: unable to download video data: HTTP Error 403: Forbidden",
         );
         assert_eq!(e.kind, ProbeErrorKind::NeedLogin);
     }
