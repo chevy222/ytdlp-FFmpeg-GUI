@@ -238,17 +238,23 @@ pub fn probe_url(
 ) -> std::result::Result<UrlProbe, ProbeFailure> {
     use std::sync::atomic::Ordering;
     let extra: &[&str] = if playlist {
-        &["-J", "--no-warnings", "--yes-playlist", "--socket-timeout", "60"]
+        &[
+            "-J",
+            "--no-warnings",
+            "--yes-playlist",
+            "--socket-timeout",
+            "60",
+        ]
     } else {
-        &["-J", "--no-warnings", "--no-playlist", "--socket-timeout", "60"]
+        &[
+            "-J",
+            "--no-warnings",
+            "--no-playlist",
+            "--socket-timeout",
+            "60",
+        ]
     };
-    let args = ytdlp_args(
-        resolver,
-        url,
-        cookies_file,
-        network,
-        extra,
-    );
+    let args = ytdlp_args(resolver, url, cookies_file, network, extra);
     on_log(crate::exec::display_command("yt-dlp", &args));
     let mut cmd = resolver.command(Tool::YtDlp).map_err(|e| ProbeFailure {
         kind: ProbeErrorKind::Failed,
@@ -392,9 +398,20 @@ pub fn probe_volume(
         .map(|s| s.to_string())
         .chain(std::iter::once(path.to_string_lossy().into_owned()))
         .chain(
-            ["-vn", "-map", "0:a:0", "-t", "600", "-af", "volumedetect", "-f", "null", "-"]
-                .iter()
-                .map(|s| s.to_string()),
+            [
+                "-vn",
+                "-map",
+                "0:a:0",
+                "-t",
+                "600",
+                "-af",
+                "volumedetect",
+                "-f",
+                "null",
+                "-",
+            ]
+            .iter()
+            .map(|s| s.to_string()),
         )
         .collect();
     on_log(crate::exec::display_command("ffmpeg", &args));
@@ -411,7 +428,10 @@ pub fn probe_volume(
 pub fn parse_ytdlp_json(text: &str) -> Result<UrlProbe> {
     let v: Value = serde_json::from_str(text)?;
     let title = v["title"].as_str().map(str::to_string);
-    let uploader = v["uploader"].as_str().or(v["channel"].as_str()).map(str::to_string);
+    let uploader = v["uploader"]
+        .as_str()
+        .or(v["channel"].as_str())
+        .map(str::to_string);
     let duration = v["duration"].as_f64();
     let thumbnail = v["thumbnail"].as_str().map(str::to_string);
     let is_playlist = v["_type"].as_str() == Some("playlist")

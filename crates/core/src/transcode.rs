@@ -7,11 +7,11 @@
 //!
 //! 进度：`ffmpeg -progress pipe:1 -nostats`，按 `out_time_us` 相对探测时长换算百分比。
 
+use parking_lot::Mutex;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
-use parking_lot::Mutex;
 
 use crate::exec::{decode_text, ChildGuard, Tool, ToolResolver};
 use crate::model::{MediaMeta, RotAngle};
@@ -235,10 +235,7 @@ pub fn explicit_encoder_args(mode: &str) -> (String, Vec<String>) {
 
 /// 编码器选择（TC-14：auto = QSV 可用则 hevc_qsv，否则 libx265 兜底；
 /// 显式 nvenc/amf/libx265 不被自动覆盖）。
-fn pick_encoder(
-    resolver: &ToolResolver,
-    mode: &str,
-) -> Result<(String, Vec<String>)> {
+fn pick_encoder(resolver: &ToolResolver, mode: &str) -> Result<(String, Vec<String>)> {
     let (enc, args) = explicit_encoder_args(mode);
     match mode {
         "libx265" => Ok((enc, args)),
@@ -345,7 +342,12 @@ fn detect_hw_encoders_uncached(resolver: &ToolResolver) -> Result<HwEncoders> {
 /// 因此用旋转不变量表达：短边 = `min(iw,ih)`、长边 = `max(iw,ih)`——无论转不转都成立。
 /// 缩放系数 s = min(1, max_h/短边, max_w/长边)，宽高各自 `trunc(*s/2)*2` 保偶数边长
 /// （奇数宽会让 libx265/QSV 直接报 chroma subsampling 错误）。
-fn build_vf(rot: RotAngle, max_w: u32, max_h: u32, force_scale: Option<(u32, u32)>) -> Option<String> {
+fn build_vf(
+    rot: RotAngle,
+    max_w: u32,
+    max_h: u32,
+    force_scale: Option<(u32, u32)>,
+) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     match rot.degrees() {
         90 => parts.push("transpose=1".into()),
@@ -476,7 +478,12 @@ pub fn build_args_for_tier(
     // —— 滤镜链 ——
     // CPU 链：旋转（transpose）→ 分辨率上限（旋转不变量 min(iw,ih)/max(iw,ih)，
     // min 两两嵌套——ffmpeg 求值器 min/max 只收两个参数）。
-    let cpu_vf = build_vf(params.rot_angle, params.max_w, params.max_h, params.force_scale);
+    let cpu_vf = build_vf(
+        params.rot_angle,
+        params.max_w,
+        params.max_h,
+        params.force_scale,
+    );
     // GPU 链：vpp_qsv 先缩放后转置；force_scale 用固定值（无表达式），
     // 缩小上限用 ffmpeg 表达式（min() 嵌套，与 CPU 路径同式）。
     let gpu_vf: Option<String> = (tier == TranscodeTier::GpuQsv).then(|| {
@@ -485,7 +492,9 @@ pub fn build_args_for_tier(
             return match params.rot_angle.degrees() {
                 90 => format!("vpp_qsv=transpose=clock:w={w}:h={h}"),
                 270 => format!("vpp_qsv=transpose=cclock:w={w}:h={h}"),
-                180 => format!("vpp_qsv=transpose=clock,vpp_qsv=transpose=clock,scale_qsv=w={w}:h={h}"),
+                180 => {
+                    format!("vpp_qsv=transpose=clock,vpp_qsv=transpose=clock,scale_qsv=w={w}:h={h}")
+                }
                 _ => format!("scale_qsv=w={w}:h={h}"),
             };
         }

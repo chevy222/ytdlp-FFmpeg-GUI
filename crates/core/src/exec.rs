@@ -938,7 +938,10 @@ mod tests {
     #[test]
     fn display_command_redacts_proxy_credentials() {
         // 分离写法：--proxy 的值 userinfo 被遮蔽
-        let a = vec!["--proxy".to_string(), "socks5://user:pass@1.2.3.4:1080".to_string()];
+        let a = vec![
+            "--proxy".to_string(),
+            "socks5://user:pass@1.2.3.4:1080".to_string(),
+        ];
         assert_eq!(
             display_command("yt-dlp", &a),
             "yt-dlp --proxy socks5://***@1.2.3.4:1080"
@@ -1016,8 +1019,9 @@ mod tests {
         // 非 UTF-8 行（GBK 的"你"= C4 E3）不能让读取循环中断：
         // `lines()` 遇非法字节返回 Err，旧实现 break 后子进程会卡死在写 stdout 上
         let mut cmd = Command::new("sh");
-        cmd.arg("-c")
-            .arg("printf '\\304\\343\\n'; echo '[download]  12.3% of 1MiB at 1MiB/s ETA 00:01'; exit 0");
+        cmd.arg("-c").arg(
+            "printf '\\304\\343\\n'; echo '[download]  12.3% of 1MiB at 1MiB/s ETA 00:01'; exit 0",
+        );
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         let mut guard = ChildGuard::spawn(&mut cmd).unwrap();
@@ -1073,7 +1077,9 @@ mod tests {
         let t0 = Instant::now();
         // panic 消息由默认 hook 打到测试 stderr（仅失败时展示），这里只验时序
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = stream_lines(&mut guard, &cancel, None, |_| panic!("on_line panic（回归测试）"));
+            let _ = stream_lines(&mut guard, &cancel, None, |_| {
+                panic!("on_line panic（回归测试）")
+            });
         }));
         let spent = t0.elapsed();
         assert!(caught.is_err(), "panic 必须原样传播给调用方");

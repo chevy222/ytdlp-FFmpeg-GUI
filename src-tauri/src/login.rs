@@ -29,10 +29,11 @@ use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 /// WebView2 的默认 UA 带 `Edg/` 等标识，部分站点会据此返回空白页或进入重定向
 /// 循环；换成标准桌面 Chrome UA 以提高兼容性。
 ///
-/// 维护提示：站点风控会按 UA 的版本号判定"浏览器是否过旧"，这里的 Chrome 版本
-/// 需要隔一段时间跟着上调（改的是这个常量，不是别处）。
+/// **必须与 `download.rs` 的 `DEFAULT_USER_AGENT` 保持一致**：登录窗用什么 UA
+/// 登录、下载就用什么 UA 请求，否则站点按 UA 指纹风控时会出现"登录了但下载 403"。
+/// 维护提示：站点风控会按 UA 的版本号判定"浏览器是否过旧"，上调时两处一起改。
 pub const LOGIN_USER_AGENT: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
 
 /// 开窗进行中标志：开窗已被移到 async 命令的线程上，这里再挡一道重复点击
 /// （同 label 建两次会报错，用户看不出为什么）。

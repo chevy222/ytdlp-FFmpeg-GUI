@@ -231,8 +231,7 @@ impl History {
                 };
                 Err(CoreError::ConfigCorrupt(format!(
                     "history.json 损坏（{}）：{}",
-                    note,
-                    "无法恢复任何条目"
+                    note, "无法恢复任何条目"
                 )))
             }
         }

@@ -45,9 +45,8 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
     tauri_build::try_build(
-        tauri_build::Attributes::new().windows_attributes(
-            tauri_build::WindowsAttributes::new().app_manifest(APP_MANIFEST),
-        ),
+        tauri_build::Attributes::new()
+            .windows_attributes(tauri_build::WindowsAttributes::new().app_manifest(APP_MANIFEST)),
     )
     .expect("tauri-build 失败");
 }

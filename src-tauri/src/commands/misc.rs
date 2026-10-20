@@ -1,10 +1,10 @@
 //! 杂项命令：队列读数、打开目录、清理临时文件、检查更新、打开外部链接。
 
+use super::{ensure_main_window, err_string, CmdResult};
+use crate::state::AppState;
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager, State};
 use ytdlp_core::log;
-use super::{CmdResult, ensure_main_window, err_string};
-use crate::state::AppState;
 
 /// 队列读数（UI 展示"运行中 x/y、排队 n"）。
 ///
@@ -159,9 +159,7 @@ fn fetch_latest_release(proxy: Option<&str>) -> CmdResult<(String, String)> {
     }
     cmd.arg(api_url);
     ytdlp_core::exec::hide_console(&mut cmd);
-    let output = cmd
-        .output()
-        .map_err(|e| format!("无法调用 curl：{e}"))?;
+    let output = cmd.output().map_err(|e| format!("无法调用 curl：{e}"))?;
     if !output.status.success() {
         return Err(format!(
             "GitHub API 请求失败（{}）：{}",
@@ -232,11 +230,10 @@ pub async fn get_version_info(app: AppHandle) -> CmdResult<UpdateInfo> {
     };
     let current = env!("CARGO_PKG_VERSION").to_string();
     // curl 最长 10s：离开 async worker（A6），并带应用代理
-    let fetched = tauri::async_runtime::spawn_blocking(move || {
-        fetch_latest_release(Some(proxy.as_str()))
-    })
-    .await
-    .unwrap_or_else(|_| Err("查询任务异常".into()));
+    let fetched =
+        tauri::async_runtime::spawn_blocking(move || fetch_latest_release(Some(proxy.as_str())))
+            .await
+            .unwrap_or_else(|_| Err("查询任务异常".into()));
     match fetched {
         Ok((tag, url)) => Ok(UpdateInfo {
             current_version: current,
@@ -268,11 +265,8 @@ pub fn open_url(win: tauri::WebviewWindow, url: String) -> CmdResult<()> {
 
 /// 简单语义化版本比较：`a > b` 返回 true。缺失段按 0 处理。
 fn version_greater(a: &str, b: &str) -> bool {
-    let parse = |s: &str| -> Vec<u64> {
-        s.split('.')
-            .filter_map(|x| x.parse::<u64>().ok())
-            .collect()
-    };
+    let parse =
+        |s: &str| -> Vec<u64> { s.split('.').filter_map(|x| x.parse::<u64>().ok()).collect() };
     let va = parse(a);
     let vb = parse(b);
     for i in 0..va.len().max(vb.len()) {

@@ -148,11 +148,7 @@ mod tests {
     fn prune_keeps_recent_files() {
         let dir = tempdir().unwrap();
         for d in 1..=10 {
-            std::fs::write(
-                dir.path().join(format!("app-2026-09-{:02}.log", d)),
-                b"x",
-            )
-            .unwrap();
+            std::fs::write(dir.path().join(format!("app-2026-09-{:02}.log", d)), b"x").unwrap();
         }
         std::fs::write(dir.path().join("other.log"), b"x").unwrap();
         prune(dir.path());
@@ -162,7 +158,10 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         // 只留最近 KEEP_DAYS 个 app-*.log，非本模块命名的文件不动
-        assert_eq!(left.iter().filter(|n| n.starts_with("app-")).count(), KEEP_DAYS);
+        assert_eq!(
+            left.iter().filter(|n| n.starts_with("app-")).count(),
+            KEEP_DAYS
+        );
         assert!(left.iter().any(|n| n == "other.log"));
         assert!(left.iter().any(|n| n == "app-2026-09-10.log"));
         assert!(!left.iter().any(|n| n == "app-2026-09-01.log"));

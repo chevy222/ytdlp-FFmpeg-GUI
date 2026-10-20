@@ -1,13 +1,17 @@
 //! 合并任务线程：合并作业参数、锚点提交、执行与收尾（产物回列表）。
 
+use super::{
+    default_output_dir, ensure_main_window, log_error_lines, log_item, now_str, persist,
+    restore_status, today_stamp, transition_in, update_item, update_progress, CmdResult,
+    ProgressPayload, SlotGuard,
+};
+use crate::state::AppState;
 use tauri::{AppHandle, Emitter, Manager};
 use ytdlp_core::download;
 use ytdlp_core::merge::{self, MergeParams};
 use ytdlp_core::model::{ItemKind, MediaItem, Status};
 use ytdlp_core::worker::SubmitOutcome;
 use ytdlp_core::{transition, CoreError};
-use super::{CmdResult, SlotGuard, ProgressPayload, update_item, update_progress, transition_in, log_item, log_error_lines, persist, default_output_dir, now_str, restore_status, today_stamp, ensure_main_window};
-use crate::state::AppState;
 
 /// 合并面板参数（MG-01/04：低频操作，仅面板内配置，不落 config.json）。
 #[derive(Debug, Clone)]
@@ -113,10 +117,7 @@ pub fn start_merge(
     // 旧实现对每个 id 各提交一次，导致同一合并被并发执行 N 次（同路径互写、产物重复）。
     let anchor = job.ids[0].clone();
     for id in &job.ids {
-        state
-            .merge_jobs
-            .lock()
-            .insert(id.clone(), job.clone());
+        state.merge_jobs.lock().insert(id.clone(), job.clone());
     }
     let outcome = {
         let mut q = state.queue.lock();
@@ -381,4 +382,3 @@ fn finish_merge(
     // 并发 slot 由调用方的 SlotGuard 释放
     persist(app);
 }
-

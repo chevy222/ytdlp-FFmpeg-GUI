@@ -49,11 +49,16 @@ pub(crate) use cookies::save_cookies_inner;
 pub use merge_task::MergeJob;
 pub use misc::clear_temp_inner;
 
+use crate::login;
+use crate::state::AppState;
+use download_task::run_download_task;
+use merge_task::run_merge_task;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
+use transcode_task::run_transcode_task;
 use ytdlp_core::config::NetworkConfig;
 use ytdlp_core::cookies::CookieStore;
 use ytdlp_core::download;
@@ -61,11 +66,6 @@ use ytdlp_core::exec::ToolResolver;
 use ytdlp_core::model::{ItemKind, MediaItem, Status};
 use ytdlp_core::probe::{self, ProbeErrorKind};
 use ytdlp_core::{transition, CoreError};
-use crate::state::AppState;
-use crate::login;
-use download_task::run_download_task;
-use merge_task::run_merge_task;
-use transcode_task::run_transcode_task;
 
 /// 解析（探测）并发上限：粘贴 100 条链接时不能瞬间起 100 个 yt-dlp 子进程
 /// ——打满本机资源，也必然触发站点风控。播放列表展开（DL-09）本就是顺序解析，
@@ -238,6 +238,11 @@ fn log_item(app: &AppHandle, id: &str, line: impl Into<String>) {
 /// 不走 curl：curl 不走 Windows 系统代理（WinINET），且 schannel + socks5 兼容性差
 /// （经常 server closed abruptly）；yt-dlp 与主下载共用同一套代理/cookies/TLS
 /// （openssl），行为最一致。`--write-thumbnail --skip-download` 只拉封面不下载视频。
+///
+/// **`cookies` 参数恒传 `None`**：实测 YouTube 缩略图传 cookies 反而 403（"Sign in
+/// to confirm you're not a bot"），不传则成功；且传 cookies 会让 yt-dlp 退出时
+/// save_cookies 到 temp 文件，若 temp 目录已被清理则 FileNotFoundError（即使封面
+/// 已下载成功）。参数保留是为了未来其它站点可能需要。
 fn fetch_thumb_ytdlp(
     resolver: &ToolResolver,
     video_url: &str,
@@ -279,7 +284,9 @@ fn fetch_thumb_ytdlp(
     args.push(out_tmpl_str);
     args.push(video_url.to_string());
     on_log(ytdlp_core::exec::display_command("yt-dlp", &args));
-    let mut cmd = resolver.command(ytdlp_core::exec::Tool::YtDlp).map_err(|e| e.to_string())?;
+    let mut cmd = resolver
+        .command(ytdlp_core::exec::Tool::YtDlp)
+        .map_err(|e| e.to_string())?;
     cmd.args(&args);
     ytdlp_core::exec::hide_console(&mut cmd);
     // 总超时兜底：--socket-timeout 只管读超时，管不了"连上之后不产数据"的挂起；
@@ -305,18 +312,16 @@ fn fetch_thumb_ytdlp(
     // 只按扩展名白名单挑：目录里可能还躺着 .part/点文件等其它条目，而 read_dir
     // 顺序不定 —— "随便取第一个"会把非封面文件复制过去。
     let thumb_file = std::fs::read_dir(&tmp_dir).ok().and_then(|rd| {
-        rd.flatten()
-            .map(|e| e.path())
-            .find(|p| {
-                p.is_file()
-                    && matches!(
-                        p.extension()
-                            .and_then(|e| e.to_str())
-                            .map(str::to_ascii_lowercase)
-                            .as_deref(),
-                        Some("webp" | "jpg" | "jpeg" | "png")
-                    )
-            })
+        rd.flatten().map(|e| e.path()).find(|p| {
+            p.is_file()
+                && matches!(
+                    p.extension()
+                        .and_then(|e| e.to_str())
+                        .map(str::to_ascii_lowercase)
+                        .as_deref(),
+                    Some("webp" | "jpg" | "jpeg" | "png")
+                )
+        })
     });
     let Some(thumb_file) = thumb_file else {
         let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -602,28 +607,26 @@ fn run_probe(app: AppHandle, id: String) {
                 it.error = None;
                 it.push_log("解析完成，已就绪".to_string());
             });
-                // 封面缩略图（异步生成，不阻塞就绪）。
-                // spawn_blocking：里面是 yt-dlp / ffmpeg 子进程（阻塞），
-                // 放在 async 执行器的 worker 上会占住线程（执行器线程数 ≈ CPU 核数）
-                {
-                    let app2 = app.clone();
-                    let id2 = id.clone();
-                    let cache_dir = state.paths.cache_dir();
-                    let local_path = item.path.clone();
-                    let video_url = item.url.clone();
-                    // 本地文件优先取内嵌封面（元数据），与桌面缩略图同源
-                    let resolver2 = resolver.clone();
-                    // 缩略图代理按视频页面 URL 解析（而非缩略图 URL i.ytimg.com）——
-                    // 用户勾的是 youtube.com，i.ytimg.com 不匹配；缩略图属于该视频，
-                    // 应跟视频走同一代理。
-                    let thumb_proxy = video_url
-                        .as_deref()
-                        .and_then(|u| network.resolve_proxy(u));
-                    // 缩略图下载不传 cookies：缩略图是 CDN 资源，解析已成功说明视频可公开访问；
-                    // 传 cookies 会导致 yt-dlp 退出时 save_cookies 到 temp 文件，
-                    // 若 temp 目录已被清理则 FileNotFoundError（即使缩略图已下载成功）。
-                    let thumb_tmp_root = state.paths.temp_dir();
-                    tauri::async_runtime::spawn_blocking(move || {
+            // 封面缩略图（异步生成，不阻塞就绪）。
+            // spawn_blocking：里面是 yt-dlp / ffmpeg 子进程（阻塞），
+            // 放在 async 执行器的 worker 上会占住线程（执行器线程数 ≈ CPU 核数）
+            {
+                let app2 = app.clone();
+                let id2 = id.clone();
+                let cache_dir = state.paths.cache_dir();
+                let local_path = item.path.clone();
+                let video_url = item.url.clone();
+                // 本地文件优先取内嵌封面（元数据），与桌面缩略图同源
+                let resolver2 = resolver.clone();
+                // 缩略图代理按视频页面 URL 解析（而非缩略图 URL i.ytimg.com）——
+                // 用户勾的是 youtube.com，i.ytimg.com 不匹配；缩略图属于该视频，
+                // 应跟视频走同一代理。
+                let thumb_proxy = video_url.as_deref().and_then(|u| network.resolve_proxy(u));
+                // 缩略图下载不传 cookies：缩略图是 CDN 资源，解析已成功说明视频可公开访问；
+                // 传 cookies 会导致 yt-dlp 退出时 save_cookies 到 temp 文件，
+                // 若 temp 目录已被清理则 FileNotFoundError（即使缩略图已下载成功）。
+                let thumb_tmp_root = state.paths.temp_dir();
+                tauri::async_runtime::spawn_blocking(move || {
                     let dest = ytdlp_core::thumbs::thumb_path(&cache_dir, &id2);
                     // URL 视频：直接用 yt-dlp --write-thumbnail --skip-download 下载缩略图。
                     // 与下载视频走同一套代理/cookies/TLS(openssl)，不走 curl（schannel
@@ -631,9 +634,15 @@ fn run_probe(app: AppHandle, id: String) {
                     // 本地文件：优先取内嵌封面（ffmpeg），无封面流才抽帧。
                     let r = if video_url.is_some() {
                         if let Some(vurl) = &video_url {
-                            fetch_thumb_ytdlp(&resolver2, vurl, &dest, &thumb_tmp_root,
-                                thumb_proxy.as_deref(), None,
-                                &mut |l| log_item(&app2, &id2, l))
+                            fetch_thumb_ytdlp(
+                                &resolver2,
+                                vurl,
+                                &dest,
+                                &thumb_tmp_root,
+                                thumb_proxy.as_deref(),
+                                None,
+                                &mut |l| log_item(&app2, &id2, l),
+                            )
                         } else {
                             Ok(())
                         }
@@ -650,10 +659,17 @@ fn run_probe(app: AppHandle, id: String) {
                     };
                     match r {
                         Ok(()) => {
-                            update_item(&app2, &id2, |it| {
-                                it.thumb = Some(dest.to_string_lossy().into_owned());
-                            });
-                            app2.state::<AppState>().persist();
+                            // 缩略图下载是异步的：用户可能在解析完成后立即删除条目，
+                            // 此时 update_item 返回 None、persist 做无意义全量序列化。
+                            // 先确认条目仍存在再更新，避免批量删除时触发多次 persist。
+                            let exists =
+                                app2.state::<AppState>().history.lock().get(&id2).is_some();
+                            if exists {
+                                update_item(&app2, &id2, |it| {
+                                    it.thumb = Some(dest.to_string_lossy().into_owned());
+                                });
+                                app2.state::<AppState>().persist();
+                            }
                         }
                         Err(e) => {
                             log_item(&app2, &id2, format!("缩略图生成失败：{e}"));
@@ -768,7 +784,11 @@ pub fn get_item_formats(
 
 /// 取某条目的完整日志（打开日志弹窗时按需拉取的权威副本）。
 #[tauri::command(async)]
-pub fn get_item_log(app: AppHandle, win: tauri::WebviewWindow, id: String) -> CmdResult<Vec<String>> {
+pub fn get_item_log(
+    app: AppHandle,
+    win: tauri::WebviewWindow,
+    id: String,
+) -> CmdResult<Vec<String>> {
     ensure_main_window(&win)?;
     let state = app.state::<AppState>();
     let hist = state.history.lock();
@@ -927,14 +947,9 @@ fn expand_playlist(
     if url.is_empty() {
         return;
     }
-    match probe::list_playlist_entries(
-        resolver,
-        &url,
-        cookies,
-        network,
-        Some(cancel),
-        |l| log_item(app, id, l),
-    ) {
+    match probe::list_playlist_entries(resolver, &url, cookies, network, Some(cancel), |l| {
+        log_item(app, id, l)
+    }) {
         Ok(entries) => {
             let n = entries.len();
             log_item(app, id, format!("播放列表展开：{n} 集"));
@@ -1036,11 +1051,7 @@ pub fn cancel_item(app: AppHandle, win: tauri::WebviewWindow, id: String) -> Cmd
                 set.remove(jid);
             }
         }
-        let anchor = job
-            .ids
-            .first()
-            .cloned()
-            .unwrap_or_else(|| id.clone());
+        let anchor = job.ids.first().cloned().unwrap_or_else(|| id.clone());
         if let Some(flag) = state.cancel_flag(&anchor) {
             // 运行中：置标志即可，进程树终止与状态收尾由合并任务线程负责
             flag.store(true, Ordering::Relaxed);
@@ -1251,14 +1262,16 @@ pub async fn open_login_site(
         Some(u) if !u.trim().is_empty() => {
             let u = u.trim().to_string();
             // P1-4：自定义 URL 仅允许 https，防止登录窗被引导到 http/恶意 scheme
-            let parsed = url::Url::parse(&u).map_err(|_| "自定义登录 URL 格式不正确".to_string())?;
+            let parsed =
+                url::Url::parse(&u).map_err(|_| "自定义登录 URL 格式不正确".to_string())?;
             if parsed.scheme() != "https" {
                 return Err("自定义登录 URL 仅支持 https".into());
             }
             u
         }
-        _ => login::login_url_for_host(&host)
-            .ok_or_else(|| format!("站点 {host} 不支持内置登录：请在下方的 Cookie 列表中直接导入"))?,
+        _ => login::login_url_for_host(&host).ok_or_else(|| {
+            format!("站点 {host} 不支持内置登录：请在下方的 Cookie 列表中直接导入")
+        })?,
     };
     tauri::async_runtime::spawn_blocking(move || {
         login::open_login(&app, &host, &login_url).map_err(err_string)

@@ -214,7 +214,12 @@ impl InstalledIndex {
     /// load → record → save 会互相覆盖：后写入者用陈旧索引把先写入者的指纹抹掉，
     /// 表现为"明明刚更新过，下次还提示有新版本 / 又下一遍 100MB"。
     /// 索引只影响「更新」的判定，失败只告警不阻断安装。
-    pub fn record_install(tools_dir: &Path, key: &str, path: &Path, sha256: &str) -> Result<(), String> {
+    pub fn record_install(
+        tools_dir: &Path,
+        key: &str,
+        path: &Path,
+        sha256: &str,
+    ) -> Result<(), String> {
         static LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
         let _guard = LOCK.lock();
         let mut index = Self::load(tools_dir);
@@ -470,9 +475,9 @@ impl ToolDownloader {
         // 404）就能让整步校验静默跳过。ffmpeg/ffprobe 的 sha_url() 本身为 None（设计如此，
         // 由 release-version feed 兜底），不在此列。
         let want = match kind.sha_url() {
-            Some(_) => self
-                .remote_sha(kind)
-                .ok_or_else(|| "SHA-256 校验：无法获取远端期望值（网络失败/限流），拒绝安装".to_string())?,
+            Some(_) => self.remote_sha(kind).ok_or_else(|| {
+                "SHA-256 校验：无法获取远端期望值（网络失败/限流），拒绝安装".to_string()
+            })?,
             None => String::new(),
         };
         if !want.is_empty() && !digest.eq_ignore_ascii_case(&want) {

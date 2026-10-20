@@ -8,13 +8,9 @@ use std::path::{Path, PathBuf};
 /// 会让"看着很快"的抽帧命令永久挂住，而调用点在解析/下载收尾链路上）。
 const THUMB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-// 注：这里曾有两个现已删除的函数：
-// - `save_remote_thumb` / `fetch_to`：curl 版「远程缩略图 URL → 本地」下载
-//   （含 socks5→socks5h 归一化）。解析链路改用 yt-dlp 取封面后失去全部调用方。
-// - `collect_written_thumbnail`：从输出目录收集 yt-dlp `--write-thumbnail` 写出的
-//   封面。下载命令已不再写 `--write-thumbnail`（见 download.rs build_args），
-//   且全仓无任何调用方，属死代码，已删除以免误导。
-// 要恢复请连超时/大小上限与代理归一化一起恢复。
+// 历史：下载命令曾带 `--write-thumbnail` 在输出目录留一份封面，由
+// `collect_written_thumbnail` 收集；现已整合为"解析阶段一次性下载"，
+// 下载命令只 `--embed-thumbnail`（嵌入 MP4 元数据），不再单独写封面文件。
 
 /// 抽取文件**内嵌封面**（attached_pic，元数据）——与桌面/播放器显示的封面同源，
 /// 不重新截帧。无封面流时返回 `Ok(false)`，由调用方回退抽帧。

@@ -1,12 +1,15 @@
 //! 站点 Cookie 管理命令（设置-Cookie 页）；登录窗经 `save_cookies_inner` 直接调用（不走 IPC）。
 
+use super::{ensure_main_window, err_string, CmdResult};
+use crate::state::AppState;
 use tauri::{AppHandle, Emitter, Manager};
 use ytdlp_core::cookies::CookieStore;
-use super::{CmdResult, ensure_main_window, err_string};
-use crate::state::AppState;
 
 #[tauri::command(async)]
-pub fn list_cookies(app: AppHandle, win: tauri::WebviewWindow) -> CmdResult<Vec<serde_json::Value>> {
+pub fn list_cookies(
+    app: AppHandle,
+    win: tauri::WebviewWindow,
+) -> CmdResult<Vec<serde_json::Value>> {
     ensure_main_window(&win)?;
     let state = app.state::<AppState>();
     let store = CookieStore::new(state.paths.cookies_dir());
@@ -55,7 +58,9 @@ pub fn save_cookies(
 /// 规范化 cookie 存储 host：YouTube 相关域名统一存 www.youtube.com.txt
 fn normalize_cookie_host(host: &str) -> String {
     match host.to_lowercase().as_str() {
-        "youtube.com" | "youtu.be" | "m.youtube.com" | "www.youtube.com" => "www.youtube.com".into(),
+        "youtube.com" | "youtu.be" | "m.youtube.com" | "www.youtube.com" => {
+            "www.youtube.com".into()
+        }
         "bilibili.com" | "www.bilibili.com" | "m.bilibili.com" => "www.bilibili.com".into(),
         "x.com" | "www.x.com" | "twitter.com" | "www.twitter.com" => "www.x.com".into(),
         "douyin.com" | "www.douyin.com" | "m.douyin.com" => "www.douyin.com".into(),

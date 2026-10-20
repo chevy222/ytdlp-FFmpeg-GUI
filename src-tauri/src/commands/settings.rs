@@ -1,10 +1,10 @@
 //! 设置命令：读取/保存 config.json（后端 sanitize + 原子写 + 并发/历史上限即时生效）。
 
+use super::{ensure_main_window, err_string, launch_next, CmdResult};
+use crate::state::AppState;
 use tauri::{AppHandle, Manager};
 use ytdlp_core::config::AppConfig;
 use ytdlp_core::transcode;
-use super::{CmdResult, ensure_main_window, err_string, launch_next};
-use crate::state::AppState;
 
 #[tauri::command(async)]
 pub fn get_config(app: AppHandle, win: tauri::WebviewWindow) -> CmdResult<AppConfig> {
@@ -15,7 +15,11 @@ pub fn get_config(app: AppHandle, win: tauri::WebviewWindow) -> CmdResult<AppCon
 }
 
 #[tauri::command(async)]
-pub fn save_config(app: AppHandle, win: tauri::WebviewWindow, mut config: AppConfig) -> CmdResult<()> {
+pub fn save_config(
+    app: AppHandle,
+    win: tauri::WebviewWindow,
+    mut config: AppConfig,
+) -> CmdResult<()> {
     ensure_main_window(&win)?;
     let state = app.state::<AppState>();
     // 后端必须自己校验：前端只有 UI 层限制（number 输入的 min/max 拦不住手输/粘贴），
@@ -49,10 +53,7 @@ pub fn save_config(app: AppHandle, win: tauri::WebviewWindow, mut config: AppCon
         .lock()
         .set_concurrency(config.general.concurrency as usize);
     // 历史上限即时生效（超出部分在下一次 upsert 时按"最旧终态优先"裁剪）
-    state
-        .history
-        .lock()
-        .set_limit(config.general.history_limit);
+    state.history.lock().set_limit(config.general.history_limit);
     // 必须在释放队列锁之后再逐个启动：launch_next 会读 history + queue 的锁
     for id in to_launch {
         launch_next(&app, id);

@@ -214,7 +214,10 @@ pub fn build_args(url: &str, p: &DownloadParams, cfg: &DownloadConfig) -> Vec<St
     args.push("--user-agent".into());
     args.push(crate::config::DEFAULT_USER_AGENT.to_string());
     args.push("--add-header".into());
-    args.push(format!("Accept-Language:{}", crate::config::DEFAULT_ACCEPT_LANGUAGE));
+    args.push(format!(
+        "Accept-Language:{}",
+        crate::config::DEFAULT_ACCEPT_LANGUAGE
+    ));
     // 其他
     args.push("--no-warnings".into());
     // 注意：不加 `--ignore-errors` —— 它会让"下载/后处理失败"仍以退出码 0 结束，
@@ -372,10 +375,7 @@ fn file_newness(path: &Path) -> Option<std::time::SystemTime> {
         let unix_100ns = filetime - WINDOWS_TO_UNIX_EPOCH_100NS;
         let seconds = unix_100ns / 10_000_000;
         let nanos = (unix_100ns % 10_000_000) * 100;
-        Some(
-            std::time::UNIX_EPOCH
-                + std::time::Duration::new(seconds, nanos as u32),
-        )
+        Some(std::time::UNIX_EPOCH + std::time::Duration::new(seconds, nanos as u32))
     }
     #[cfg(not(windows))]
     {
@@ -420,11 +420,7 @@ fn cleanup_cancelled_outputs(
     merged: &[PathBuf],
     started: std::time::SystemTime,
 ) {
-    let is_new = |p: &Path| -> bool {
-        file_newness(p)
-            .map(|t| t >= started)
-            .unwrap_or(false)
-    };
+    let is_new = |p: &Path| -> bool { file_newness(p).map(|t| t >= started).unwrap_or(false) };
     for p in extracted.iter().chain(merged.iter()).chain(dests.iter()) {
         if p.is_file() && is_new(p) {
             let _ = std::fs::remove_file(p);
@@ -464,16 +460,9 @@ fn cleanup_partial_files(
     merged: &[PathBuf],
     started: std::time::SystemTime,
 ) {
-    let is_new = |p: &Path| -> bool {
-        file_newness(p)
-            .map(|t| t >= started)
-            .unwrap_or(false)
-    };
+    let is_new = |p: &Path| -> bool { file_newness(p).map(|t| t >= started).unwrap_or(false) };
     for p in extracted.iter().chain(merged.iter()).chain(dests.iter()) {
-        let (Some(dir), Some(name)) = (
-            p.parent(),
-            p.file_name().and_then(|s| s.to_str()),
-        ) else {
+        let (Some(dir), Some(name)) = (p.parent(), p.file_name().and_then(|s| s.to_str())) else {
             continue;
         };
         let part_prefix = format!("{name}.part");
@@ -737,67 +726,67 @@ pub fn post_process(
         args.push("-map".into());
         args.push("0:a:0?".into());
     } else {
-    match (&vf, cover_idx) {
-        // 主视频需要滤镜 + 存在封面流：简单滤镜 `-vf` 与第二条视频流的 `copy`
-        // 不能共存（ffmpeg：Filtering and streamcopy cannot be used together），
-        // 且 `0:m:attached_pic?` 本身不是合法流说明符。
-        // 因此主视频走 filter_complex 打标签，封面按**绝对流索引**映射后原样 copy。
-        (Some(filter), Some(ci)) => {
-            let src = main_idx
-                .map(|i| format!("0:{i}"))
-                .unwrap_or_else(|| "0:v:0".to_string());
-            args.push("-filter_complex".into());
-            args.push(format!("[{src}]{filter}[v]"));
-            args.push("-map".into());
-            args.push("[v]".into());
-            args.push("-map".into());
-            args.push("0:a:0?".into());
-            args.push("-map".into());
-            args.push(format!("0:{ci}?"));
-            args.push("-c:v:0".into());
-            args.push("libx265".into());
-            args.push("-crf".into());
-            args.push("23".into());
-            args.push("-preset".into());
-            args.push("medium".into());
-            // 必须带 `:v:0`：不带流后缀的 `-tag:v` 会落到 mjpeg 封面流上，
-            // mp4 封装直接报 `Tag hvc1 incompatible with output codec id '7'`
-            args.push("-tag:v:0".into());
-            args.push("hvc1".into());
-            args.push("-c:v:1".into());
-            args.push("copy".into());
-        }
-        _ => {
-            if let Some(filter) = &vf {
-                args.push("-vf".into());
-                args.push(filter.clone());
-            }
-            args.push("-map".into());
-            args.push(
-                main_idx
-                    .map(|i| format!("0:{i}?"))
-                    .unwrap_or_else(|| "0:v:0?".to_string()),
-            );
-            args.push("-map".into());
-            args.push("0:a:0?".into());
-            if let Some(ci) = cover_idx {
+        match (&vf, cover_idx) {
+            // 主视频需要滤镜 + 存在封面流：简单滤镜 `-vf` 与第二条视频流的 `copy`
+            // 不能共存（ffmpeg：Filtering and streamcopy cannot be used together），
+            // 且 `0:m:attached_pic?` 本身不是合法流说明符。
+            // 因此主视频走 filter_complex 打标签，封面按**绝对流索引**映射后原样 copy。
+            (Some(filter), Some(ci)) => {
+                let src = main_idx
+                    .map(|i| format!("0:{i}"))
+                    .unwrap_or_else(|| "0:v:0".to_string());
+                args.push("-filter_complex".into());
+                args.push(format!("[{src}]{filter}[v]"));
+                args.push("-map".into());
+                args.push("[v]".into());
+                args.push("-map".into());
+                args.push("0:a:0?".into());
                 args.push("-map".into());
                 args.push(format!("0:{ci}?"));
-                args.push("-c:v:1".into());
-                args.push("copy".into());
-            }
-            args.push("-c:v:0".into());
-            args.push(if need_downscale { "libx265" } else { "copy" }.into());
-            if need_downscale {
+                args.push("-c:v:0".into());
+                args.push("libx265".into());
                 args.push("-crf".into());
                 args.push("23".into());
                 args.push("-preset".into());
                 args.push("medium".into());
+                // 必须带 `:v:0`：不带流后缀的 `-tag:v` 会落到 mjpeg 封面流上，
+                // mp4 封装直接报 `Tag hvc1 incompatible with output codec id '7'`
                 args.push("-tag:v:0".into());
                 args.push("hvc1".into());
+                args.push("-c:v:1".into());
+                args.push("copy".into());
+            }
+            _ => {
+                if let Some(filter) = &vf {
+                    args.push("-vf".into());
+                    args.push(filter.clone());
+                }
+                args.push("-map".into());
+                args.push(
+                    main_idx
+                        .map(|i| format!("0:{i}?"))
+                        .unwrap_or_else(|| "0:v:0?".to_string()),
+                );
+                args.push("-map".into());
+                args.push("0:a:0?".into());
+                if let Some(ci) = cover_idx {
+                    args.push("-map".into());
+                    args.push(format!("0:{ci}?"));
+                    args.push("-c:v:1".into());
+                    args.push("copy".into());
+                }
+                args.push("-c:v:0".into());
+                args.push(if need_downscale { "libx265" } else { "copy" }.into());
+                if need_downscale {
+                    args.push("-crf".into());
+                    args.push("23".into());
+                    args.push("-preset".into());
+                    args.push("medium".into());
+                    args.push("-tag:v:0".into());
+                    args.push("hvc1".into());
+                }
             }
         }
-    }
     }
     // 音频（增益到峰值 0dBFS，MAXGAIN 封顶 24dB，TC-07 语义）
     // applied_gain 记录实际写入 ffmpeg 的增益值，成功后回写到 meta.audio_volume，
@@ -1068,7 +1057,11 @@ mod tests {
         let joined = args.join(" ");
         assert!(joined.contains("--format"));
         // 7 级格式链：H.264+AAC 直拷优先，长边上限 1920 同时限制 width/height
-        assert!(joined.contains("[vcodec*=avc]+ba[acodec*=mp4a]"), "{}", joined);
+        assert!(
+            joined.contains("[vcodec*=avc]+ba[acodec*=mp4a]"),
+            "{}",
+            joined
+        );
         assert!(joined.contains("height<=1920"), "{}", joined);
         assert!(joined.contains("width<=1920"), "{}", joined);
         assert!(joined.contains("--merge-output-format mp4"));
@@ -1152,15 +1145,13 @@ mod tests {
         // 保证 new 的写入时间确实晚于 old（sleep 拉开先后；since 锚定在
         // old 的实际时间戳上，不依赖 sleep 的亚秒精度）
         std::thread::sleep(std::time::Duration::from_millis(20));
-        let since = file_newness(&old).unwrap()
-            + std::time::Duration::from_millis(1);
+        let since = file_newness(&old).unwrap() + std::time::Duration::from_millis(1);
         let new = dir.path().join("new.mp4");
         std::fs::write(&new, b"x").unwrap();
         // 只返回本次之后新增的最新视频，绝不返回 old.mp4
         assert_eq!(newest_media_since(dir.path(), since), Some(new.clone()));
         // 没有任何新文件时返回 None（调用方据此判失败，而不是去动既有文件）
-        let since2 = file_newness(&new).unwrap()
-            + std::time::Duration::from_millis(1);
+        let since2 = file_newness(&new).unwrap() + std::time::Duration::from_millis(1);
         assert_eq!(newest_media_since(dir.path(), since2), None);
     }
 

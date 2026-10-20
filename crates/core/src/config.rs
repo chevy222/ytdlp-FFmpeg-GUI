@@ -260,7 +260,8 @@ impl AppConfig {
         // 并发上限：前端输入框是 1..16，后端按同一口径收口（避免 config.json 被手改）
         self.general.concurrency = self.general.concurrency.clamp(1, MAX_CONCURRENCY);
         self.general.history_limit = self
-            .general.history_limit
+            .general
+            .history_limit
             .clamp(1, GeneralConfig::HISTORY_LIMIT_MAX);
         if self.general.collision_policy != "skip" {
             self.general.collision_policy = "auto_inc".into();

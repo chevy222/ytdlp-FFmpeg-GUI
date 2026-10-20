@@ -1,12 +1,16 @@
 //! 下载任务线程：参数组装、yt-dlp 执行、后处理与收尾（产物回填/取消清理）。
 
+use super::{
+    default_output_dir, ensure_main_window, err_string, log_error_lines, log_item, persist,
+    resolve_cookies, transition_in, update_item, update_progress, CmdResult, ProgressPayload,
+    SlotGuard,
+};
+use crate::state::AppState;
 use tauri::{AppHandle, Emitter, Manager};
-use ytdlp_core::download::{self, DownloadParams, post_process, run_download};
+use ytdlp_core::download::{self, post_process, run_download, DownloadParams};
 use ytdlp_core::model::Status;
 use ytdlp_core::worker::SubmitOutcome;
 use ytdlp_core::{transition, CoreError};
-use super::{CmdResult, err_string, SlotGuard, ProgressPayload, update_item, update_progress, transition_in, log_item, log_error_lines, persist, default_output_dir, resolve_cookies, ensure_main_window};
-use crate::state::AppState;
 
 #[tauri::command(async)]
 pub fn start_download(
@@ -97,7 +101,12 @@ pub fn start_download(
     Ok(())
 }
 
-pub(super) fn run_download_task(app: AppHandle, id: String, format_id: Option<String>, audio_only: bool) {
+pub(super) fn run_download_task(
+    app: AppHandle,
+    id: String,
+    format_id: Option<String>,
+    audio_only: bool,
+) {
     let state = app.state::<AppState>();
     let cancel = state.register_cancel(&id);
     // 并发额度守卫：panic / 任何提前返回都会释放 slot（手写 release_slot 漏一次
@@ -309,7 +318,11 @@ pub(super) fn run_download_task(app: AppHandle, id: String, format_id: Option<St
     finish_download(&app, &id, Ok(outcome));
 }
 
-fn finish_download(app: &AppHandle, id: &str, result: Result<download::DownloadOutcome, CoreError>) {
+fn finish_download(
+    app: &AppHandle,
+    id: &str,
+    result: Result<download::DownloadOutcome, CoreError>,
+) {
     let state = app.state::<AppState>();
     // 本次任务的最终产物（回填 path + 抽帧封面共用）。
     // 目录扫描来的"弱证据"产物不写进条目：它可能根本不是本次任务的产物。
@@ -381,10 +394,7 @@ fn finish_download(app: &AppHandle, id: &str, result: Result<download::DownloadO
             let (need_thumb, cover_idx) = {
                 let hist = state.history.lock();
                 match hist.get(id) {
-                    Some(it) => (
-                        it.thumb.clone().is_none(),
-                        it.meta.cover_stream_index,
-                    ),
+                    Some(it) => (it.thumb.clone().is_none(), it.meta.cover_stream_index),
                     None => (false, None),
                 }
             };
@@ -424,4 +434,3 @@ fn finish_download(app: &AppHandle, id: &str, result: Result<download::DownloadO
     // 手写释放 + 守卫释放会重复归还，可能把下一个等待任务"超发"启动
     persist(app);
 }
-

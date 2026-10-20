@@ -1,15 +1,15 @@
 //! 工具链托管下载/更新与依赖自检（设置-依赖页）：下载计划、进度上报、版本/指纹比对。
 
+use super::{ensure_main_window, CmdResult};
+use crate::state::AppState;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
 use ytdlp_core::exec::{ToolResolver, ToolSource};
+use ytdlp_core::log;
 use ytdlp_core::tool_download::{installed_matches, InstalledIndex, ToolDownloader, ToolKind};
 use ytdlp_core::transcode;
-use ytdlp_core::log;
-use super::{CmdResult, ensure_main_window};
-use crate::state::AppState;
 
 /// 硬件编码器探测（TC-16）：QSV/NVENC/AMF 可用性，供设置页标注。
 /// 探测要起 ffmpeg 子进程（秒级），用 `spawn_blocking` 避免占住 async worker（A6）。

@@ -1,13 +1,17 @@
 //! 转码任务线程：批量转码/放大入口、参数组装、执行与收尾（产物回列表）。
 
+use super::{
+    default_output_dir, ensure_main_window, log_error_lines, log_item, now_str, persist,
+    restore_status, transition_in, update_item, update_progress, CmdResult, ProgressPayload,
+    SlotGuard,
+};
+use crate::state::AppState;
 use tauri::{AppHandle, Emitter, Manager};
 use ytdlp_core::download::probe_output;
 use ytdlp_core::model::{ItemKind, MediaItem, Status};
 use ytdlp_core::transcode::{self, TranscodeParams};
 use ytdlp_core::worker::SubmitOutcome;
 use ytdlp_core::{transition, CoreError};
-use super::{CmdResult, SlotGuard, ProgressPayload, update_item, update_progress, transition_in, log_item, log_error_lines, persist, default_output_dir, now_str, restore_status, ensure_main_window};
-use crate::state::AppState;
 
 /// 批量转码（TC-05：按 设置-转码/通用 默认参数执行，不弹确认窗）。
 #[tauri::command(async)]
@@ -23,11 +27,7 @@ pub fn start_transcode(
 /// 批量放大到 1080P：长边<1920 且 短边<1080 的视频等比放大到不超过 1920×1080，
 /// 已达 1080P 及以上不缩放。其余转码参数同 设置-转码/通用。
 #[tauri::command(async)]
-pub fn start_upscale(
-    app: AppHandle,
-    win: tauri::WebviewWindow,
-    ids: Vec<String>,
-) -> CmdResult<()> {
+pub fn start_upscale(app: AppHandle, win: tauri::WebviewWindow, ids: Vec<String>) -> CmdResult<()> {
     ensure_main_window(&win)?;
     // 放大意图的登记放在 begin_transcode 里、与"状态成功改到 Transcoding"同一处
     // （只有真正会入队的 id 才登记）：预检跳过 / 条目不存在 / 早退的 id 从不登记，
@@ -220,14 +220,35 @@ pub(super) fn run_transcode_task(app: AppHandle, id: String) {
                     let th = ((h as f32 * s) / 2.0).floor() as u32 * 2;
                     // 旋转 90/270° 时输出宽高互换（vpp_qsv/transpose 后方向相反）；
                     // 0/180° 不互换。force_scale 存的是"旋转后的输出尺寸"。
-                    let (tw, th) = if rot_deg == 90 || rot_deg == 270 { (th, tw) } else { (tw, th) };
+                    let (tw, th) = if rot_deg == 90 || rot_deg == 270 {
+                        (th, tw)
+                    } else {
+                        (tw, th)
+                    };
                     if tw > 0 && th > 0 {
-                        log_item(&app, &id, format!("放大到 1080P：源 {w}×{h}{} → 输出 {tw}×{th}（缩放比 {:.2}x）",
-                            if rot_deg != 0 { format!("（旋转{rot_deg}°）") } else { String::new() }, s));
+                        log_item(
+                            &app,
+                            &id,
+                            format!(
+                                "放大到 1080P：源 {w}×{h}{} → 输出 {tw}×{th}（缩放比 {:.2}x）",
+                                if rot_deg != 0 {
+                                    format!("（旋转{rot_deg}°）")
+                                } else {
+                                    String::new()
+                                },
+                                s
+                            ),
+                        );
                         Some((tw, th))
-                    } else { None }
+                    } else {
+                        None
+                    }
                 } else {
-                    log_item(&app, &id, format!("放大到 1080P：源 {w}×{h} 已达 1080P 以上，跳过放大"));
+                    log_item(
+                        &app,
+                        &id,
+                        format!("放大到 1080P：源 {w}×{h} 已达 1080P 以上，跳过放大"),
+                    );
                     None
                 }
             }
@@ -236,7 +257,9 @@ pub(super) fn run_transcode_task(app: AppHandle, id: String) {
                 None
             }
         }
-    } else { None };
+    } else {
+        None
+    };
     let params = TranscodeParams {
         input: path.clone(),
         out_dir,
@@ -369,4 +392,3 @@ fn finish_transcode(app: &AppHandle, id: &str, result: Result<std::path::PathBuf
     state.cancels.lock().remove(id);
     persist(app);
 }
-
