@@ -1072,8 +1072,10 @@ mod tests {
     fn build_args_ignores_global_playlist_flag() {
         // 播放列表在解析阶段已展开：下载参数必须永远是 --no-playlist，
         // 输出模板也不能带 playlist 字段（否则父条目会再下载一遍整个列表）。
-        let mut cfg = DownloadConfig::default();
-        cfg.playlist = true;
+        let cfg = DownloadConfig {
+            playlist: true,
+            ..Default::default()
+        };
         let args = build_args("https://example.com/list", &params(), &cfg);
         let joined = args.join(" ");
         assert!(joined.contains("--no-playlist"), "{}", joined);
