@@ -269,15 +269,20 @@ fn log_item(app: &AppHandle, id: &str, line: impl Into<String>) {
 /// （经常 server closed abruptly）；yt-dlp 与主下载共用同一套代理/TLS（openssl），
 /// 行为最一致。`--write-thumbnail --skip-download` 只拉封面不下载视频。
 ///
-/// **不传 cookies**：实测 YouTube 缩略图传 cookies 反而 403（"Sign in to confirm
-/// you're not a bot"），不传则成功；且传 cookies 会让 yt-dlp 退出时 save_cookies 到
-/// temp 文件，若 temp 目录已被清理则 FileNotFoundError（即使封面已下载成功）。
+/// **Cookie**：按视频页面 host 从站点 Cookie 库导出到本任务临时目录，随 tmp 清理。
+/// YouTube 对无 Cookie 的缩略图请求会触发 bot 校验（"Sign in to confirm you're
+/// not a bot"），因此缩略图与解析/下载同口径带 Cookie；库文件本身只读，导出文件
+/// 用完即删，不会污染 `config/cookies/`。
+// 参数较多是封面链路的固有形态（路径/代理/Cookie 来源/日志），按项目惯例放行。
+#[allow(clippy::too_many_arguments)]
 fn fetch_thumb_ytdlp(
     resolver: &ToolResolver,
     video_url: &str,
     dest: &Path,
     temp_root: &Path,
     proxy: Option<&str>,
+    cookies_host: Option<&str>,
+    cookies_dir: &Path,
     on_log: &mut dyn FnMut(String),
 ) -> Result<(), String> {
     // 运行时文件必须落 <exe 同级>\temp\（§3.7），禁止系统 temp；
@@ -288,6 +293,20 @@ fn fetch_thumb_ytdlp(
         .unwrap_or(0);
     let tmp_dir = temp_root.join(format!("thumb-{ts}"));
     std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("创建临时目录失败：{e}"))?;
+    // Cookie 导出到任务私有目录：yt-dlp 退出时可能回写该文件，tmp 删除即可，
+    // 不触碰 config/cookies/ 的站点库文件。
+    let cookies_file = match cookies_host {
+        Some(host) => match CookieStore::new(cookies_dir)
+            .export_for_task(host, &tmp_dir.join("cookies.txt"))
+        {
+            Ok(p) => p,
+            Err(e) => {
+                on_log(format!("缩略图 Cookie 导出失败（改为不带 Cookie）：{e}"));
+                None
+            }
+        },
+        None => None,
+    };
     let out_tmpl = tmp_dir.join("%(id)s.%(ext)s");
     let out_tmpl_str = out_tmpl.to_string_lossy().into_owned();
     let mut args: Vec<String> = vec![
@@ -306,6 +325,10 @@ fn fetch_thumb_ytdlp(
             args.push(p.to_string());
         }
     }
+    if let Some(cf) = &cookies_file {
+        args.push("--cookies".into());
+        args.push(cf.to_string_lossy().into_owned());
+    }
     if let Ok(deno) = resolver.resolve(ytdlp_core::exec::Tool::Deno) {
         args.push("--js-runtimes".into());
         args.push(format!("deno:{}", deno.to_string_lossy()));
@@ -322,9 +345,14 @@ fn fetch_thumb_ytdlp(
     args.push(out_tmpl_str);
     args.push(video_url.to_string());
     on_log(ytdlp_core::exec::display_command("yt-dlp", &args));
-    let mut cmd = resolver
-        .command(ytdlp_core::exec::Tool::YtDlp)
-        .map_err(|e| e.to_string())?;
+    let mut cmd = match resolver.command(ytdlp_core::exec::Tool::YtDlp) {
+        Ok(c) => c,
+        Err(e) => {
+            // 已导出的 Cookie 文件必须随临时目录一起清掉
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return Err(e.to_string());
+        }
+    };
     cmd.args(&args);
     // 总超时兜底：--socket-timeout 只管读超时，管不了"连上之后不产数据"的挂起；
     // 与全项目其它子进程调用同口径（60s 量级）。run_capture_deadline 只在退出码
@@ -790,6 +818,17 @@ fn run_probe(app: AppHandle, id: String, auto_ready: bool) {
                 }
             } else {
                 let cover_idx = p.meta.cover_stream_index;
+                // 缩略图 Cookie 的 host：优先本次解析出的页面 host，其次条目旧值，
+                // 最后从 URL 兜底（解析成功前 item.host 可能还是 None）。
+                let thumb_host = p
+                    .host
+                    .clone()
+                    .or_else(|| item.host.clone())
+                    .or_else(|| {
+                        item.url
+                            .as_deref()
+                            .and_then(ytdlp_core::cookies::host_from_url)
+                    });
                 update_item(&app, &id, |it| {
                     // 先取标题再 move meta
                     let meta_title = p.meta.title.clone();
@@ -822,10 +861,11 @@ fn run_probe(app: AppHandle, id: String, auto_ready: bool) {
                     // 用户勾的是 youtube.com，i.ytimg.com 不匹配；缩略图属于该视频，
                     // 应跟视频走同一代理。
                     let thumb_proxy = video_url.as_deref().and_then(|u| network.resolve_proxy(u));
-                    // 缩略图下载不传 cookies：缩略图是 CDN 资源，解析已成功说明视频可公开访问；
-                    // 传 cookies 会导致 yt-dlp 退出时 save_cookies 到 temp 文件，
-                    // 若 temp 目录已被清理则 FileNotFoundError（即使缩略图已下载成功）。
+                    // 缩略图与解析/下载同口径带站点 Cookie：YouTube 对无 Cookie 的
+                    // 缩略图请求会触发 bot 校验。Cookie 由 fetch_thumb_ytdlp 导出到
+                    // 任务临时目录，随 tmp 清理，不污染站点库。
                     let thumb_tmp_root = state.paths.temp_dir();
+                    let cookies_dir = state.paths.cookies_dir();
                     tauri::async_runtime::spawn_blocking(move || {
                         let dest = ytdlp_core::thumbs::thumb_path(&cache_dir, &id2);
                         // URL 视频：直接用 yt-dlp --write-thumbnail --skip-download 下载缩略图。
@@ -840,6 +880,8 @@ fn run_probe(app: AppHandle, id: String, auto_ready: bool) {
                                     &dest,
                                     &thumb_tmp_root,
                                     thumb_proxy.as_deref(),
+                                    thumb_host.as_deref(),
+                                    &cookies_dir,
                                     &mut |l| log_item(&app2, &id2, l),
                                 )
                             } else {
