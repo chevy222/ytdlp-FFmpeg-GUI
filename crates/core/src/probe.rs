@@ -383,6 +383,40 @@ pub fn probe_local(
     Ok(LocalProbe { meta })
 }
 
+/// 校验 attached_pic 封面流是否可解码/重编码（宽高必须 > 0）。
+///
+/// 旧版 history 可能保存了损坏封面的索引（width/height=0），而旋转转码必须重新
+/// 解码封面：不校验的话每个层级都会因这条坏流失败。转码前用它兜底刷新。
+pub fn cover_stream_usable(resolver: &ToolResolver, path: &Path, index: u32) -> bool {
+    let index = index.to_string();
+    let path_str = path.to_string_lossy();
+    let args: Vec<&str> = vec![
+        "-v",
+        "error",
+        "-select_streams",
+        index.as_str(),
+        "-show_entries",
+        "stream=width,height",
+        "-of",
+        "csv=p=0",
+        path_str.as_str(),
+    ];
+    let Ok(out) = crate::exec::run_tool_capture(resolver, Tool::Ffprobe, &args) else {
+        return false;
+    };
+    let text = decode_text(&out.stdout);
+    let mut dims = text.trim().split(',');
+    let w = dims
+        .next()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let h = dims
+        .next()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    w > 0 && h > 0
+}
+
 /// 音量探测（ffmpeg volumedetect）。
 ///
 /// 只解**主音轨**（`-map 0:a:0`）且只取**前 10 分钟**（`-t 600`）：
@@ -571,8 +605,15 @@ pub fn parse_ffprobe_json(text: &str) -> std::result::Result<MediaMeta, serde_js
                     || s["disposition"]["attached_pic"].as_str() == Some("1");
                 if is_cover {
                     // 封面流（attached pic）只记录索引，不参与主视频元数据，
-                    // 否则 mjpeg 封面会覆盖主视频的高度/编码器/码率/帧率
-                    if meta.cover_stream_index.is_none() {
+                    // 否则 mjpeg 封面会覆盖主视频的高度/编码器/码率/帧率。
+                    //
+                    // 只接受尺寸有效的封面：损坏的 attached_pic 常见 width/height=0
+                    // （ffmpeg 报 "Attached picture ... invalid size, ignoring"），
+                    // 记录它会让旋转转码/缩略图提取都去解码一条无法解码的流，
+                    // 整次转码失败。视为无封面后走抽帧回退即可。
+                    let cover_w = s["width"].as_u64().unwrap_or(0);
+                    let cover_h = s["height"].as_u64().unwrap_or(0);
+                    if cover_w > 0 && cover_h > 0 && meta.cover_stream_index.is_none() {
                         meta.cover_stream_index = Some(abs_index);
                     }
                     continue;
@@ -792,9 +833,24 @@ mod tests {
 
     #[test]
     fn parse_ffprobe_json_attached_pic_cover() {
-        let json = r#"{"streams":[{"codec_type":"video","codec_name":"mjpeg","disposition":{"attached_pic":1}},{"codec_type":"video","codec_name":"hevc","height":1080},{"codec_type":"audio","codec_name":"aac"}]}"#;
+        let json = r#"{"streams":[{"codec_type":"video","codec_name":"mjpeg","width":600,"height":600,"disposition":{"attached_pic":1}},{"codec_type":"video","codec_name":"hevc","height":1080},{"codec_type":"audio","codec_name":"aac"}]}"#;
         let m = parse_ffprobe_json(json).unwrap();
         assert_eq!(m.cover_stream_index, Some(0));
+        assert_eq!(m.height, Some(1080));
+    }
+
+    #[test]
+    fn parse_ffprobe_json_invalid_attached_pic_ignored() {
+        // 真实坏样例：attached_pic 的 width/height=0（ffmpeg 报 invalid size）。
+        // 记录该索引会让旋转转码去解码它，导致整次转码失败。
+        let json = r#"{"streams":[
+          {"index":0,"codec_type":"video","codec_name":"h264","width":1920,"height":1080},
+          {"index":1,"codec_type":"audio","codec_name":"aac"},
+          {"index":2,"codec_type":"video","codec_name":"mjpeg","width":0,"height":0,"disposition":{"attached_pic":1}}
+        ]}"#;
+        let m = parse_ffprobe_json(json).unwrap();
+        assert_eq!(m.cover_stream_index, None);
+        assert_eq!(m.video_stream_index, Some(0));
         assert_eq!(m.height, Some(1080));
     }
 
@@ -804,7 +860,7 @@ mod tests {
           "streams": [
             {"index":0,"codec_type":"video","codec_name":"hevc","height":1080,"extradata":"0a0b0c","tags":{"rotate":"90"}},
             {"index":1,"codec_type":"audio","codec_name":"aac","sample_rate":"48000","bit_rate":"128000"},
-            {"index":2,"codec_type":"video","codec_name":"mjpeg","disposition":{"attached_pic":1}}
+            {"index":2,"codec_type":"video","codec_name":"mjpeg","width":600,"height":600,"disposition":{"attached_pic":1}}
           ]
         }"#;
         let m = parse_ffprobe_json(json).unwrap();
@@ -819,7 +875,7 @@ mod tests {
     fn parse_ffprobe_json_cover_first_main_index_is_second() {
         // 封面流排在主视频之前时，绝对索引必须指向真正的主视频
         let json = r#"{"streams":[
-          {"index":0,"codec_type":"video","codec_name":"mjpeg","disposition":{"attached_pic":1}},
+          {"index":0,"codec_type":"video","codec_name":"mjpeg","width":600,"height":600,"disposition":{"attached_pic":1}},
           {"index":1,"codec_type":"video","codec_name":"hevc","height":1080},
           {"index":2,"codec_type":"audio","codec_name":"aac"}
         ]}"#;

@@ -817,6 +817,19 @@ pub fn run_transcode(
     mut on_progress: impl FnMut(f32),
     mut on_log: impl FnMut(String),
 ) -> Result<PathBuf> {
+    // 旧版 history 可能保存了损坏 attached_pic 的索引（width/height=0）：旋转转码
+    // 会尝试重新解码该封面，导致所有层级都失败。转码前校验一次，坏封面按不保留处理。
+    let mut effective = params.clone();
+    if effective.keep_cover {
+        if let Some(idx) = meta.cover_stream_index {
+            if !crate::probe::cover_stream_usable(resolver, &effective.input, idx) {
+                on_log("内嵌封面不可用（尺寸无效），本次转码不保留封面".into());
+                effective.keep_cover = false;
+            }
+        }
+    }
+    let params = &effective;
+
     let explicit = matches!(params.encoder_mode.as_str(), "libx265" | "nvenc" | "amf");
     let auto_qsv = !explicit && qsv_available(resolver).unwrap_or(false);
     // 层级序列：auto 模式且 QSV 可用时四级回落，否则纯软件。
