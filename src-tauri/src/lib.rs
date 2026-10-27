@@ -252,13 +252,13 @@ pub fn run() {
                 // 也必须被置位。
                 let deadline = Instant::now() + Duration::from_secs(5);
                 loop {
-                    let running = app_for_exit
-                        .state::<state::AppState>()
-                        .queue
-                        .lock()
-                        .running_count();
+                    let running = {
+                        let st = app_for_exit.state::<state::AppState>();
+                        st.queue.lock().running_count()
+                    };
                     let pending = {
-                        let cancels = app_for_exit.state::<state::AppState>().cancels.lock();
+                        let st = app_for_exit.state::<state::AppState>();
+                        let cancels = st.cancels.lock();
                         for flag in cancels.values() {
                             flag.store(true, Ordering::Relaxed);
                         }
