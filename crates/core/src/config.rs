@@ -34,7 +34,7 @@ pub struct DownloadConfig {
     pub retries: u32,
     /// 仅音频默认（新 URL 条目的初始 audio_only）
     pub audio_only: bool,
-    /// 播放列表默认（默认关）
+    /// 播放列表默认（默认关）：解析到合集时展开为逐集条目平铺，父条目不再单独下载
     pub playlist: bool,
     /// 嵌入封面/元数据
     pub embed_cover: bool,

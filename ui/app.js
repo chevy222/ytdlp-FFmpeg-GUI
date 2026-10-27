@@ -673,6 +673,8 @@ let secId=null;
 function openSec(id){
   const it=S.items.find(i=>i.id===id); if(!it)return;
   secId=id;
+  // 与格式选择同口径：编辑时间范围期间先停表，避免倒计时到点用旧范围自动下载
+  stopCountdown(id);
   document.getElementById('secStart').value=(it.sections&&it.sections[0])||'';
   document.getElementById('secEnd').value=(it.sections&&it.sections[1])||'';
   document.getElementById('secModal').classList.add('show');
@@ -858,9 +860,9 @@ function renderSetPage(){
     h+=row('并发分片数',num('download.fragments',d.fragments,1,16));
     h+=row('重试次数',num('download.retries',d.retries,0,10));
     h+=row('仅音频默认',chk('download.audio_only',d.audio_only,''));
-    h+=row('播放列表默认',chk('download.playlist',d.playlist,''));
+    h+=row('播放列表默认（解析后展开为逐集条目）',chk('download.playlist',d.playlist,''),'合集解析成功后父条目会被移除，只保留展开后的每一集；不会整列表重复下载');
     h+=row('嵌入封面 / 元数据',chk('download.embed_cover',d.embed_cover,''));
-    h+=row('文件名模板（下载/转码/合并输出共用）',sel('download.filename_template',d.filename_template,[['纯标题','纯标题'],['标题+ID','标题+ID'],['UP主-标题','UP主-标题'],['日期-标题','日期-标题']]));
+    h+=row('文件名模板（下载/转码输出共用）',sel('download.filename_template',d.filename_template,[['纯标题','纯标题'],['标题+ID','标题+ID'],['UP主-标题','UP主-标题'],['日期-标题','日期-标题']]),'合并输出的文件名在合并面板里单独填写');
   } else if(curPage==='transcode'){
     if(S.hw===undefined)probeHw();
     h+=row('长边上限 MAXW',num('transcode.max_w',t.max_w,0,7680));
@@ -929,14 +931,7 @@ function bindSetEvents(){
     // text/number 用 input（实时写回，避免填完直接点保存没失焦丢值）；
     // checkbox/select 用 change（勾选/选中即触发）
     const evt=(el.type==='checkbox'||el.tagName==='SELECT')?'change':'input';
-    el.addEventListener(evt,()=>{
-      const path=el.dataset.cfg;
-      let val;
-      if(el.type==='checkbox')val=el.checked;
-      else if(el.type==='number')val=el.value===''?null:Number(el.value);
-      else val=el.value;
-      setCfg(path,val);
-    });
+    el.addEventListener(evt,()=>applyCfgInput(el));
   });
   // 常用代理端口快捷标签：填入输入框并同步进配置（点保存按钮统一落盘）
   page.querySelectorAll('[data-proxy-fill]').forEach(b=>b.addEventListener('click',()=>{
@@ -1024,6 +1019,25 @@ function setCfg(path,val){
   for(let i=0;i<parts.length-1;i++){ if(!obj[parts[i]])obj[parts[i]]={}; obj=obj[parts[i]]; }
   obj[parts[parts.length-1]]=val;
 }
+// 把单个输入框写回 S.config。
+// 数字框清空时：brcap_kbps 是 Option（留空 = 后端回填默认），其余字段
+// 是非 Option 数值，写 null 会让 AppConfig 反序列化整份失败，因此保留旧值。
+function applyCfgInput(el){
+  const path=el.dataset.cfg;
+  let val;
+  if(el.type==='checkbox')val=el.checked;
+  else if(el.type==='number'){
+    if(el.value==='') {
+      if(path!=='transcode.brcap_kbps')return;
+      val=null;
+    } else {
+      const n=Number(el.value);
+      if(!Number.isFinite(n))return;
+      val=n;
+    }
+  } else val=el.value;
+  setCfg(path,val);
+}
 function refreshDeps(){
   INVOKE('probe_dependencies').then(list=>{
     const map={yt_dlp:'depYt','yt-dlp':'depYt',ffmpeg:'depFfmpeg',ffprobe:'depFfprobe',deno:'depDeno'};
@@ -1049,14 +1063,7 @@ function saveSettings(){
   // 保存前从 DOM 重新收集所有输入框的值，不依赖 input/change 事件实时同步——
   // 用户在代理地址输入框粘贴后直接点"保存"，最后一次 input 事件可能尚未触发，
   // 导致 S.config 里仍是旧值（空），而输入框里显示的新值没有被保存。
-  document.querySelectorAll('#settingsModal [data-cfg]').forEach(el=>{
-    const path=el.dataset.cfg;
-    let val;
-    if(el.type==='checkbox')val=el.checked;
-    else if(el.type==='number')val=el.value===''?null:Number(el.value);
-    else val=el.value;
-    setCfg(path,val);
-  });
+  document.querySelectorAll('#settingsModal [data-cfg]').forEach(el=>applyCfgInput(el));
   INVOKE('save_config',{config:S.config}).then(()=>{
     // 保存成功后同步基线，否则 closeSettings 会立刻误报"未保存修改"
     S.configSaved=JSON.stringify(S.config);
@@ -1121,10 +1128,9 @@ async function init(){
       if(it&&it.kind==='UrlTask'&&it.status==='Ready')startCountdown(it.id);
     }).then(un=>unlisteners.push(un)).catch(()=>{});
     LISTEN('login:done', ()=>{
-      toast('Cookie 已保存，正在重新解析需要登录的条目');
-      // 真正触发重解析：NeedLogin 条目逐个 retry（后端 retry_item 允许该状态）
-      S.items.filter(i=>i.status==='NeedLogin')
-        .forEach(i=>INVOKE('retry_item',{id:i.id}).catch(()=>{}));
+      // 后端按 host 统一重解析 NeedLogin 与已就绪（受限清晰度）条目，
+      // 并发 list:changed / item:update 回推；前端不再逐条 retry。
+      toast('Cookie 已保存，正在重新解析相关条目');
     }).then(un=>unlisteners.push(un)).catch(()=>{});
     // 登录失败（未捕获到 cookie / 读取失败）：明确提示，不再静默当"已保存"
     LISTEN('login:failed', e=>{

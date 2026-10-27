@@ -56,11 +56,11 @@ pub struct AppState {
     /// finish 前移除。「清空临时文件」据此精确豁免活跃合并，避免"有任务在跑就
     /// 跳过所有 merge_*"导致崩溃残留永远清不掉。
     pub merge_tmp: Mutex<HashSet<String>>,
-    /// 放大到 1080P 的任务 id 集合：start_upscale 写入，run_transcode_task
-    /// 入口消费后移除。**消费语义**：登记与消费之间的所有退出路径
+    /// 放大到 1080P 的任务 id → 目标尺寸：start_upscale 在预检时算好并写入，
+    /// run_transcode_task 入口消费后移除。**消费语义**：登记与消费之间的所有退出路径
     /// （begin_transcode 预检跳过 / cancel_item 取消）都必须移除登记，
     /// 否则残留条目会让后续普通转码被误放大到 1080P。
-    pub upscale_ids: Mutex<HashSet<String>>,
+    pub upscale_targets: Mutex<HashMap<String, (u32, u32)>>,
     /// CLI 本次调用级覆盖（--dir/--cookies/--yt-dlp-path/--deno-path）
     pub cli: Mutex<CliOverrides>,
     /// 历史写盘串行锁（同一时刻只有一个写入者）
@@ -108,7 +108,7 @@ impl AppState {
             cancels: Mutex::new(HashMap::new()),
             merge_jobs: Mutex::new(HashMap::new()),
             merge_tmp: Mutex::new(HashSet::new()),
-            upscale_ids: Mutex::new(HashSet::new()),
+            upscale_targets: Mutex::new(HashMap::new()),
             cli: Mutex::new(CliOverrides::default()),
             persist_lock: Mutex::new(()),
             persist_req: AtomicU64::new(0),

@@ -218,6 +218,38 @@ fn log_error_lines(app: &AppHandle, id: &str, prefix: &str, e: &CoreError) {
     }
 }
 
+/// 解析失败收尾（URL 解析失败与播放列表展开失败共用）：
+/// 取消 → 已取消；需要登录 → 需登录；其余 → 失败。
+fn handle_probe_failure(
+    app: &AppHandle,
+    id: &str,
+    f: &probe::ProbeFailure,
+    log_prefix: &str,
+) {
+    let status = match f.kind {
+        ProbeErrorKind::NeedLogin => Status::NeedLogin,
+        ProbeErrorKind::Cancelled => Status::Canceled,
+        _ => Status::Failed,
+    };
+    update_item(app, id, |it| {
+        transition_in(it, status);
+        if f.kind != ProbeErrorKind::Cancelled {
+            it.error = Some(f.to_string());
+        }
+        // 多行错误逐行落日志：单条塞多行在日志弹窗里会被错误截断
+        let s = f.to_string();
+        let mut lines = s.lines();
+        if let Some(first) = lines.next() {
+            it.push_log(format!("{log_prefix}：{first}"));
+        }
+        for l in lines {
+            if !l.trim().is_empty() {
+                it.push_log(l.to_string());
+            }
+        }
+    });
+}
+
 /// 记录日志行：锁内原地 push（不 clone 整条目），发轻量 `item:log` 事件
 /// （只含 id + 单行文本），前端增量 append；不再触发全量 item:update。
 fn log_item(app: &AppHandle, id: &str, line: impl Into<String>) {
@@ -403,6 +435,79 @@ fn persist(app: &AppHandle) {
     }
 }
 
+/// 产物条目缩略图（转码/合并产物共用）：后台抽帧/内嵌封面，成功后回填并落盘。
+pub(super) fn spawn_product_thumb(
+    app: &AppHandle,
+    product_id: String,
+    out: PathBuf,
+    cover_idx: Option<u32>,
+) {
+    let app2 = app.clone();
+    let state = app.state::<AppState>();
+    let cache_dir = state.paths.cache_dir();
+    let resolver = state.resolver();
+    tauri::async_runtime::spawn_blocking(move || {
+        let dest = ytdlp_core::thumbs::thumb_path(&cache_dir, &product_id);
+        if ytdlp_core::thumbs::ensure_thumb(
+            &resolver,
+            &out,
+            &dest,
+            cover_idx.map(|i| i as usize),
+            &mut |_| {},
+        )
+        .is_ok()
+        {
+            update_item(&app2, &product_id, |it| {
+                it.thumb = Some(dest.to_string_lossy().into_owned());
+            });
+        }
+        app2.state::<AppState>().persist();
+    });
+}
+
+/// 批量任务预检 + 状态迁移（转码/合并共用）。
+///
+/// 两段式：先确认所有 id 都存在（任一缺失直接报错，避免前 N-1 个已被改成
+/// 处理中却没人执行），再逐条跑 `check` 并做 transition；被跳过的条目带原因返回。
+/// 调用方负责在出锁后 emit `item:update` / 写跳过日志。
+pub(super) fn prepare_batch(
+    hist: &mut ytdlp_core::history::History,
+    ids: &[String],
+    target: Status,
+    skip_prefix: &str,
+    mut check: impl FnMut(&MediaItem) -> Result<(), String>,
+) -> Result<(Vec<MediaItem>, Vec<(String, String)>), String> {
+    let mut items = Vec::with_capacity(ids.len());
+    for id in ids {
+        let Some(item) = hist.get(id).cloned() else {
+            return Err(format!("条目不存在：{id}"));
+        };
+        items.push((id.clone(), item));
+    }
+    let mut accepted = Vec::new();
+    let mut skipped = Vec::new();
+    for (id, item) in items {
+        if let Err(msg) = check(&item) {
+            skipped.push((id, format!("{skip_prefix}：{msg}")));
+            continue;
+        }
+        match transition(item.status, target) {
+            Ok(to) => {
+                // 进入新任务前进度归零：否则上一轮下载/转码的 100% 会一直挂在进度列
+                let updated = MediaItem {
+                    status: to,
+                    percent: 0.0,
+                    ..item
+                };
+                hist.upsert(updated.clone());
+                accepted.push(updated);
+            }
+            Err(e) => skipped.push((id, format!("{skip_prefix}：{e}"))),
+        }
+    }
+    Ok((accepted, skipped))
+}
+
 // ---------- 添加与解析 ----------
 
 /// 读取剪贴板文本。首页"添加"按钮在输入框为空时自动调用，
@@ -459,7 +564,7 @@ pub(crate) fn add_url_inner(app: &AppHandle, urls: Vec<String>) -> CmdResult<()>
         let app2 = app.clone();
         std::thread::spawn(move || {
             let _slot = ProbeSlot::acquire();
-            run_probe(app2, id);
+            run_probe(app2, id, true);
         });
     }
     persist(app);
@@ -508,7 +613,7 @@ pub async fn add_local(
         let app2 = app.clone();
         std::thread::spawn(move || {
             let _slot = ProbeSlot::acquire();
-            run_probe(app2, id);
+            run_probe(app2, id, true);
         });
     }
     persist(&app);
@@ -565,7 +670,10 @@ fn clean_url(raw: &str) -> String {
 /// 注册取消标志：**解析中的条目也要能取消**（yt-dlp 卡在 DNS/握手时，
 /// `--socket-timeout` 管不到建连阶段，只有取消能救），取消由 `probe::probe_url`
 /// 内部的看门狗落实为进程树终止。
-fn run_probe(app: AppHandle, id: String) {
+/// `auto_ready`：解析成功后是否发 `item:ready` 触发前端 5 秒自动下载。
+/// 登录后刷新已就绪条目时传 false（用户可能还要挑格式）；
+/// 新增/重试/播放列表展开条目传 true（与"解析完成默认自动下载"一致）。
+fn run_probe(app: AppHandle, id: String, auto_ready: bool) {
     let state = app.state::<AppState>();
     let item = {
         let hist = state.history.lock();
@@ -619,101 +727,12 @@ fn run_probe(app: AppHandle, id: String) {
     match result {
         Ok(p) => {
             let url_src = item.url.is_some();
-            let cover_idx = p.meta.cover_stream_index;
-            update_item(&app, &id, |it| {
-                // 先取标题再 move meta
-                let meta_title = p.meta.title.clone();
-                it.meta = p.meta;
-                it.site = p.site.clone();
-                if p.host.is_some() {
-                    it.host = p.host.clone();
-                }
-                // 解析出视频标题后同步到条目标题（前端名称列显示）
-                if let Some(t) = meta_title {
-                    it.title = t;
-                }
-                transition_in(it, Status::Ready);
-                it.percent = 0.0;
-                it.error = None;
-                it.push_log("解析完成，已就绪".to_string());
-            });
-            // 封面缩略图（异步生成，不阻塞就绪）。
-            // spawn_blocking：里面是 yt-dlp / ffmpeg 子进程（阻塞），
-            // 放在 async 执行器的 worker 上会占住线程（执行器线程数 ≈ CPU 核数）
-            {
-                let app2 = app.clone();
-                let id2 = id.clone();
-                let cache_dir = state.paths.cache_dir();
-                let local_path = item.path.clone();
-                let video_url = item.url.clone();
-                // 本地文件优先取内嵌封面（元数据），与桌面缩略图同源
-                let resolver2 = resolver.clone();
-                // 缩略图代理按视频页面 URL 解析（而非缩略图 URL i.ytimg.com）——
-                // 用户勾的是 youtube.com，i.ytimg.com 不匹配；缩略图属于该视频，
-                // 应跟视频走同一代理。
-                let thumb_proxy = video_url.as_deref().and_then(|u| network.resolve_proxy(u));
-                // 缩略图下载不传 cookies：缩略图是 CDN 资源，解析已成功说明视频可公开访问；
-                // 传 cookies 会导致 yt-dlp 退出时 save_cookies 到 temp 文件，
-                // 若 temp 目录已被清理则 FileNotFoundError（即使缩略图已下载成功）。
-                let thumb_tmp_root = state.paths.temp_dir();
-                tauri::async_runtime::spawn_blocking(move || {
-                    let dest = ytdlp_core::thumbs::thumb_path(&cache_dir, &id2);
-                    // URL 视频：直接用 yt-dlp --write-thumbnail --skip-download 下载缩略图。
-                    // 与下载视频走同一套代理/cookies/TLS(openssl)，不走 curl（schannel
-                    // + socks5 兼容性差，经常 server closed abruptly）。
-                    // 本地文件：优先取内嵌封面（ffmpeg），无封面流才抽帧。
-                    let r = if video_url.is_some() {
-                        if let Some(vurl) = &video_url {
-                            fetch_thumb_ytdlp(
-                                &resolver2,
-                                vurl,
-                                &dest,
-                                &thumb_tmp_root,
-                                thumb_proxy.as_deref(),
-                                None,
-                                &mut |l| log_item(&app2, &id2, l),
-                            )
-                        } else {
-                            Ok(())
-                        }
-                    } else if let Some(p) = local_path {
-                        ytdlp_core::thumbs::ensure_thumb(
-                            &resolver2,
-                            std::path::Path::new(&p),
-                            &dest,
-                            cover_idx.map(|i| i as usize),
-                            &mut |l| log_item(&app2, &id2, l),
-                        )
-                    } else {
-                        Ok(())
-                    };
-                    match r {
-                        Ok(()) => {
-                            // 缩略图下载是异步的：用户可能在解析完成后立即删除条目，
-                            // 此时 update_item 返回 None、persist 做无意义全量序列化。
-                            // 先确认条目仍存在再更新，避免批量删除时触发多次 persist。
-                            let exists =
-                                app2.state::<AppState>().history.lock().get(&id2).is_some();
-                            if exists {
-                                update_item(&app2, &id2, |it| {
-                                    it.thumb = Some(dest.to_string_lossy().into_owned());
-                                });
-                                app2.state::<AppState>().persist();
-                            }
-                        }
-                        Err(e) => {
-                            log_item(&app2, &id2, format!("缩略图生成失败：{e}"));
-                        }
-                    }
-                });
-            }
-            // URL 已就绪：触发 5 秒倒计时自动下载（前端计时，后端只发可下载信号）
-            if url_src {
-                let _ = app.emit("item:ready", serde_json::json!({ "id": id }));
-            }
-            // 播放列表（DL-09）：开启时把合集展开为逐集条目平铺进列表
-            if url_src && playlist_on && p.is_playlist {
-                expand_playlist(
+            // 播放列表（DL-09）：开启时把合集展开为逐集条目平铺进列表。
+            // 父条目保持"解析中"直到展开结束（不触发倒计时、不生成封面），
+            // 展开成功后从列表移除；失败则落到 NeedLogin/失败/已取消。
+            let playlist_task = url_src && playlist_on && p.is_playlist;
+            if playlist_task {
+                match expand_playlist(
                     &app,
                     &id,
                     &item,
@@ -721,33 +740,107 @@ fn run_probe(app: AppHandle, id: String) {
                     netscape.as_deref(),
                     &network,
                     &cancel,
-                );
+                ) {
+                    Ok(n) => ytdlp_core::log::info(format!("播放列表 {id} 展开为 {n} 集")),
+                    Err(f) => handle_probe_failure(&app, &id, &f, "播放列表展开失败"),
+                }
+            } else {
+                let cover_idx = p.meta.cover_stream_index;
+                update_item(&app, &id, |it| {
+                    // 先取标题再 move meta
+                    let meta_title = p.meta.title.clone();
+                    it.meta = p.meta;
+                    it.site = p.site.clone();
+                    if p.host.is_some() {
+                        it.host = p.host.clone();
+                    }
+                    // 解析出视频标题后同步到条目标题（前端名称列显示）
+                    if let Some(t) = meta_title {
+                        it.title = t;
+                    }
+                    transition_in(it, Status::Ready);
+                    it.percent = 0.0;
+                    it.error = None;
+                    it.push_log("解析完成，已就绪".to_string());
+                });
+                // 封面缩略图（异步生成，不阻塞就绪）。
+                // spawn_blocking：里面是 yt-dlp / ffmpeg 子进程（阻塞），
+                // 放在 async 执行器的 worker 上会占住线程（执行器线程数 ≈ CPU 核数）
+                {
+                    let app2 = app.clone();
+                    let id2 = id.clone();
+                    let cache_dir = state.paths.cache_dir();
+                    let local_path = item.path.clone();
+                    let video_url = item.url.clone();
+                    // 本地文件优先取内嵌封面（元数据），与桌面缩略图同源
+                    let resolver2 = resolver.clone();
+                    // 缩略图代理按视频页面 URL 解析（而非缩略图 URL i.ytimg.com）——
+                    // 用户勾的是 youtube.com，i.ytimg.com 不匹配；缩略图属于该视频，
+                    // 应跟视频走同一代理。
+                    let thumb_proxy = video_url.as_deref().and_then(|u| network.resolve_proxy(u));
+                    // 缩略图下载不传 cookies：缩略图是 CDN 资源，解析已成功说明视频可公开访问；
+                    // 传 cookies 会导致 yt-dlp 退出时 save_cookies 到 temp 文件，
+                    // 若 temp 目录已被清理则 FileNotFoundError（即使缩略图已下载成功）。
+                    let thumb_tmp_root = state.paths.temp_dir();
+                    tauri::async_runtime::spawn_blocking(move || {
+                        let dest = ytdlp_core::thumbs::thumb_path(&cache_dir, &id2);
+                        // URL 视频：直接用 yt-dlp --write-thumbnail --skip-download 下载缩略图。
+                        // 与下载视频走同一套代理/cookies/TLS(openssl)，不走 curl（schannel
+                        // + socks5 兼容性差，经常 server closed abruptly）。
+                        // 本地文件：优先取内嵌封面（ffmpeg），无封面流才抽帧。
+                        let r = if video_url.is_some() {
+                            if let Some(vurl) = &video_url {
+                                fetch_thumb_ytdlp(
+                                    &resolver2,
+                                    vurl,
+                                    &dest,
+                                    &thumb_tmp_root,
+                                    thumb_proxy.as_deref(),
+                                    None,
+                                    &mut |l| log_item(&app2, &id2, l),
+                                )
+                            } else {
+                                Ok(())
+                            }
+                        } else if let Some(p) = local_path {
+                            ytdlp_core::thumbs::ensure_thumb(
+                                &resolver2,
+                                std::path::Path::new(&p),
+                                &dest,
+                                cover_idx.map(|i| i as usize),
+                                &mut |l| log_item(&app2, &id2, l),
+                            )
+                        } else {
+                            Ok(())
+                        };
+                        match r {
+                            Ok(()) => {
+                                // 缩略图下载是异步的：用户可能在解析完成后立即删除条目，
+                                // 此时 update_item 返回 None、persist 做无意义全量序列化。
+                                // 先确认条目仍存在再更新，避免批量删除时触发多次 persist。
+                                let exists =
+                                    app2.state::<AppState>().history.lock().get(&id2).is_some();
+                                if exists {
+                                    update_item(&app2, &id2, |it| {
+                                        it.thumb = Some(dest.to_string_lossy().into_owned());
+                                    });
+                                    app2.state::<AppState>().persist();
+                                }
+                            }
+                            Err(e) => {
+                                log_item(&app2, &id2, format!("缩略图生成失败：{e}"));
+                            }
+                        }
+                    });
+                }
+                // URL 已就绪：触发 5 秒倒计时自动下载（前端计时，后端只发可下载信号）
+                if url_src && auto_ready {
+                    let _ = app.emit("item:ready", serde_json::json!({ "id": id }));
+                }
             }
         }
         Err(f) => {
-            // 取消 → 已取消；需要登录 → 需登录；其余 → 失败
-            let status = match f.kind {
-                ProbeErrorKind::NeedLogin => Status::NeedLogin,
-                ProbeErrorKind::Cancelled => Status::Canceled,
-                _ => Status::Failed,
-            };
-            update_item(&app, &id, |it| {
-                transition_in(it, status);
-                if f.kind != ProbeErrorKind::Cancelled {
-                    it.error = Some(f.to_string());
-                }
-                // 多行错误逐行落日志：单条塞多行在日志弹窗里会被错误截断
-                let s = f.to_string();
-                let mut lines = s.lines();
-                if let Some(first) = lines.next() {
-                    it.push_log(format!("解析失败：{first}"));
-                }
-                for l in lines {
-                    if !l.trim().is_empty() {
-                        it.push_log(l.to_string());
-                    }
-                }
-            });
+            handle_probe_failure(&app, &id, &f, "解析失败");
         }
     }
     // 解析阶段临时目录清理（cookie 导出在本任务私有目录下，库文件本身不删）
@@ -758,6 +851,81 @@ fn run_probe(app: AppHandle, id: String) {
     // 落盘只做一次：上面两个分支里的 persist 都与这一次重复（每次都是
     // clone + 序列化 + fsync 整份 history，批量粘贴时按条数线性放大）
     persist(&app);
+}
+
+/// 登录完成后的重解析：把该站点下 `NeedLogin`/`Ready` 的 URL 条目重新解析一遍。
+///
+/// 很多站点未登录也能解析出受限清晰度（B 站只给低码率），条目状态是 Ready
+/// 而不是 NeedLogin；登录后若不重解析，格式列表仍是旧的低清晰度版本。
+/// 这里按 host 的 Cookie 候选域匹配，清掉旧的手选格式并重新探测。
+pub(crate) fn reprobe_items_for_host(app: &AppHandle, host: &str) {
+    let state = app.state::<AppState>();
+    let login_candidates = ytdlp_core::cookies::cookie_candidates(&host.to_lowercase());
+    let mut updated: Vec<MediaItem> = Vec::new();
+    let mut spawns: Vec<(String, bool)> = Vec::new();
+    {
+        let mut hist = state.history.lock();
+        let candidates: Vec<MediaItem> = hist
+            .items
+            .iter()
+            .filter(|it| {
+                if it.kind != ItemKind::UrlTask
+                    || !matches!(it.status, Status::NeedLogin | Status::Ready)
+                {
+                    return false;
+                }
+                let item_host = it
+                    .host
+                    .clone()
+                    .or_else(|| it.url.as_deref().and_then(ytdlp_core::cookies::host_from_url));
+                item_host
+                    .map(|h| {
+                        ytdlp_core::cookies::cookie_candidates(&h)
+                            .iter()
+                            .any(|c| login_candidates.contains(c))
+                    })
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+        for mut item in candidates {
+            // NeedLogin 登录后解析成功可以延续"自动下载"习惯；
+            // Ready 条目只是刷新格式，解析完不应自动开始下载。
+            let auto_ready = item.status == Status::NeedLogin;
+            let Ok(to) = transition(item.status, Status::Probing) else {
+                continue;
+            };
+            item.status = to;
+            item.error = None;
+            item.percent = 0.0;
+            // 登录后格式集合会变：旧的手选 format_id 可能已不存在
+            item.format_id = None;
+            item.push_log("登录完成，重新解析…".to_string());
+            let id = item.id.clone();
+            hist.upsert(item.clone());
+            updated.push(item);
+            spawns.push((id, auto_ready));
+        }
+    }
+    if updated.is_empty() {
+        return;
+    }
+    for it in &updated {
+        let _ = app.emit("item:update", it);
+    }
+    let _ = app.emit("list:changed", ());
+    ytdlp_core::log::info(format!(
+        "登录完成：{host} 下 {} 条条目重新解析",
+        updated.len()
+    ));
+    for (id, auto_ready) in spawns {
+        let app2 = app.clone();
+        std::thread::spawn(move || {
+            let _slot = ProbeSlot::acquire();
+            run_probe(app2, id, auto_ready);
+        });
+    }
+    persist(app);
 }
 
 // ---------- 列表 ----------
@@ -997,44 +1165,54 @@ fn expand_playlist(
     cookies: Option<&Path>,
     network: &NetworkConfig,
     cancel: &Arc<AtomicBool>,
-) {
+) -> Result<usize, probe::ProbeFailure> {
     let url = item.url.clone().unwrap_or_default();
     if url.is_empty() {
-        return;
+        return Err(probe::ProbeFailure {
+            kind: ProbeErrorKind::Failed,
+            message: "播放列表 URL 为空".into(),
+        });
     }
-    match probe::list_playlist_entries(resolver, &url, cookies, network, Some(cancel), |l| {
+    let entries = probe::list_playlist_entries(resolver, &url, cookies, network, Some(cancel), |l| {
         log_item(app, id, l)
-    }) {
-        Ok(entries) => {
-            let n = entries.len();
-            log_item(app, id, format!("播放列表展开：{n} 集"));
-            let mut ids = Vec::with_capacity(entries.len());
-            {
-                let st = app.state::<AppState>();
-                let mut hist = st.history.lock();
-                for e in entries {
-                    let entry = MediaItem::from_url(e.url);
-                    ids.push(entry.id.clone());
-                    hist.upsert(entry);
-                }
-            }
-            // 新条目整批入列表：发一次 list:changed 让前端立即拿到完整清单
-            //（后续每集解析进度经 item:update 逐条回推）
-            let _ = app.emit("list:changed", ());
-            let app2 = app.clone();
-            std::thread::spawn(move || {
-                for eid in ids {
-                    // 逐集顺序解析（每个解析都受全局解析闸门约束，不会因合集过大
-                    // 而瞬间起等量子进程）
-                    let _slot = ProbeSlot::acquire();
-                    run_probe(app2.clone(), eid);
-                }
-            });
-        }
-        Err(f) => {
-            log_item(app, id, format!("播放列表展开失败：{}", f.message));
-        }
+    })?;
+    if entries.is_empty() {
+        return Err(probe::ProbeFailure {
+            kind: ProbeErrorKind::Failed,
+            message: "播放列表为空或没有任何可下载的条目".into(),
+        });
     }
+    let n = entries.len();
+    let mut ids = Vec::with_capacity(n);
+    {
+        let st = app.state::<AppState>();
+        // 展开出的逐集条目继承"仅音频默认"（与 add_url 同口径）
+        let default_audio_only = st.config.lock().download.audio_only;
+        let mut hist = st.history.lock();
+        for e in entries {
+            let mut entry = MediaItem::from_url(e.url);
+            entry.audio_only = default_audio_only;
+            ids.push(entry.id.clone());
+            hist.upsert(entry);
+        }
+        // 父条目只承担"展开播放列表"这一件事：成功后从列表移除，
+        // 避免它被当成普通视频再次下载整个列表（双下载）。
+        hist.remove(id);
+    }
+    ytdlp_core::thumbs::remove_thumb(&app.state::<AppState>().paths.cache_dir(), id);
+    // 先移除父条目再发 list:changed：否则前端可能在刷新时把父条目又画回来
+    let _ = app.emit("item:removed", serde_json::json!({ "id": id }));
+    let _ = app.emit("list:changed", ());
+    let app2 = app.clone();
+    std::thread::spawn(move || {
+        for eid in ids {
+            // 逐集顺序解析（每个解析都受全局解析闸门约束，不会因合集过大
+            // 而瞬间起等量子进程）
+            let _slot = ProbeSlot::acquire();
+            run_probe(app2.clone(), eid, true);
+        }
+    });
+    Ok(n)
 }
 
 /// 转码结束后原条目恢复状态：本地文件 → 已就绪；下载产物/转码产物 → 已完成（可再转码）。
@@ -1091,8 +1269,8 @@ pub fn cancel_item(app: AppHandle, win: tauri::WebviewWindow, id: String) -> Cmd
     let state = app.state::<AppState>();
 
     // 取消即放弃任何待执行的放大意图：排队中被取消的放大任务永远不会进到
-    // 任务线程消费 upscale_ids，不清掉就会让之后对同一 id 的普通转码被误放大
-    state.upscale_ids.lock().remove(&id);
+    // 任务线程消费 upscale_targets，不清掉就会让之后对同一 id 的普通转码被误放大
+    state.upscale_targets.lock().remove(&id);
 
     // 合并作业要整批处理：一次合并只把**锚点条目**提交给队列，其余参与条目既不在
     // 等待队列也不在运行集合里。单条取消若不扩成整批，那些条目会永久停在"合并中"
@@ -1101,7 +1279,7 @@ pub fn cancel_item(app: AppHandle, win: tauri::WebviewWindow, id: String) -> Cmd
     if let Some(job) = merge_job {
         // 参与条目同样放弃待执行的放大意图（整批取消/执行都不经过各自的放大登记）
         {
-            let mut set = state.upscale_ids.lock();
+            let mut set = state.upscale_targets.lock();
             for jid in &job.ids {
                 set.remove(jid);
             }
@@ -1245,7 +1423,7 @@ pub fn retry_item(app: AppHandle, win: tauri::WebviewWindow, id: String) -> CmdR
         // 与 add_url/add_local/expand_playlist 同口径：解析线程也受 ProbeSlot 闸门约束，
         // 否则批量"重试失败条目"会瞬间起等量 yt-dlp，突破 PROBE_CONCURRENCY。
         let _slot = ProbeSlot::acquire();
-        run_probe(app2, id);
+        run_probe(app2, id, true);
     });
     persist(&app);
     Ok(())

@@ -5,6 +5,7 @@
 //! - 进程执行：Command 参数化（不拼接 shell，防注入）；取消时终止进程树（Windows taskkill /T）。
 //! - 平台：Linux 上编译/测试，Windows 上生产运行；取消用条件编译。
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -170,11 +171,33 @@ pub fn find_in_path(name: &str) -> Option<PathBuf> {
     None
 }
 
+/// 进程内所有受控子进程 PID（退出时统一终止，防止关窗后 yt-dlp/ffmpeg 孤儿化）。
+static CHILD_PIDS: std::sync::LazyLock<parking_lot::Mutex<HashSet<u32>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashSet::new()));
+
+fn register_child_pid(pid: u32) {
+    CHILD_PIDS.lock().insert(pid);
+}
+
+fn unregister_child_pid(pid: u32) {
+    CHILD_PIDS.lock().remove(&pid);
+}
+
+/// 终止当前登记的所有子进程树（进程退出收尾用）。
+pub fn kill_all_children() {
+    let pids: Vec<u32> = CHILD_PIDS.lock().iter().copied().collect();
+    for pid in pids {
+        kill_tree_by_pid(pid);
+    }
+}
+
 /// 可取消的受控子进程：Drop 时若未退出则强制终止（防泄漏）。
 pub struct ChildGuard {
     child: Option<Child>,
     /// 已取消（外部标志；取消时终止进程树）
     cancelled: bool,
+    /// 进程 PID（child 被 wait_with_output 接管后仍保留，供注册表注销）
+    pid: u32,
 }
 
 impl ChildGuard {
@@ -193,9 +216,12 @@ impl ChildGuard {
                 format!("启动进程失败：{}", e),
             ))
         })?;
+        let pid = child.id();
+        register_child_pid(pid);
         Ok(Self {
             child: Some(child),
             cancelled: false,
+            pid,
         })
     }
 
@@ -216,6 +242,8 @@ impl ChildGuard {
         // 取消时进程树已由 kill_tree()（Drop/看门狗）终止，这里只需等待回收即可，
         // 无需再单杀主进程（此前的 `child.kill()` 是冗余分支）。
         let out = child.wait_with_output().map_err(CoreError::Io)?;
+        // 句柄已关闭，尽快从退出清理注册表移除，避免 PID 回收后被误杀
+        unregister_child_pid(self.pid);
         if self.cancelled {
             return Err(CoreError::Cancelled);
         }
@@ -248,10 +276,9 @@ impl ChildGuard {
         }
     }
 
-    /// 子进程 PID（看门狗线程按 PID 终止进程树用；句柄被 `wait_with_output`
-    /// 接管后为 None）。
+    /// 子进程 PID（看门狗线程按 PID 终止进程树用）。
     pub fn pid(&self) -> Option<u32> {
-        self.child.as_ref().map(Child::id)
+        Some(self.pid)
     }
 }
 
@@ -270,6 +297,7 @@ impl Drop for ChildGuard {
                 }
             }
         }
+        unregister_child_pid(self.pid);
     }
 }
 

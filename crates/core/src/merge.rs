@@ -296,11 +296,8 @@ fn run_piped_progress(
     // 报错写满管道缓冲区后不再产出 stdout，父进程也跟着阻塞），并用
     // read_until + decode_text 逐行解码（`lines()` 遇非 UTF-8 会中断整条读取）。
     let outcome = crate::exec::stream_lines(&mut guard, cancel, None, |line| {
-        if duration > 0.0 {
-            if let Some(us) = crate::transcode::parse_out_time_us(line) {
-                let pct = ((us as f64 / 1e6) / duration * 100.0).clamp(0.0, 99.0) as f32;
-                on_progress(pct);
-            }
+        if let Some(pct) = crate::transcode::progress_percent(line, duration, 99.0) {
+            on_progress(pct);
         }
     })?;
     if outcome.killed || cancel.load(Ordering::Relaxed) {

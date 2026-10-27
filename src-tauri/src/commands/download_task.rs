@@ -355,9 +355,9 @@ fn finish_download(
         }
     };
     update_item(app, id, |it| {
-        // P1-3：cancel_item 抢先把状态写成 Canceled，但任务线程此时已跑完、
-        // 实际成功。transition(Canceled → Done) 不在白名单内会被静默拒绝，
-        // 条目就永久停在"已取消"但产物已落地。显式覆盖，不依赖状态机。
+        // cancel_item 抢先把状态写成 Canceled，但任务线程此时已跑完、实际成功。
+        // 状态机已允许 Canceled → Done，这里显式覆盖是为了额外写入
+        // "取消请求到达时下载已完成" 这条日志。
         if it.status == Status::Canceled && final_status == Status::Done {
             it.status = Status::Done;
             it.push_log("取消请求到达时下载已完成".to_string());

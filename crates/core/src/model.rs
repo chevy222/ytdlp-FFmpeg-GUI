@@ -273,34 +273,6 @@ impl DownloadFormat {
 }
 
 impl MediaMeta {
-    /// 列表轮询用的轻量副本：不复制格式列表（YouTube 单条可达 60 项）。
-    pub fn to_lite(&self) -> Self {
-        Self {
-            title: self.title.clone(),
-            uploader: self.uploader.clone(),
-            duration_secs: self.duration_secs,
-            container: self.container.clone(),
-            height: self.height,
-            vcodec: self.vcodec.clone(),
-            vbitrate_kbps: self.vbitrate_kbps,
-            fps: self.fps,
-            acodec: self.acodec.clone(),
-            abitrate_kbps: self.abitrate_kbps,
-            audio_tracks: self.audio_tracks,
-            audio_channels: self.audio_channels,
-            audio_volume: self.audio_volume.clone(),
-            size_bytes: self.size_bytes,
-            has_cover: self.has_cover,
-            extradata: self.extradata.clone(),
-            sample_rate: self.sample_rate,
-            video_stream_index: self.video_stream_index,
-            cover_stream_index: self.cover_stream_index,
-            rotate_tag: self.rotate_tag,
-            width: self.width,
-            download_formats: Vec::new(),
-        }
-    }
-
     /// 分辨率短边：无论横竖屏，都取 min(宽,高)。
     /// 文档 §8 口径"分辨率(4K/2K/xP)"按短边计（§6.2）。
     pub fn short_edge(&self) -> Option<u32> {
@@ -441,30 +413,13 @@ impl MediaItem {
     }
 
     /// 列表轮询用的轻量副本：不复制日志（最多 300 行）与下载格式列表。
+    ///
+    /// 先整体 clone 再清空大字段，避免逐字段手抄时新增字段被漏掉。
     pub fn to_lite(&self) -> Self {
-        Self {
-            id: self.id.clone(),
-            kind: self.kind,
-            title: self.title.clone(),
-            path: self.path.clone(),
-            url: self.url.clone(),
-            site: self.site.clone(),
-            host: self.host.clone(),
-            status: self.status,
-            percent: self.percent,
-            error: self.error.clone(),
-            speed: self.speed.clone(),
-            eta: self.eta.clone(),
-            file: self.file.clone(),
-            log: VecDeque::new(),
-            meta: self.meta.to_lite(),
-            thumb: self.thumb.clone(),
-            rot_angle: self.rot_angle,
-            format_id: self.format_id.clone(),
-            audio_only: self.audio_only,
-            updated_at: self.updated_at.clone(),
-            sections: self.sections.clone(),
-        }
+        let mut lite = self.clone();
+        lite.log.clear();
+        lite.meta.download_formats.clear();
+        lite
     }
 
     /// 日志追加，保留最近 `MAX_LOG_LINES` 行（300）。
@@ -482,7 +437,7 @@ impl MediaItem {
 /// 允许的迁移：
 /// ```text
 /// Probing -> Ready | Failed | Canceled | NeedLogin
-/// Ready   -> Downloading | Transcoding | Merging | Canceled
+/// Ready   -> Downloading | Transcoding | Merging | Canceled | Probing（登录后重新解析刷新格式）
 /// Downloading -> PostProcessing | Failed | Canceled | NeedLogin | Done
 /// PostProcessing -> Done | Failed | Canceled
 /// Transcoding -> Done | Failed | Canceled | Ready(任务结束恢复)
@@ -505,6 +460,8 @@ pub fn transition(from: Status, to: Status) -> Result<Status, crate::CoreError> 
         | (Status::Ready, Status::Transcoding)
         | (Status::Ready, Status::Merging)
         | (Status::Ready, Status::Canceled)
+        // 登录完成后刷新已就绪条目的格式列表（重新解析）
+        | (Status::Ready, Status::Probing)
         | (Status::Downloading, Status::PostProcessing)
         | (Status::Downloading, Status::Failed)
         | (Status::Downloading, Status::Canceled)
@@ -705,8 +662,12 @@ mod tests {
     }
 
     #[test]
-    fn transition_ready_to_probing_rejected() {
-        assert!(transition(Status::Ready, Status::Probing).is_err());
+    fn transition_ready_to_probing_allowed_for_refresh() {
+        // 登录完成后需要把 Ready 条目重新解析，以刷新受限清晰度的格式列表
+        assert_eq!(
+            transition(Status::Ready, Status::Probing).unwrap(),
+            Status::Probing
+        );
     }
 
     #[test]

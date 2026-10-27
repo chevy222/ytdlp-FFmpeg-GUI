@@ -2,16 +2,17 @@
 
 use super::{
     default_output_dir, ensure_main_window, log_error_lines, log_item, now_str, persist,
-    restore_status, transition_in, update_item, update_progress, CmdResult, ProgressPayload,
-    SlotGuard,
+    prepare_batch, restore_status, spawn_product_thumb, transition_in, update_item,
+    update_progress, CmdResult, ProgressPayload, SlotGuard,
 };
 use crate::state::AppState;
+use std::collections::HashMap;
 use tauri::{AppHandle, Emitter, Manager};
 use ytdlp_core::download::probe_output;
-use ytdlp_core::model::{ItemKind, MediaItem, Status};
+use ytdlp_core::model::{ItemKind, MediaItem, MediaMeta, Status};
 use ytdlp_core::transcode::{self, TranscodeParams};
 use ytdlp_core::worker::SubmitOutcome;
-use ytdlp_core::{transition, CoreError};
+use ytdlp_core::CoreError;
 
 /// 批量转码（TC-05：按 设置-转码/通用 默认参数执行，不弹确认窗）。
 #[tauri::command(async)]
@@ -29,84 +30,102 @@ pub fn start_transcode(
 #[tauri::command(async)]
 pub fn start_upscale(app: AppHandle, win: tauri::WebviewWindow, ids: Vec<String>) -> CmdResult<()> {
     ensure_main_window(&win)?;
-    // 放大意图的登记放在 begin_transcode 里、与"状态成功改到 Transcoding"同一处
+    // 放大目标在 begin_transcode 里、与"状态成功改到 Transcoding"同一处登记
     // （只有真正会入队的 id 才登记）：预检跳过 / 条目不存在 / 早退的 id 从不登记，
     // 从根上消除"登记了但没人消费"的残留（历史 bug：残留的 true 会让之后对同一
     // id 的普通转码被误放大）。清理点见 cancel_item，消费点见 run_transcode_task 入口。
     begin_transcode(app, ids, true)
 }
 
+/// 放大到 1080P 的目标尺寸（旋转后的输出宽高，偶数对齐）。
+/// Err 表示无需放大（已达 1080P）或分辨率未知 —— 调用方应直接跳过任务，
+/// 而不是继续走一次普通转码。
+fn upscale_target(meta: &MediaMeta, rot_deg: u16) -> Result<(u32, u32), String> {
+    let (w, h) = match (meta.width, meta.height) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => (w, h),
+        _ => return Err("源分辨率未知".into()),
+    };
+    let long = w.max(h) as f32;
+    let short = w.min(h) as f32;
+    let s = (1920.0 / long).min(1080.0 / short);
+    if s <= 1.0 {
+        return Err("源已达 1080P 以上".into());
+    }
+    let tw = ((w as f32 * s) / 2.0).floor() as u32 * 2;
+    let th = ((h as f32 * s) / 2.0).floor() as u32 * 2;
+    if tw == 0 || th == 0 {
+        return Err("计算出的目标尺寸无效".into());
+    }
+    // 旋转 90/270° 时输出宽高互换（transpose 后方向相反）
+    Ok(if rot_deg == 90 || rot_deg == 270 {
+        (th, tw)
+    } else {
+        (tw, th)
+    })
+}
+
 /// 转码入口（start_transcode / start_upscale 共用）。
-/// `upscale=true` 时把通过的 id 登记进 `AppState.upscale_ids`。
+/// `upscale=true` 时把通过的 id 与目标尺寸登记进 `AppState.upscale_targets`。
 fn begin_transcode(app: AppHandle, ids: Vec<String>, upscale: bool) -> CmdResult<()> {
     let state = app.state::<AppState>();
     if ids.is_empty() {
         return Err("未选择条目".into());
     }
-    let mut to_run = Vec::new();
     // 同 start_merge：跳过日志出锁后再写，避免 history 锁重入死锁
-    let mut skipped: Vec<(String, String)> = Vec::new();
-    // 锁内分两段：先做存在性预检（收集条目），全部通过后再改状态。
-    // 旧写法在循环内"边校验边改状态"，第 N 个 id 不存在时直接 return，
-    // 前 N-1 个已被写成 Transcoding 并 emit，既没进队列也没执行体，
-    // 永久卡死（remove/retry 都不接受非终态）。
-    let mut updated_items: Vec<MediaItem> = Vec::new();
-    {
+    let (accepted, skipped) = {
         let mut hist = state.history.lock();
-        // 第一段：存在性预检 + 收集（不改任何状态）
-        let mut items: Vec<(String, MediaItem)> = Vec::with_capacity(ids.len());
-        for id in &ids {
-            let Some(item) = hist.get(id).cloned() else {
-                return Err(format!("条目不存在：{id}"));
-            };
-            items.push((id.clone(), item));
-        }
-        // 第二段：统一改状态
-        for (id, item) in items {
-            let has_file = item
-                .path
-                .as_deref()
-                .map(|p| std::path::Path::new(p).is_file())
-                .unwrap_or(false);
-            if !has_file {
-                skipped.push((
-                    id,
-                    "转码被跳过：无本地输入文件（先下载或添加本地文件）".into(),
-                ));
-                continue;
-            }
-            match transition(item.status, Status::Transcoding) {
-                Ok(to) => {
-                    // 放大意图与"真正入队"绑定登记（见 start_upscale 的注释）：
-                    // 登记与消费之间不存在被跳过/早退的悬空窗口
-                    if upscale {
-                        state.upscale_ids.lock().insert(id.clone());
-                    }
-                    // 进入新任务前进度归零：否则上一轮下载/转码的 100% 会一直挂在进度列
-                    let updated = MediaItem {
-                        status: to,
-                        percent: 0.0,
-                        ..item
-                    };
-                    hist.upsert(updated.clone());
-                    updated_items.push(updated);
-                    to_run.push(id);
+        let mut upscale_targets: HashMap<String, (u32, u32)> = HashMap::new();
+        let (accepted, skipped) = prepare_batch(
+            &mut hist,
+            &ids,
+            Status::Transcoding,
+            "转码被跳过",
+            |item| {
+                let has_file = item
+                    .path
+                    .as_deref()
+                    .map(|p| std::path::Path::new(p).is_file())
+                    .unwrap_or(false);
+                if !has_file {
+                    return Err("无本地输入文件（先下载或添加本地文件）".into());
                 }
-                Err(e) => skipped.push((id, format!("转码被跳过：{e}"))),
+                if upscale {
+                    // 已达 1080P / 分辨率未知：直接跳过任务，不再走一次完整转码
+                    let size = upscale_target(&item.meta, item.rot_angle.degrees())?;
+                    upscale_targets.insert(item.id.clone(), size);
+                }
+                Ok(())
+            },
+        )?;
+        // 放大目标与"真正入队"绑定登记：只登记成功 transition 的条目
+        if upscale {
+            let mut targets = state.upscale_targets.lock();
+            for item in &accepted {
+                if let Some(size) = upscale_targets.get(&item.id) {
+                    targets.insert(item.id.clone(), *size);
+                }
             }
         }
-    }
+        (accepted, skipped)
+    };
     // 出锁后统一 emit：避免持锁派发事件，也消除了旧写法每条一次
     // drop(hist)→emit→re-lock 的抖动（批量 50 条 = 50 轮锁释放+获取）
-    for updated in &updated_items {
+    for updated in &accepted {
         let _ = app.emit("item:update", updated);
     }
     for (id, msg) in &skipped {
         log_item(&app, id, msg.as_str());
     }
+    let to_run: Vec<String> = accepted.iter().map(|i| i.id.clone()).collect();
     if to_run.is_empty() {
         // 先落盘再返回：上面的 skipped 日志已写入内存 history，不 persist 会在重启后丢失
         persist(&app);
+        if upscale {
+            // 放大预检全部跳过时，把更具体的原因（已达 1080P / 分辨率未知）带回前端
+            if let Some((_, msg)) = skipped.first() {
+                return Err(msg.clone());
+            }
+        }
         return Err("没有可转码的条目（需要已解析的本地文件）".into());
     }
     for id in to_run {
@@ -138,10 +157,10 @@ pub(super) fn run_transcode_task(app: AppHandle, id: String) {
         app: app.clone(),
         id: id.clone(),
     };
-    // 放大意图在入口一次性消费：无论后面走哪条提前返回路径（条目被删 /
+    // 放大目标在入口一次性消费：无论后面走哪条提前返回路径（条目被删 /
     // 无本地文件），登记都已清除；排队中被取消的任务根本进不到这里，由
     // cancel_item 负责清理。残留登记会让后续普通转码被误放大到 1080P。
-    let upscale = state.upscale_ids.lock().remove(&id);
+    let upscale_size = state.upscale_targets.lock().remove(&id);
     // 锁纪律（§11.15）：history 锁内只 clone 条目，config/cli/default_output_dir
     // 一律出锁后再取（P1-3：持 history 锁期间嵌套取 config/cli 锁会让 update_item 卡顿）。
     //
@@ -203,63 +222,26 @@ pub(super) fn run_transcode_task(app: AppHandle, id: String) {
             ),
         );
     }
-    // 放大到 1080P：upscale 标记已在函数入口一次性消费（见上）。
-    // 在 Rust 侧用 ffprobe 已探测的分辨率计算固定目标宽高（偶数对齐），
-    // 不用 ffmpeg 表达式——表达式里 if()/min() 的逗号会被 filtergraph 解析器
-    // 误判为滤波器分隔符（scale_qsv 选项值的单引号不转义逗号），导致 EXIT=127。
+    // 放大目标已在 begin_transcode 预检时算好（无需放大/分辨率未知的条目
+    // 根本不会入队）。这里只记录目标尺寸，供任务日志回看。
     let rot_deg = item.rot_angle.degrees();
-    let force_scale = if upscale {
-        match (meta.width, meta.height) {
-            (Some(w), Some(h)) if w > 0 && h > 0 => {
-                let long = w.max(h) as f32;
-                let short = w.min(h) as f32;
-                let s = (1920.0 / long).min(1080.0 / short);
-                if s > 1.0 {
-                    // 不旋转时的目标宽高（偶数对齐）
-                    let tw = ((w as f32 * s) / 2.0).floor() as u32 * 2;
-                    let th = ((h as f32 * s) / 2.0).floor() as u32 * 2;
-                    // 旋转 90/270° 时输出宽高互换（vpp_qsv/transpose 后方向相反）；
-                    // 0/180° 不互换。force_scale 存的是"旋转后的输出尺寸"。
-                    let (tw, th) = if rot_deg == 90 || rot_deg == 270 {
-                        (th, tw)
-                    } else {
-                        (tw, th)
-                    };
-                    if tw > 0 && th > 0 {
-                        log_item(
-                            &app,
-                            &id,
-                            format!(
-                                "放大到 1080P：源 {w}×{h}{} → 输出 {tw}×{th}（缩放比 {:.2}x）",
-                                if rot_deg != 0 {
-                                    format!("（旋转{rot_deg}°）")
-                                } else {
-                                    String::new()
-                                },
-                                s
-                            ),
-                        );
-                        Some((tw, th))
-                    } else {
-                        None
-                    }
+    let force_scale = upscale_size;
+    if let Some((tw, th)) = force_scale {
+        log_item(
+            &app,
+            &id,
+            format!(
+                "放大到 1080P：源 {}×{}{} → 输出 {tw}×{th}",
+                meta.width.unwrap_or(0),
+                meta.height.unwrap_or(0),
+                if rot_deg != 0 {
+                    format!("（旋转{rot_deg}°）")
                 } else {
-                    log_item(
-                        &app,
-                        &id,
-                        format!("放大到 1080P：源 {w}×{h} 已达 1080P 以上，跳过放大"),
-                    );
-                    None
-                }
-            }
-            _ => {
-                log_item(&app, &id, "放大到 1080P：源分辨率未知，跳过放大");
-                None
-            }
-        }
-    } else {
-        None
-    };
+                    String::new()
+                },
+            ),
+        );
+    }
     let params = TranscodeParams {
         input: path.clone(),
         out_dir,
@@ -319,9 +301,8 @@ fn finish_transcode(app: &AppHandle, id: &str, result: Result<std::path::PathBuf
         }
     };
     update_item(app, id, |it| {
-        // P1-3：cancel_item 抢先写成 Canceled，但转码实际已完成。
-        // transition(Canceled → Ready/Done) 不在白名单，静默拒绝后条目永久停在
-        // "已取消"，而产物已作为新条目回列表。显式覆盖为恢复状态。
+        // cancel_item 抢先写成 Canceled，但转码实际已完成。状态机已允许
+        // Canceled → Ready/Done，这里显式覆盖是为了额外写一条完成日志。
         if it.status == Status::Canceled && final_status == Status::Done {
             it.status = orig_status;
             it.push_log("取消请求到达时转码已完成".to_string());
@@ -359,33 +340,7 @@ fn finish_transcode(app: &AppHandle, id: &str, result: Result<std::path::PathBuf
         prod.updated_at = now_str();
         state.history.lock().upsert(prod.clone());
         // 产物缩略图：从最终产物抽帧（与下载完成兜底同链路）
-        {
-            let app2 = app.clone();
-            let pid = prod.id.clone();
-            let cache_dir = state.paths.cache_dir();
-            let resolver2 = state.resolver();
-            let out2 = out.clone();
-            let cover_idx = prod.meta.cover_stream_index;
-            // spawn_blocking：内部是 ffmpeg 子进程（阻塞）
-            tauri::async_runtime::spawn_blocking(move || {
-                let dest = ytdlp_core::thumbs::thumb_path(&cache_dir, &pid);
-                if ytdlp_core::thumbs::ensure_thumb(
-                    &resolver2,
-                    &out2,
-                    &dest,
-                    cover_idx.map(|i| i as usize),
-                    &mut |_| {},
-                )
-                .is_ok()
-                {
-                    update_item(&app2, &pid, |it| {
-                        it.thumb = Some(dest.to_string_lossy().into_owned());
-                    });
-                }
-                app2.state::<AppState>().persist();
-            });
-        }
-        let _ = app.emit("item:ready", serde_json::json!({ "id": prod.id }));
+        spawn_product_thumb(app, prod.id.clone(), out.clone(), prod.meta.cover_stream_index);
         let _ = app.emit("list:changed", ());
     }
     // 清理取消标志（并发 slot 由调用方的 SlotGuard 释放），启动下一个等待任务

@@ -233,7 +233,10 @@ fn finish_login(app: &AppHandle, host: &str) {
     if let Some(win) = app.get_webview_window("ytdlp-login") {
         let _ = win.close();
     }
-    // 通知前端（触发 NeedLogin 条目自动重解析）
+    // 后端统一重解析：NeedLogin 与"未登录也能解析受限清晰度"的 Ready 条目
+    // 都要重新拉格式列表，否则登录后格式弹窗仍是旧的低清晰度版本。
+    crate::commands::reprobe_items_for_host(app, host);
+    // 通知前端（后端已发起重解析）
     let _ = app.emit("login:done", serde_json::json!({ "host": host }));
 }
 

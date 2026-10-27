@@ -2,7 +2,7 @@
 //!
 //! 输出 H.265（QSV/NVENC/AMF/libx265），支持：手动旋转（条目 rot_angle，TC-04）、
 //! 分辨率上限（MAXW/MAXH）、码率封顶、音量归一化（增益上限，通用段）、保留封面、
-//! 文件名模板（下载段共用）+ 碰撞安全命名（auto_inc/skip）、取消清理输出残留（UL-06）。
+//! 文件名模板（下载/转码共用）+ 碰撞安全命名（auto_inc/skip）、取消清理输出残留（UL-06）。
 //! x265 CRF 固定 23（不落配置，TC 需求）。
 //!
 //! 进度：`ffmpeg -progress pipe:1 -nostats`，按 `out_time_us` 相对探测时长换算百分比。
@@ -69,7 +69,7 @@ pub struct TranscodeParams {
     pub out_dir: PathBuf,
     /// 输出命名标题（文件名模板输入）
     pub title: String,
-    /// 文件名模板：纯标题/标题+ID/UP主-标题/日期-标题（下载段共用）
+    /// 文件名模板：纯标题/标题+ID/UP主-标题/日期-标题（下载/转码共用）
     pub filename_template: String,
     /// 容器：mp4 | mkv（P0 仅两者，§TC-12）
     pub container: String,
@@ -110,7 +110,7 @@ impl TranscodeParams {
     }
 }
 
-/// 文件名模板（§设置-下载，下载/转码/合并输出共用）。
+/// 文件名模板（§设置-下载，下载/转码共用；合并名称在合并面板单独填写）。
 ///
 /// - 纯标题：`{title}`
 /// - 标题+ID：`{title}-{id 前 8 位}`
@@ -636,8 +636,15 @@ pub fn build_args_for_tier(
                 }
             }
         }
-        TranscodeTier::GpuQsv => {
-            if let Some(f) = &gpu_vf {
+        // GpuQsv / HybridQsv 的映射与封面处理完全相同，只有主视频滤镜来源不同
+        // （全 GPU 用 vpp_qsv/scale_qsv；混合层多一步 hwdownload）。
+        TranscodeTier::GpuQsv | TranscodeTier::HybridQsv => {
+            let main_filter = if tier == TranscodeTier::GpuQsv {
+                gpu_vf.as_ref()
+            } else {
+                hybrid_main.as_ref()
+            };
+            if let Some(f) = main_filter {
                 args.push("-filter:v:0".into());
                 args.push(f.clone());
             }
@@ -648,27 +655,6 @@ pub fn build_args_for_tier(
             if rotated {
                 if let Some(ci) = cover_idx {
                     // 封面从第二软件输入取，CPU 滤镜旋转
-                    args.push("-map".into());
-                    args.push(format!("1:{ci}?"));
-                    args.push("-filter:v:1".into());
-                    args.push(cpu_vf_for_cover());
-                }
-            } else if let Some(ci) = cover_idx {
-                args.push("-map".into());
-                args.push(format!("0:{ci}?"));
-            }
-        }
-        TranscodeTier::HybridQsv => {
-            if let Some(f) = &hybrid_main {
-                args.push("-filter:v:0".into());
-                args.push(f.clone());
-            }
-            args.push("-map".into());
-            args.push(format!("{main_label}?"));
-            args.push("-map".into());
-            args.push("0:a:0?".into());
-            if rotated {
-                if let Some(ci) = cover_idx {
                     args.push("-map".into());
                     args.push(format!("1:{ci}?"));
                     args.push("-filter:v:1".into());
@@ -715,20 +701,25 @@ pub fn build_args_for_tier(
             args.push("-tag:v:0".into());
             args.push("hvc1".into());
         }
-        if rotated && cover_idx.is_some() {
-            // 旋转过的封面已重编码，显式标回 attached_pic
-            args.push("-c:v:1".into());
-            args.push("mjpeg".into());
-            args.push("-q:v:1".into());
-            args.push("2".into());
-            args.push("-disposition:v:1".into());
-            args.push("attached_pic".into());
-        } else if cover_idx.is_some() {
-            args.push("-c:v:1".into());
-            args.push("copy".into());
+    } else {
+        // 非 QSV（libx265 / nvenc / amf）：CRF/CQ/QP 管画质，
+        // maxrate/bufsize 兑现"码率封顶"。此前该设置只在 QSV 分支生效，
+        // 显式编码器等于完全忽略用户配置的封顶值。
+        if let Some(cap) = params.brcap_kbps.filter(|c| *c > 0) {
+            let kb = meta
+                .vbitrate_kbps
+                .filter(|b| *b > 0)
+                .map(|src| src.min(cap))
+                .unwrap_or(cap);
+            args.push("-maxrate".into());
+            args.push(format!("{kb}k"));
+            args.push("-bufsize".into());
+            args.push(format!("{}k", kb.saturating_mul(2)));
         }
-    } else if cover_idx.is_some() {
+    }
+    if cover_idx.is_some() {
         if rotated {
+            // 旋转过的封面已重编码，显式标回 attached_pic
             args.push("-c:v:1".into());
             args.push("mjpeg".into());
             args.push("-q:v:1".into());
@@ -829,6 +820,18 @@ pub(crate) fn parse_out_time_us(line: &str) -> Option<u64> {
         }
     }
     None
+}
+
+/// 按 ffmpeg `-progress` 行与总时长换算百分比（下载后处理/转码/合并共用）。
+///
+/// `max` 是各链路允许的上限（合并拼接阶段留 1% 给收尾，因此传 99）。
+/// 时长未知时返回 None，调用方不做进度换算。
+pub(crate) fn progress_percent(line: &str, duration: f64, max: f32) -> Option<f32> {
+    if duration <= 0.0 {
+        return None;
+    }
+    let us = parse_out_time_us(line)?;
+    Some(((us as f64 / 1e6) / duration * 100.0).clamp(0.0, max as f64) as f32)
 }
 
 /// 执行转码。
@@ -992,11 +995,8 @@ fn run_transcode_once(
             on_progress(100.0);
             return;
         }
-        if let Some(us) = parse_out_time_us(line) {
-            if duration > 0.0 {
-                let pct = ((us as f64 / 1e6) / duration * 100.0).clamp(0.0, 100.0) as f32;
-                on_progress(pct);
-            }
+        if let Some(pct) = progress_percent(line, duration, 100.0) {
+            on_progress(pct);
         }
     })?;
 
@@ -1186,6 +1186,33 @@ mod tests {
     }
 
     #[test]
+    fn software_encoder_honors_bitrate_cap() {
+        // 码率封顶不能只在 QSV 分支生效：libx265/NVENC/AMF 也要有 maxrate/bufsize。
+        let mut params = mk();
+        params.brcap_kbps = Some(5000);
+        let meta = MediaMeta {
+            vbitrate_kbps: Some(12_000),
+            ..Default::default()
+        };
+        let args = build_args(&ToolResolver::default(), &params, &meta).unwrap();
+        let joined = args.join(" ");
+        assert!(joined.contains("-maxrate 5000k"), "{}", joined);
+        assert!(joined.contains("-bufsize 10000k"), "{}", joined);
+
+        // 源码率低于封顶值时跟随源码率（与 QSV 分支同口径）
+        let meta = MediaMeta {
+            vbitrate_kbps: Some(2_000),
+            ..Default::default()
+        };
+        let args = build_args(&ToolResolver::default(), &params, &meta).unwrap();
+        assert!(args.join(" ").contains("-maxrate 2000k"));
+
+        // 源码率未知时直接使用封顶值
+        let args = build_args(&ToolResolver::default(), &params, &MediaMeta::default()).unwrap();
+        assert!(args.join(" ").contains("-maxrate 5000k"));
+    }
+
+    #[test]
     fn zero_gain_limit_keeps_audio_copy() {
         // max_gain_db=0：需要增益但实际增益为 0，不应重编码音频
         let mut params = mk();
@@ -1290,6 +1317,22 @@ mod tests {
         let hw = parse_encoders_output(&text);
         assert!(hw.qsv && hw.nvenc && !hw.amf);
         assert!(!parse_encoders_output("V....D libx265").qsv);
+    }
+
+    #[test]
+    fn progress_percent_clamps_and_handles_unknown_duration() {
+        let p = progress_percent("out_time_us=2000000", 10.0, 100.0).unwrap();
+        assert!((p - 20.0).abs() < 1e-4, "{}", p);
+        assert_eq!(
+            progress_percent("out_time_us=20000000", 10.0, 100.0),
+            Some(100.0)
+        );
+        assert_eq!(
+            progress_percent("out_time_us=20000000", 10.0, 99.0),
+            Some(99.0)
+        );
+        assert_eq!(progress_percent("out_time_us=1", 0.0, 100.0), None);
+        assert_eq!(progress_percent("noise", 10.0, 100.0), None);
     }
 
     #[test]

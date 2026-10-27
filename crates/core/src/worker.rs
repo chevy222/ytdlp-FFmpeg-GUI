@@ -90,6 +90,11 @@ impl TaskQueue {
         self.waiting.len() != before
     }
 
+    /// 清空等待队列并返回被移除的 id（进程退出时用：不再启动任何排队任务）。
+    pub fn drain_waiting(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.waiting).into_iter().collect()
+    }
+
     pub fn running_count(&self) -> usize {
         self.running.len()
     }
@@ -156,6 +161,20 @@ mod tests {
         assert!(q.cancel_waiting("b"));
         assert!(!q.cancel_waiting("b"));
         assert_eq!(q.waiting_count(), 0);
+    }
+
+    #[test]
+    fn drain_waiting_keeps_running() {
+        let mut q = TaskQueue::new(1);
+        q.submit("a");
+        q.submit("b");
+        q.submit("c");
+        let drained = q.drain_waiting();
+        assert_eq!(drained, vec!["b".to_string(), "c".to_string()]);
+        assert_eq!(q.waiting_count(), 0);
+        assert_eq!(q.running_count(), 1);
+        // 释放 slot 时已经没有等待任务可启动
+        assert_eq!(q.finish("a"), None);
     }
 
     #[test]

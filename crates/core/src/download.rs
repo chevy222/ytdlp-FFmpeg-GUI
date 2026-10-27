@@ -46,10 +46,10 @@ pub struct DownloadParams {
 }
 
 /// 文件名模板 → yt-dlp 输出模板（DL-10）。
-pub fn output_template(tmpl: &str, playlist: bool) -> &'static str {
-    if playlist {
-        return "%(playlist_title)s/%(playlist_index)s - %(title)s.%(ext)s";
-    }
+///
+/// 播放列表在解析阶段已展开为逐集 URL，下载任务永远是单视频：
+/// 这里不再有 playlist 模板分支，避免把 `%(playlist_title)s` 套到普通下载上。
+pub fn output_template(tmpl: &str) -> &'static str {
     match tmpl {
         "标题+ID" => "%(title)s [%(id)s].%(ext)s",
         "UP主-标题" => "%(uploader)s - %(title)s.%(ext)s",
@@ -122,8 +122,8 @@ pub fn build_args(url: &str, p: &DownloadParams, cfg: &DownloadConfig) -> Vec<St
     // 合并容器统一 MP4
     args.push("--merge-output-format".into());
     args.push("mp4".into());
-    // 输出
-    let tmpl = output_template(&p.filename_template, cfg.playlist);
+    // 输出（播放列表已在解析阶段展开，下载任务一律按单视频命名）
+    let tmpl = output_template(&p.filename_template);
     let out = p.out_dir.join(tmpl);
     args.push("-o".into());
     args.push(out.to_string_lossy().into_owned());
@@ -160,12 +160,10 @@ pub fn build_args(url: &str, p: &DownloadParams, cfg: &DownloadConfig) -> Vec<St
         args.push("--audio-quality".into());
         args.push("0".into());
     }
-    // 播放列表
-    if cfg.playlist {
-        args.push("--yes-playlist".into());
-    } else {
-        args.push("--no-playlist".into());
-    }
+    // 播放列表：解析阶段已展开为逐集任务，下载永远只处理当前 URL。
+    // 不能再用全局 cfg.playlist 决定 --yes-playlist，否则父条目会把整个列表
+    // 再下载一遍（同时各集条目也在下载）。
+    args.push("--no-playlist".into());
     // 代理
     if let Some(proxy) = &p.proxy {
         if !proxy.is_empty() {
@@ -420,36 +418,7 @@ fn cleanup_cancelled_outputs(
     merged: &[PathBuf],
     started: std::time::SystemTime,
 ) {
-    let is_new = |p: &Path| -> bool { file_newness(p).map(|t| t >= started).unwrap_or(false) };
-    for p in extracted.iter().chain(merged.iter()).chain(dests.iter()) {
-        if p.is_file() && is_new(p) {
-            let _ = std::fs::remove_file(p);
-        }
-        let dir = match p.parent() {
-            Some(d) => d,
-            None => continue,
-        };
-        let name = match p.file_name().and_then(|s| s.to_str()) {
-            Some(n) => n.to_string(),
-            None => continue,
-        };
-        let part_prefix = format!("{name}.part");
-        let ytdl_name = format!("{name}.ytdl");
-        let rd = match std::fs::read_dir(dir) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        for entry in rd.flatten() {
-            let ep = entry.path();
-            let en = match ep.file_name().and_then(|s| s.to_str()) {
-                Some(s) => s.to_string(),
-                None => continue,
-            };
-            if (en.starts_with(&part_prefix) || en == ytdl_name) && is_new(&ep) {
-                let _ = std::fs::remove_file(&ep);
-            }
-        }
-    }
+    cleanup_task_outputs(extracted, dests, merged, started, true);
 }
 
 /// 失败（非取消）时的残留清理：只删**本任务时间窗内**新写的 `.part`/`.ytdl`
@@ -460,8 +429,24 @@ fn cleanup_partial_files(
     merged: &[PathBuf],
     started: std::time::SystemTime,
 ) {
+    cleanup_task_outputs(extracted, dests, merged, started, false);
+}
+
+/// 取消/失败共用的残留清理：
+/// - `delete_completed=true`（取消）：删除本任务时间窗内新写的正式产物；
+/// - `false`（失败）：只删 `.part`/`.ytdl` 半成品，保留已成功落盘的文件。
+fn cleanup_task_outputs(
+    extracted: &[PathBuf],
+    dests: &[PathBuf],
+    merged: &[PathBuf],
+    started: std::time::SystemTime,
+    delete_completed: bool,
+) {
     let is_new = |p: &Path| -> bool { file_newness(p).map(|t| t >= started).unwrap_or(false) };
     for p in extracted.iter().chain(merged.iter()).chain(dests.iter()) {
+        if delete_completed && p.is_file() && is_new(p) {
+            let _ = std::fs::remove_file(p);
+        }
         let (Some(dir), Some(name)) = (p.parent(), p.file_name().and_then(|s| s.to_str())) else {
             continue;
         };
@@ -855,11 +840,8 @@ pub fn post_process(
     let mut guard = ChildGuard::spawn(&mut cmd)?;
     let duration = meta.duration_secs.unwrap_or(0.0);
     let outcome = crate::exec::stream_lines(&mut guard, cancel, None, |line| {
-        if let Some(us) = crate::transcode::parse_out_time_us(line) {
-            if duration > 0.0 {
-                let pct = ((us as f64 / 1e6) / duration * 100.0).clamp(0.0, 100.0) as f32;
-                on_progress(pct);
-            }
+        if let Some(pct) = crate::transcode::progress_percent(line, duration, 100.0) {
+            on_progress(pct);
         }
     })?;
     if outcome.killed || cancel.load(Ordering::Relaxed) {
@@ -1024,21 +1006,20 @@ mod tests {
 
     #[test]
     fn output_template_mapping() {
-        assert_eq!(output_template("纯标题", false), "%(title)s.%(ext)s");
+        assert_eq!(output_template("纯标题"), "%(title)s.%(ext)s");
         assert_eq!(
-            output_template("标题+ID", false),
+            output_template("标题+ID"),
             "%(title)s [%(id)s].%(ext)s"
         );
         assert_eq!(
-            output_template("UP主-标题", false),
+            output_template("UP主-标题"),
             "%(uploader)s - %(title)s.%(ext)s"
         );
         assert_eq!(
-            output_template("日期-标题", false),
+            output_template("日期-标题"),
             "%(upload_date)s %(title)s.%(ext)s"
         );
-        assert_eq!(output_template("未知", false), "%(title)s.%(ext)s");
-        assert!(output_template("纯标题", true).contains("playlist"));
+        assert_eq!(output_template("未知"), "%(title)s.%(ext)s");
     }
 
     #[test]
@@ -1085,6 +1066,20 @@ mod tests {
         assert!(joined.ends_with("https://example.com/v"));
         // --ignore-errors 会让失败仍以 0 退出，不能加（否则失败被当成功）
         assert!(!joined.contains("--ignore-errors"), "{}", joined);
+    }
+
+    #[test]
+    fn build_args_ignores_global_playlist_flag() {
+        // 播放列表在解析阶段已展开：下载参数必须永远是 --no-playlist，
+        // 输出模板也不能带 playlist 字段（否则父条目会再下载一遍整个列表）。
+        let mut cfg = DownloadConfig::default();
+        cfg.playlist = true;
+        let args = build_args("https://example.com/list", &params(), &cfg);
+        let joined = args.join(" ");
+        assert!(joined.contains("--no-playlist"), "{}", joined);
+        assert!(!joined.contains("--yes-playlist"), "{}", joined);
+        assert!(!joined.contains("playlist_title"), "{}", joined);
+        assert!(!joined.contains("playlist_index"), "{}", joined);
     }
 
     #[test]

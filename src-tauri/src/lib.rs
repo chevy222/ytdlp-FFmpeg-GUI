@@ -7,8 +7,15 @@ mod login;
 mod login_win;
 mod state;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
 use tauri::Manager;
 use ytdlp_core::model::Status;
+
+/// 退出流程只允许进入一次：`app.exit(0)` 会再次触发 `ExitRequested`，
+/// 第二次不能再 `prevent_exit`，否则永远退不出去。
+static EXITING: AtomicBool = AtomicBool::new(false);
 
 /// 初始化落盘日志与 panic 钩子（GUI 无控制台，异常现场只能落盘）。
 ///
@@ -213,17 +220,62 @@ pub fn run() {
             std::process::exit(1);
         }
     };
-    // 退出兜底（异步 persist 的补丁）：命令层的 persist 已全部改为异步写盘
-    // （spawn 线程 + 500ms 去抖，不为写盘延迟卡住 UI 线程），进程退出不会等
-    // 这些线程。这里在退出请求时同步写一次（单次 fsync，毫秒级），保证
-    // "点取消/旋转后立即关窗口"的最后一批状态不丢。
+    // 退出兜底：先拦截退出，取消所有任务、清空等待队列，等运行中的子进程
+    // 收尾后再真正退出；同时同步写一次 history（异步 persist 不会在进程退出时等）。
     app.run(|app_handle, event| {
-        if let tauri::RunEvent::ExitRequested { .. } = event {
-            let st = app_handle.state::<state::AppState>();
-            // 读取失败的 history 只是空占位，退出时同样不能拿它覆盖原文件。
-            if !st.history_load_failed {
-                st.persist();
+        if let tauri::RunEvent::ExitRequested { api, .. } = event {
+            if EXITING.swap(true, Ordering::SeqCst) {
+                // app.exit(0) 触发的第二次 ExitRequested：放行
+                return;
             }
+            api.prevent_exit();
+            let app_for_exit = app_handle.clone();
+            {
+                let st = app_for_exit.state::<state::AppState>();
+                // 1) 通知所有任务/工具下载取消（看门狗会终止进程树）
+                {
+                    let cancels = st.cancels.lock();
+                    for flag in cancels.values() {
+                        flag.store(true, Ordering::Relaxed);
+                    }
+                }
+                // 2) 清空等待队列：任务结束释放 slot 时不能再启动新的排队任务
+                let _ = st.queue.lock().drain_waiting();
+            }
+            // 3) 立即终止已登记的子进程树（yt-dlp/ffmpeg/ffprobe），
+            //    避免进程退出后它们还在后台写盘。
+            ytdlp_core::exec::kill_all_children();
+            std::thread::spawn(move || {
+                // 4) 等待运行中的任务退出（最多 5 秒），再落盘并真正退出。
+                // 每轮重新扫一遍 cancels：收尾期间仍可能有任务刚注册取消标志
+                // （例如上一个任务释放 slot 时恰好启动了下一个），这些新标志
+                // 也必须被置位。
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    let running = app_for_exit
+                        .state::<state::AppState>()
+                        .queue
+                        .lock()
+                        .running_count();
+                    let pending = {
+                        let cancels = app_for_exit.state::<state::AppState>().cancels.lock();
+                        for flag in cancels.values() {
+                            flag.store(true, Ordering::Relaxed);
+                        }
+                        !cancels.is_empty()
+                    };
+                    if (running == 0 && !pending) || Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                let st = app_for_exit.state::<state::AppState>();
+                // 读取失败的 history 只是空占位，退出时同样不能拿它覆盖原文件。
+                if !st.history_load_failed {
+                    st.persist();
+                }
+                app_for_exit.exit(0);
+            });
         }
     });
 }

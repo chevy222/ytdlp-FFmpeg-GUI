@@ -2,8 +2,8 @@
 
 use super::{
     default_output_dir, ensure_main_window, log_error_lines, log_item, now_str, persist,
-    restore_status, today_stamp, transition_in, update_item, update_progress, CmdResult,
-    ProgressPayload, SlotGuard,
+    prepare_batch, restore_status, spawn_product_thumb, today_stamp, transition_in, update_item,
+    update_progress, CmdResult, ProgressPayload, SlotGuard,
 };
 use crate::state::AppState;
 use tauri::{AppHandle, Emitter, Manager};
@@ -11,7 +11,7 @@ use ytdlp_core::download;
 use ytdlp_core::merge::{self, MergeParams};
 use ytdlp_core::model::{ItemKind, MediaItem, Status};
 use ytdlp_core::worker::SubmitOutcome;
-use ytdlp_core::{transition, CoreError};
+use ytdlp_core::CoreError;
 
 /// 合并面板参数（MG-01/04：低频操作，仅面板内配置，不落 config.json）。
 #[derive(Debug, Clone)]
@@ -39,65 +39,37 @@ pub fn start_merge(
     if ids.len() < 2 {
         return Err("合并至少需要 2 个条目".into());
     }
-    let mut jobs = Vec::new();
     // 跳过原因出锁后再写日志：log_item → update_item 会再次 lock history，
     // std::sync::Mutex 不可重入，锁内调用会当场死锁（UI 永久冻结）
-    let mut skipped: Vec<(String, String)> = Vec::new();
-    // 锁内分两段：先做存在性预检（收集条目），全部通过后再改状态。
-    // 旧写法在循环内"边校验边改状态"，第 N 个 id 不存在时直接 return，
-    // 前 N-1 个已被写成 Merging 并 emit，既没进队列也没执行体，永久卡死。
-    let mut updated_items: Vec<MediaItem> = Vec::new();
-    {
+    let (accepted, skipped) = {
         let mut hist = state.history.lock();
-        // 第一段：存在性预检 + 收集（不改任何状态）
-        let mut items: Vec<(String, MediaItem)> = Vec::with_capacity(ids.len());
-        for id in &ids {
-            let Some(item) = hist.get(id).cloned() else {
-                return Err(format!("条目不存在：{id}"));
-            };
-            items.push((id.clone(), item));
-        }
-        // 第二段：统一改状态
-        for (id, item) in items {
+        prepare_batch(&mut hist, &ids, Status::Merging, "合并被跳过", |item| {
             let has_file = item
                 .path
                 .as_deref()
                 .map(|p| std::path::Path::new(p).is_file())
                 .unwrap_or(false);
-            if !has_file {
-                skipped.push((id, "合并被跳过：无本地输入文件".into()));
-                continue;
+            if has_file {
+                Ok(())
+            } else {
+                Err("无本地输入文件".into())
             }
-            match transition(item.status, Status::Merging) {
-                Ok(to) => {
-                    // 进入新任务前进度归零：否则上一轮下载/转码的 100% 会一直挂在进度列
-                    let updated = MediaItem {
-                        status: to,
-                        percent: 0.0,
-                        ..item
-                    };
-                    hist.upsert(updated.clone());
-                    updated_items.push(updated);
-                    jobs.push(id);
-                }
-                Err(e) => skipped.push((id, format!("合并被跳过：{e}"))),
-            }
-        }
-    }
+        })?
+    };
     // 出锁后统一 emit
-    for updated in &updated_items {
+    for updated in &accepted {
         let _ = app.emit("item:update", updated);
     }
-    for (id, msg) in skipped {
-        log_item(&app, &id, msg);
+    for (id, msg) in &skipped {
+        log_item(&app, id, msg.as_str());
     }
-    if jobs.len() < 2 {
+    if accepted.len() < 2 {
         // 上面已经把通过的条目改成 Merging 了：这里必须还原，否则它们永远卡在
         // "合并中"——既不在队列里（没有执行体），也不在终态（retry 只接受
         // 失败/已取消/需要登录），用户除了删条目没有别的出路。
-        for jid in &jobs {
-            let orig = restore_status(&app, jid);
-            update_item(&app, jid, |it| {
+        for item in &accepted {
+            let orig = restore_status(&app, &item.id);
+            update_item(&app, &item.id, |it| {
                 transition_in(it, orig);
                 it.error = Some("可合并条目不足 2 个，本次合并未执行".into());
             });
@@ -105,6 +77,7 @@ pub fn start_merge(
         persist(&app);
         return Err("可合并条目不足 2 个".into());
     }
+    let jobs: Vec<String> = accepted.iter().map(|i| i.id.clone()).collect();
     let norm = normalize.unwrap_or_else(|| state.config.lock().general.normalize_audio);
     let job = MergeJob {
         ids: jobs,
@@ -297,9 +270,8 @@ fn finish_merge(
         let err = err_text.clone();
         let pct = final_status == Status::Done;
         update_item(app, jid, |it| {
-            // P1-3：cancel_item 抢先写成 Canceled，但合并实际已完成。
-            // transition(Canceled → Ready/Done) 不在白名单，静默拒绝后条目
-            // 永久停在"已取消"，而产物已作为新条目回列表。显式覆盖为恢复状态。
+            // cancel_item 抢先写成 Canceled，但合并实际已完成。状态机已允许
+            // Canceled → Ready/Done，这里显式覆盖是为了额外写完成日志。
             if it.status == Status::Canceled && final_status == Status::Done {
                 it.status = orig;
                 if is_anchor {
@@ -337,33 +309,7 @@ fn finish_merge(
         prod.updated_at = now_str();
         state.history.lock().upsert(prod.clone());
         // 产物缩略图：从最终产物抽帧（与下载完成兜底同链路）
-        {
-            let app2 = app.clone();
-            let pid = prod.id.clone();
-            let cache_dir = state.paths.cache_dir();
-            let resolver2 = state.resolver();
-            let out2 = out.clone();
-            let cover_idx = prod.meta.cover_stream_index;
-            // spawn_blocking：内部是 ffmpeg 子进程（阻塞）
-            tauri::async_runtime::spawn_blocking(move || {
-                let dest = ytdlp_core::thumbs::thumb_path(&cache_dir, &pid);
-                if ytdlp_core::thumbs::ensure_thumb(
-                    &resolver2,
-                    &out2,
-                    &dest,
-                    cover_idx.map(|i| i as usize),
-                    &mut |_| {},
-                )
-                .is_ok()
-                {
-                    update_item(&app2, &pid, |it| {
-                        it.thumb = Some(dest.to_string_lossy().into_owned());
-                    });
-                }
-                app2.state::<AppState>().persist();
-            });
-        }
-        let _ = app.emit("item:ready", serde_json::json!({ "id": prod.id }));
+        spawn_product_thumb(app, prod.id.clone(), out.clone(), prod.meta.cover_stream_index);
         let _ = app.emit("list:changed", ());
     }
     {
