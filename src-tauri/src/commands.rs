@@ -465,6 +465,9 @@ pub(super) fn spawn_product_thumb(
     });
 }
 
+/// 批量预检结果：(接受的条目, 跳过的条目(id, 原因))。
+type BatchOutcome = Result<(Vec<MediaItem>, Vec<(String, String)>), String>;
+
 /// 批量任务预检 + 状态迁移（转码/合并共用）。
 ///
 /// 两段式：先确认所有 id 都存在（任一缺失直接报错，避免前 N-1 个已被改成
@@ -476,7 +479,7 @@ pub(super) fn prepare_batch(
     target: Status,
     skip_prefix: &str,
     mut check: impl FnMut(&MediaItem) -> Result<(), String>,
-) -> Result<(Vec<MediaItem>, Vec<(String, String)>), String> {
+) -> BatchOutcome {
     let mut items = Vec::with_capacity(ids.len());
     for id in ids {
         let Some(item) = hist.get(id).cloned() else {
