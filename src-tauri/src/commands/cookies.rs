@@ -15,12 +15,8 @@ pub fn list_cookies(
     let store = CookieStore::new(state.paths.cookies_dir());
     let mut out = Vec::new();
     for host in store.list_hosts().map_err(err_string)? {
-        let cookies = store.load_host(&host).map_err(err_string)?;
-        out.push(serde_json::json!({
-            "host": host,
-            "count": cookies.len(),
-            "expires_at": cookies.iter().filter_map(|c| c.expires).fold(0.0, f64::max),
-        }));
+        let count = store.load_host(&host).map_err(err_string)?.len();
+        out.push(serde_json::json!({ "host": host, "count": count }));
     }
     Ok(out)
 }
@@ -28,9 +24,8 @@ pub fn list_cookies(
 /// 保存 cookie 的核心逻辑（无窗口守卫，供 Rust 内部直接调用）。
 ///
 /// `handle_login_done` 从登录窗上下文调用此函数——登录窗的 webview label
-/// 不是 `main`，不能走命令层的 `ensure_main_window` 守卫。命令层
-/// [`save_cookies`] 加守卫后只允许主窗口调用，防止登录窗内的第三方页面
-/// 通过 `window.__TAURI__.invoke('save_cookies')` 覆写任意 host 的 cookie。
+/// 不是 `main`，不能走命令层的 `ensure_main_window` 守卫；因此该能力不暴露
+/// 为 IPC 命令，避免登录窗内的第三方页面覆写任意 host 的 cookie。
 pub(crate) fn save_cookies_inner(
     app: &AppHandle,
     host: &str,
@@ -42,17 +37,6 @@ pub(crate) fn save_cookies_inner(
     store.save_host(&normalized, cookies).map_err(err_string)?;
     let _ = app.emit("cookies:changed", normalized);
     Ok(())
-}
-
-#[tauri::command(async)]
-pub fn save_cookies(
-    app: AppHandle,
-    win: tauri::WebviewWindow,
-    host: String,
-    cookies: Vec<ytdlp_core::cookies::CookieEntry>,
-) -> CmdResult<()> {
-    ensure_main_window(&win)?;
-    save_cookies_inner(&app, &host, cookies)
 }
 
 /// 规范化 cookie 存储 host：YouTube 相关域名统一存 www.youtube.com.txt
@@ -72,7 +56,7 @@ fn normalize_cookie_host(host: &str) -> String {
 pub fn delete_cookie(app: AppHandle, win: tauri::WebviewWindow, host: String) -> CmdResult<()> {
     ensure_main_window(&win)?;
     let state = app.state::<AppState>();
-    // 与 save_cookies 同口径：库文件存的是规范化后的 host（www.youtube.com.txt），
+    // 与 save_cookies_inner 同口径：库文件存的是规范化后的 host（www.youtube.com.txt），
     // 传站点级域名（youtube.com）来删也必须命中 —— 否则 delete_host 见文件不存在
     // 直接返回 Ok，用户以为删掉了、实际还在，下次下载仍带着旧 Cookie。
     let normalized = normalize_cookie_host(&host);

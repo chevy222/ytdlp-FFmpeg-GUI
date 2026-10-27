@@ -107,15 +107,6 @@ impl TaskQueue {
     pub fn waiting_count(&self) -> usize {
         self.waiting.len()
     }
-
-    pub fn is_running(&self, id: &str) -> bool {
-        self.running.contains(id)
-    }
-
-    /// 当前占用总和（running + waiting）。
-    pub fn total(&self) -> usize {
-        self.running.len() + self.waiting.len()
-    }
 }
 
 #[cfg(test)]
@@ -140,7 +131,6 @@ mod tests {
         q.submit("c");
         let next = q.finish("a");
         assert_eq!(next.as_deref(), Some("c"));
-        assert!(q.is_running("c"));
         assert_eq!(q.running_count(), 2);
         assert_eq!(q.waiting_count(), 0);
     }
@@ -188,7 +178,6 @@ mod tests {
         assert_eq!(launched, vec!["b".to_string()]);
         assert_eq!(q.running_count(), 2);
         assert_eq!(q.waiting_count(), 1);
-        assert!(q.is_running("b"));
         // 再调到 3：放行 c
         let launched = q.set_concurrency(3);
         assert_eq!(launched, vec!["c".to_string()]);

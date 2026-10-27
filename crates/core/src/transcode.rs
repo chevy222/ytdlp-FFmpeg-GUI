@@ -233,26 +233,6 @@ pub fn explicit_encoder_args(mode: &str) -> (String, Vec<String>) {
     }
 }
 
-/// 编码器选择（TC-14：auto = QSV 可用则 hevc_qsv，否则 libx265 兜底；
-/// 显式 nvenc/amf/libx265 不被自动覆盖）。
-fn pick_encoder(resolver: &ToolResolver, mode: &str) -> Result<(String, Vec<String>)> {
-    let (enc, args) = explicit_encoder_args(mode);
-    match mode {
-        "libx265" => Ok((enc, args)),
-        "nvenc" => Ok((enc, args)),
-        "amf" => Ok((enc, args)),
-        _ => {
-            if qsv_available(resolver)? {
-                // low_power 始终启用（原设置项已移除，默认开启）
-                let args = sv(&["-global_quality", "23", "-low_power", "1"]);
-                Ok(("hevc_qsv".into(), args))
-            } else {
-                Ok(("libx265".into(), sv(&["-crf", "23", "-preset", "medium"])))
-            }
-        }
-    }
-}
-
 /// 可用硬件编码器探测结果（TC-14）。
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct HwEncoders {
@@ -417,7 +397,6 @@ impl TranscodeTier {
 /// 旋转只由条目 `rot_angle` 驱动；vpp_qsv 先缩放后转置（尺寸表达式取转置前
 /// 的 iw/ih，与 CPU 链的转置前语义一致，见 bat 内注释）。
 pub fn build_args_for_tier(
-    resolver: &ToolResolver,
     params: &TranscodeParams,
     meta: &MediaMeta,
     tier: TranscodeTier,
@@ -450,13 +429,12 @@ pub fn build_args_for_tier(
             "nvenc" | "amf" => params.encoder_mode.as_str(),
             _ => "libx265",
         };
-        pick_encoder(resolver, mode)?
+        explicit_encoder_args(mode)
     };
     // 软件层（libx265 或显式 nvenc/amf）在 mp4 容器下也要 hvc1 标签（Apple 兼容）。
     // QSV 层的 hvc1 在下方 `qsv_encode` 分支统一处理，这里排除 hevc_qsv 以免重复添加。
     // 此前只判 `encoder == "libx265"`，导致显式选 nvenc/amf 时漏标、被写成 hev1。
-    let is_hevc = encoder == "libx265" || encoder.starts_with("hevc_");
-    if params.container == "mp4" && is_hevc && encoder != "hevc_qsv" {
+    if params.container == "mp4" && encoder != "hevc_qsv" {
         // hvc1 标签（Apple 兼容）。必须带 `:v:0`：不带流后缀的 `-tag:v`
         // 会落到封面流（mjpeg）上，mp4 封装报
         // `Tag hvc1 incompatible with output codec id '7' (mp4v)` 并失败
@@ -786,15 +764,6 @@ pub fn build_args_for_tier(
     Ok(args)
 }
 
-/// 软件层参数（既有入口；单测与旧调用方共用）。
-pub fn build_args(
-    resolver: &ToolResolver,
-    params: &TranscodeParams,
-    meta: &MediaMeta,
-) -> Result<Vec<String>> {
-    build_args_for_tier(resolver, params, meta, TranscodeTier::Software)
-}
-
 /// 解析 `-progress` 输出中的 `out_time_us=`（微秒）。
 pub(crate) fn parse_out_time_us(line: &str) -> Option<u64> {
     let line = line.trim();
@@ -950,7 +919,7 @@ fn run_transcode_once(
     // 顺序很重要：先把所有可能失败的准备做完（参数构造 / ffmpeg 定位），再抢占
     // 输出名。output_path() 内部 create_new 占位，提前占位会在失败路径留下
     // 0 字节垃圾文件在用户的输出目录里。
-    let args = build_args_for_tier(resolver, params, meta, tier)?;
+    let args = build_args_for_tier(params, meta, tier)?;
     let mut cmd = resolver.command(Tool::Ffmpeg)?;
     let out = params.output_path()?;
     // 占位文件 RAII 清理：此后任何提前返回（含 stream_lines 的 `?`）都会删掉
@@ -1048,6 +1017,11 @@ fn run_transcode_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 软件层参数（测试用入口；生产代码按层级调用 `build_args_for_tier`）。
+    fn build_args(params: &TranscodeParams, meta: &MediaMeta) -> Vec<String> {
+        build_args_for_tier(params, meta, TranscodeTier::Software).unwrap()
+    }
 
     #[test]
     fn template_pure_title() {
@@ -1194,7 +1168,7 @@ mod tests {
             vbitrate_kbps: Some(12_000),
             ..Default::default()
         };
-        let args = build_args(&ToolResolver::default(), &params, &meta).unwrap();
+        let args = build_args(&params, &meta);
         let joined = args.join(" ");
         assert!(joined.contains("-maxrate 5000k"), "{}", joined);
         assert!(joined.contains("-bufsize 10000k"), "{}", joined);
@@ -1204,11 +1178,11 @@ mod tests {
             vbitrate_kbps: Some(2_000),
             ..Default::default()
         };
-        let args = build_args(&ToolResolver::default(), &params, &meta).unwrap();
+        let args = build_args(&params, &meta);
         assert!(args.join(" ").contains("-maxrate 2000k"));
 
         // 源码率未知时直接使用封顶值
-        let args = build_args(&ToolResolver::default(), &params, &MediaMeta::default()).unwrap();
+        let args = build_args(&params, &MediaMeta::default());
         assert!(args.join(" ").contains("-maxrate 5000k"));
     }
 
@@ -1222,11 +1196,10 @@ mod tests {
             acodec: Some("aac".into()),
             audio_volume: crate::model::AudioVolume {
                 max_volume_db: Some(-5.0),
-                ..Default::default()
             },
             ..Default::default()
         };
-        let args = build_args(&ToolResolver::default(), &params, &meta).unwrap();
+        let args = build_args(&params, &meta);
         let joined = args.join(" ");
         assert!(joined.contains("-c:a copy"), "{}", joined);
         assert!(!joined.contains("-af"), "{}", joined);
@@ -1240,7 +1213,7 @@ mod tests {
             cover_stream_index: Some(2),
             ..Default::default()
         };
-        let args = build_args(&ToolResolver::default(), &mk(), &meta).unwrap();
+        let args = build_args(&mk(), &meta);
         let joined = args.join(" ");
         assert!(joined.contains("-map 0:0?"), "{}", joined);
         assert!(joined.contains("-map 0:2?"), "{}", joined);
@@ -1261,7 +1234,7 @@ mod tests {
         };
         let mut params = mk();
         params.rot_angle = RotAngle::from_degrees(90);
-        let args = build_args(&ToolResolver::default(), &params, &meta).unwrap();
+        let args = build_args(&params, &meta);
         let joined = args.join(" ");
         // 旋转时封面也过 transpose 链并重编码 mjpeg（copy 的封面不跟随旋转）
         assert!(
@@ -1285,7 +1258,7 @@ mod tests {
         params.max_w = 0;
         params.max_h = 0;
         params.rot_angle = RotAngle::ZERO;
-        let args = build_args(&ToolResolver::default(), &params, &meta).unwrap();
+        let args = build_args(&params, &meta);
         let joined = args.join(" ");
         // 无滤镜无上限 → 走 -vf 分支之外的单链；封面映射 0:0? 且 copy
         assert!(joined.contains("-map 0:0?"), "{}", joined);
@@ -1300,7 +1273,7 @@ mod tests {
             video_stream_index: Some(0),
             ..Default::default()
         };
-        let args = build_args(&ToolResolver::default(), &mk(), &meta).unwrap();
+        let args = build_args(&mk(), &meta);
         let joined = args.join(" ");
         assert!(joined.contains("-map 0:t?"), "{}", joined);
         assert!(joined.contains("-c:t copy"), "{}", joined);
@@ -1352,13 +1325,7 @@ mod tests {
             video_stream_index: Some(0),
             ..Default::default()
         };
-        let args = build_args_for_tier(
-            &ToolResolver::default(),
-            &params,
-            &meta,
-            TranscodeTier::GpuQsv,
-        )
-        .unwrap();
+        let args = build_args_for_tier(&params, &meta, TranscodeTier::GpuQsv).unwrap();
         let j = args.join(" ");
         assert!(
             j.contains("-hwaccel qsv -hwaccel_output_format qsv"),
@@ -1379,13 +1346,7 @@ mod tests {
         let mut params = mk();
         params.max_w = 1920;
         params.max_h = 1080;
-        let args = build_args_for_tier(
-            &ToolResolver::default(),
-            &params,
-            &meta,
-            TranscodeTier::HybridQsv,
-        )
-        .unwrap();
+        let args = build_args_for_tier(&params, &meta, TranscodeTier::HybridQsv).unwrap();
         let j = args.join(" ");
         assert!(j.contains("-hwaccel qsv "), "{}", j);
         assert!(!j.contains("-hwaccel_output_format"), "{}", j);

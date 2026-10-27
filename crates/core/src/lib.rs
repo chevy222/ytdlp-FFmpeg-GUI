@@ -37,8 +37,6 @@ pub enum CoreError {
     Json(#[from] serde_json::Error),
     #[error("非法状态迁移: {from:?} -> {to:?}")]
     InvalidTransition { from: Status, to: Status },
-    #[error("条目不存在: {0}")]
-    NotFound(String),
     #[error("配置损坏: {0}")]
     ConfigCorrupt(String),
     #[error("任务已取消")]

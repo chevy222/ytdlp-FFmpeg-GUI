@@ -1,15 +1,14 @@
 //! 下载任务线程：参数组装、yt-dlp 执行、后处理与收尾（产物回填/取消清理）。
 
 use super::{
-    default_output_dir, ensure_main_window, err_string, log_error_lines, log_item, persist,
-    resolve_cookies, transition_in, update_item, update_progress, CmdResult, ProgressPayload,
-    SlotGuard,
+    default_output_dir, enqueue_or_spawn, ensure_main_window, err_string, log_error_lines,
+    log_item, persist, resolve_cookies, spawn_product_thumb, transition_in, update_item,
+    update_progress, CmdResult, ProgressPayload, SlotGuard,
 };
 use crate::state::AppState;
 use tauri::{AppHandle, Emitter, Manager};
 use ytdlp_core::download::{self, post_process, run_download, DownloadParams};
 use ytdlp_core::model::Status;
-use ytdlp_core::worker::SubmitOutcome;
 use ytdlp_core::{transition, CoreError};
 
 #[tauri::command(async)]
@@ -80,24 +79,14 @@ pub fn start_download(
     };
     let _ = app.emit("item:update", &updated);
     // 提交并发队列
-    let outcome = {
-        let mut q = state.queue.lock();
-        q.submit(&id)
-    };
-    if matches!(
-        outcome,
-        SubmitOutcome::Queued | SubmitOutcome::AlreadyRunning
-    ) {
-        log_item(&app, &id, "已排队，等待并发 slot…");
-        persist(&app);
-        return Ok(());
-    }
-    log_item(&app, &id, "开始下载…");
+    enqueue_or_spawn(
+        &app,
+        &id,
+        "已排队，等待并发 slot…",
+        "开始下载…",
+        move |app2, id2| run_download_task(app2, id2, format_id, audio_only),
+    );
     persist(&app);
-    let app2 = app.clone();
-    std::thread::spawn(move || {
-        run_download_task(app2, id, format_id, audio_only);
-    });
     Ok(())
 }
 
@@ -354,6 +343,12 @@ fn finish_download(
             Status::Failed
         }
     };
+    // 取消不是"错误"（与解析链路一致）；成功必须清掉上一次失败留下的文案，
+    // 否则条目已是 Done，进度列却仍显示旧错误。
+    let err_text = match &result {
+        Ok(_) | Err(CoreError::Cancelled) => None,
+        Err(e) => Some(e.to_string()),
+    };
     update_item(app, id, |it| {
         // cancel_item 抢先把状态写成 Canceled，但任务线程此时已跑完、实际成功。
         // 状态机已允许 Canceled → Done，这里显式覆盖是为了额外写入
@@ -369,13 +364,7 @@ fn finish_download(
         } else {
             it.percent
         };
-        if let Err(e) = &result {
-            // 取消不是"错误"：与解析链路（run_probe）一致，不写 error 文案，
-            // 否则 UI 上"已取消"的条目会带一段错误说明，观感不一致。
-            if !matches!(e, ytdlp_core::CoreError::Cancelled) {
-                it.error = Some(e.to_string());
-            }
-        }
+        it.error = err_text;
         if final_status == Status::Done {
             it.speed = None;
             it.eta = None;
@@ -389,41 +378,15 @@ fn finish_download(
             }
         }
     });
-    // 下载完成后：如果解析阶段缩略图下载失败（item.thumb 为 None），
-    // 用 ffmpeg 从产物提取内嵌封面流，再不行抽首帧。
+    // 下载完成后：解析阶段没拿到缩略图时，从产物补一张（helper 内部已判重）。
     if final_status == Status::Done {
         if let Some(out_path) = final_path {
-            let (need_thumb, cover_idx) = {
-                let hist = state.history.lock();
-                match hist.get(id) {
-                    Some(it) => (it.thumb.clone().is_none(), it.meta.cover_stream_index),
-                    None => (false, None),
-                }
-            };
-            if need_thumb {
-                let app2 = app.clone();
-                let id2 = id.to_string();
-                let cache_dir = state.paths.cache_dir();
-                let resolver2 = state.resolver();
-                tauri::async_runtime::spawn_blocking(move || {
-                    let out = std::path::Path::new(&out_path);
-                    let dest = ytdlp_core::thumbs::thumb_path(&cache_dir, &id2);
-                    if ytdlp_core::thumbs::ensure_thumb(
-                        &resolver2,
-                        out,
-                        &dest,
-                        cover_idx.map(|i| i as usize),
-                        &mut |l| log_item(&app2, &id2, l),
-                    )
-                    .is_ok()
-                    {
-                        update_item(&app2, &id2, |it| {
-                            it.thumb = Some(dest.to_string_lossy().into_owned());
-                        });
-                        app2.state::<AppState>().persist();
-                    }
-                });
-            }
+            let cover_idx = state
+                .history
+                .lock()
+                .get(id)
+                .and_then(|it| it.meta.cover_stream_index);
+            spawn_product_thumb(app, id.to_string(), out_path, cover_idx, id.to_string());
         }
     }
     // 任务结束：清理本任务私有临时目录（cookie 导出文件也在这个目录下，一并清理；

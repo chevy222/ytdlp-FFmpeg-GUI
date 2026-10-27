@@ -147,7 +147,7 @@ impl ToolResolver {
 }
 
 /// 在系统 PATH 中查找可执行文件。
-pub fn find_in_path(name: &str) -> Option<PathBuf> {
+fn find_in_path(name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
         let cand = dir.join(name);
@@ -258,14 +258,6 @@ impl ChildGuard {
     /// 取 stderr（调用后由调用方接管）。
     pub fn stderr(&mut self) -> Option<std::process::ChildStderr> {
         self.child.as_mut().and_then(|c| c.stderr.take())
-    }
-
-    /// 非阻塞检查是否退出。
-    pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
-        match self.child.as_mut() {
-            Some(c) => c.try_wait(),
-            None => Ok(None),
-        }
     }
 
     /// 阻塞等待退出。
@@ -672,6 +664,19 @@ pub fn tool_version_at(tool: Tool, path: &Path) -> Option<String> {
 /// 解析工具版本字符串（`-version` / `--version` 输出首行提取版本号）。
 pub fn tool_version(resolver: &ToolResolver, tool: Tool) -> Option<String> {
     tool_version_at(tool, &resolver.resolve(tool).ok()?)
+}
+
+/// yt-dlp 通用浏览器伪装参数（UA + Accept-Language）。
+///
+/// 下载、URL 解析、缩略图三条链路共用这一份：三处手抄同一组常量时，
+/// 调 UA 版本号最容易漏改一处，导致"登录能过、下载 403"的指纹不一致。
+pub fn browser_headers() -> Vec<String> {
+    vec![
+        "--user-agent".to_string(),
+        crate::config::DEFAULT_USER_AGENT.to_string(),
+        "--add-header".to_string(),
+        format!("Accept-Language:{}", crate::config::DEFAULT_ACCEPT_LANGUAGE),
+    ]
 }
 
 /// 把程序名与参数拼成一条可读的单行命令（**近似回显**，用于日志阅读——

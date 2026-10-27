@@ -7,6 +7,8 @@
 
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use serde_json::Value;
 
@@ -52,7 +54,6 @@ pub struct LocalProbe {
 #[derive(Debug, Clone)]
 pub struct PlaylistEntry {
     pub url: String,
-    pub title: String,
 }
 
 /// 组装 yt-dlp 公共参数（`-J` 家族共用）：extra 前缀 + js 运行时 + cookies + 代理 + URL。
@@ -86,15 +87,64 @@ fn ytdlp_args(
         args.push(p);
     }
     // 自定义 UA + Accept-Language：让请求更像真实浏览器，减少 bot 检测
-    args.push("--user-agent".into());
-    args.push(crate::config::DEFAULT_USER_AGENT.to_string());
-    args.push("--add-header".into());
-    args.push(format!(
-        "Accept-Language:{}",
-        crate::config::DEFAULT_ACCEPT_LANGUAGE
-    ));
+    args.extend(crate::exec::browser_headers());
     args.push(url.to_string());
     args
+}
+
+/// yt-dlp JSON 类命令的统一执行结果（`-J` 解析 / 播放列表展开共用）。
+struct JsonRun {
+    text: String,
+    stderr: String,
+    success: bool,
+    killed: bool,
+    cancelled: bool,
+}
+
+/// 执行 `yt-dlp -J` 家族命令：建参、spawn、取消兜底、300s 截止、边下边读、
+/// stderr 收集全部收敛在这一处（此前两个解析入口各抄一份，改动要同步两遍）。
+#[allow(clippy::too_many_arguments)]
+fn run_ytdlp_json(
+    resolver: &ToolResolver,
+    url: &str,
+    cookies_file: Option<&Path>,
+    network: &NetworkConfig,
+    extra: &[&str],
+    cancel: Option<&Arc<AtomicBool>>,
+    on_log: &mut dyn FnMut(String),
+) -> std::result::Result<JsonRun, ProbeFailure> {
+    let args = ytdlp_args(resolver, url, cookies_file, network, extra);
+    on_log(crate::exec::display_command("yt-dlp", &args));
+    let mut cmd = resolver.command(Tool::YtDlp).map_err(|e| ProbeFailure {
+        kind: ProbeErrorKind::Failed,
+        message: e.to_string(),
+    })?;
+    cmd.args(&args);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut guard = ChildGuard::spawn(&mut cmd).map_err(|e| ProbeFailure {
+        kind: ProbeErrorKind::Failed,
+        message: format!("启动 yt-dlp 失败：{}", e),
+    })?;
+
+    let cancel = cancel.cloned().unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    // 300 秒是纯兜底（正常解析是秒级）：卡住时不要永远占着解析线程
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    let mut text = String::new();
+    let outcome = crate::exec::stream_lines(&mut guard, &cancel, Some(deadline), |line| {
+        text.push_str(line);
+        text.push('\n');
+    })
+    .map_err(|e| ProbeFailure {
+        kind: ProbeErrorKind::Failed,
+        message: format!("yt-dlp 执行异常：{e}"),
+    })?;
+    Ok(JsonRun {
+        text,
+        stderr: outcome.stderr,
+        success: outcome.status.success(),
+        killed: outcome.killed,
+        cancelled: cancel.load(Ordering::Relaxed),
+    })
 }
 
 /// 展开播放列表（yt-dlp -J --flat-playlist）：快速拿每集 URL 与标题，
@@ -109,44 +159,20 @@ pub fn list_playlist_entries(
     url: &str,
     cookies_file: Option<&Path>,
     network: &NetworkConfig,
-    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    cancel: Option<&Arc<AtomicBool>>,
     mut on_log: impl FnMut(String),
 ) -> std::result::Result<Vec<PlaylistEntry>, ProbeFailure> {
-    use std::sync::atomic::Ordering;
-    let args = ytdlp_args(
+    let run = run_ytdlp_json(
         resolver,
         url,
         cookies_file,
         network,
         &["-J", "--flat-playlist", "--no-warnings"],
-    );
-    on_log(crate::exec::display_command("yt-dlp", &args));
-    let mut cmd = resolver.command(Tool::YtDlp).map_err(|e| ProbeFailure {
-        kind: ProbeErrorKind::Failed,
-        message: e.to_string(),
-    })?;
-    cmd.args(&args);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut guard = ChildGuard::spawn(&mut cmd).map_err(|e| ProbeFailure {
-        kind: ProbeErrorKind::Failed,
-        message: format!("启动 yt-dlp 失败：{}", e),
-    })?;
-
-    let cancel = cancel
-        .cloned()
-        .unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
-    let mut text = String::new();
-    let outcome = crate::exec::stream_lines(&mut guard, &cancel, Some(deadline), |line| {
-        text.push_str(line);
-        text.push('\n');
-    })
-    .map_err(|e| ProbeFailure {
-        kind: ProbeErrorKind::Failed,
-        message: format!("yt-dlp 执行异常：{e}"),
-    })?;
-    if outcome.killed {
-        let (kind, message) = if cancel.load(Ordering::Relaxed) {
+        cancel,
+        &mut on_log,
+    )?;
+    if run.killed {
+        let (kind, message) = if run.cancelled {
             (ProbeErrorKind::Cancelled, "获取播放列表已取消".to_string())
         } else {
             (
@@ -156,12 +182,12 @@ pub fn list_playlist_entries(
         };
         return Err(ProbeFailure { kind, message });
     }
-    if !outcome.status.success() {
-        let mut f = classify_ytdlp_error(outcome.stderr.trim());
-        f.message = format!("获取播放列表失败：{}", outcome.stderr.trim());
+    if !run.success {
+        let mut f = classify_ytdlp_error(run.stderr.trim());
+        f.message = format!("获取播放列表失败：{}", run.stderr.trim());
         return Err(f);
     }
-    let v: Value = match serde_json::from_str(&text) {
+    let v: Value = match serde_json::from_str(&run.text) {
         Ok(v) => v,
         Err(_) => {
             return Err(ProbeFailure {
@@ -186,10 +212,8 @@ pub fn list_playlist_entries(
                 skipped += 1;
                 continue;
             }
-            let title = e["title"].as_str().unwrap_or("").to_string();
             out.push(PlaylistEntry {
                 url: raw.to_string(),
-                title,
             });
         }
     }
@@ -233,10 +257,9 @@ pub fn probe_url(
     cookies_file: Option<&Path>,
     network: &NetworkConfig,
     playlist: bool,
-    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    cancel: Option<&Arc<AtomicBool>>,
     mut on_log: impl FnMut(String),
 ) -> std::result::Result<UrlProbe, ProbeFailure> {
-    use std::sync::atomic::Ordering;
     let extra: &[&str] = if playlist {
         &[
             "-J",
@@ -254,37 +277,18 @@ pub fn probe_url(
             "60",
         ]
     };
-    let args = ytdlp_args(resolver, url, cookies_file, network, extra);
-    on_log(crate::exec::display_command("yt-dlp", &args));
-    let mut cmd = resolver.command(Tool::YtDlp).map_err(|e| ProbeFailure {
-        kind: ProbeErrorKind::Failed,
-        message: e.to_string(),
-    })?;
-    cmd.args(&args);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut guard = ChildGuard::spawn(&mut cmd).map_err(|e| ProbeFailure {
-        kind: ProbeErrorKind::Failed,
-        message: format!("启动 yt-dlp 失败：{}", e),
-    })?;
-
-    let cancel = cancel
-        .cloned()
-        .unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
-    // 300 秒是纯兜底（正常解析是秒级）：卡住时不要永远占着解析线程
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
-    let mut text = String::new();
-    let outcome = crate::exec::stream_lines(&mut guard, &cancel, Some(deadline), |line| {
-        text.push_str(line);
-        text.push('\n');
-    })
-    .map_err(|e| ProbeFailure {
-        kind: ProbeErrorKind::Failed,
-        message: format!("yt-dlp 执行异常：{e}"),
-    })?;
-
-    if outcome.killed {
+    let run = run_ytdlp_json(
+        resolver,
+        url,
+        cookies_file,
+        network,
+        extra,
+        cancel,
+        &mut on_log,
+    )?;
+    if run.killed {
         // 区分"用户取消"与"超时兜底"：前者进已取消，后者进失败（带可读原因）
-        if cancel.load(Ordering::Relaxed) {
+        if run.cancelled {
             return Err(ProbeFailure {
                 kind: ProbeErrorKind::Cancelled,
                 message: "解析已取消".into(),
@@ -295,10 +299,10 @@ pub fn probe_url(
             message: "解析超时（超过 300 秒仍未返回元数据），可重试或检查网络/代理".into(),
         });
     }
-    if !outcome.status.success() {
-        return Err(classify_ytdlp_error(outcome.stderr.trim()));
+    if !run.success {
+        return Err(classify_ytdlp_error(run.stderr.trim()));
     }
-    parse_ytdlp_json(&text).map_err(|e| ProbeFailure {
+    parse_ytdlp_json(&run.text).map_err(|e| ProbeFailure {
         kind: ProbeErrorKind::Failed,
         message: format!("解析 yt-dlp 输出失败：{e}"),
     })
@@ -433,7 +437,6 @@ pub fn parse_ytdlp_json(text: &str) -> Result<UrlProbe> {
         .or(v["channel"].as_str())
         .map(str::to_string);
     let duration = v["duration"].as_f64();
-    let thumbnail = v["thumbnail"].as_str().map(str::to_string);
     let is_playlist = v["_type"].as_str() == Some("playlist")
         || v["playlist_count"].as_u64().map(|c| c > 1).unwrap_or(false);
     let webpage_url = v["webpage_url"].as_str().unwrap_or_default();
@@ -515,11 +518,10 @@ pub fn parse_ytdlp_json(text: &str) -> Result<UrlProbe> {
         height: formats
             .iter()
             .filter(|f| !f.audio_only)
-            .map(|f| f.height.unwrap_or(0))
+            .filter_map(|f| f.height)
             .max(),
         container: None, // 下载容器由所选格式决定，展示列用 URL 行内格式按钮
         download_formats: formats,
-        has_cover: thumbnail.is_some(),
         ..Default::default()
     };
     Ok(UrlProbe {
@@ -556,7 +558,6 @@ pub fn parse_ffprobe_json(text: &str) -> std::result::Result<MediaMeta, serde_js
             .get("size")
             .and_then(|x| x.as_str())
             .and_then(|s| s.parse().ok());
-        meta.has_cover = false;
     }
     let streams = v["streams"].as_array().cloned().unwrap_or_default();
     let mut has_audio = false;
@@ -569,9 +570,8 @@ pub fn parse_ffprobe_json(text: &str) -> std::result::Result<MediaMeta, serde_js
                 let is_cover = s["disposition"]["attached_pic"].as_u64() == Some(1)
                     || s["disposition"]["attached_pic"].as_str() == Some("1");
                 if is_cover {
-                    // 封面流（attached pic）只标记 has_cover 与索引，不参与主视频元数据，
+                    // 封面流（attached pic）只记录索引，不参与主视频元数据，
                     // 否则 mjpeg 封面会覆盖主视频的高度/编码器/码率/帧率
-                    meta.has_cover = true;
                     if meta.cover_stream_index.is_none() {
                         meta.cover_stream_index = Some(abs_index);
                     }
@@ -599,28 +599,6 @@ pub fn parse_ffprobe_json(text: &str) -> std::result::Result<MediaMeta, serde_js
                         .and_then(|b| b.parse::<f64>().ok())
                         .map(|b| (b / 1000.0) as u32);
                     meta.extradata = s["extradata"].as_str().map(str::to_string);
-                    // 旋转标记（MD-02 采集；转码是否据此自动纠正见 TC-04 手动旋转约定）
-                    if let Some(tags) = s["tags"].as_object() {
-                        if let Some(r) = tags.get("rotate").and_then(|x| x.as_str()) {
-                            meta.rotate_tag = r.parse::<i32>().ok();
-                        }
-                    }
-                    // 新版 ffprobe 用 side_data_list.Display Matrix.rotation 代替 tags.rotate
-                    if meta.rotate_tag.is_none() {
-                        if let Some(sd) = s["side_data_list"].as_array() {
-                            for item in sd {
-                                if let Some(r) = item["rotation"].as_f64() {
-                                    // ffprobe 的 Display Matrix `rotation` 已经是角度
-                                    // （实测 90.0，不是弧度）；再乘 180/π 会把 90° 算成 117°。
-                                    let deg = r.round() as i32;
-                                    if deg != 0 {
-                                        meta.rotate_tag = Some(deg.rem_euclid(360));
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
                 }
             }
             Some("audio") => {
@@ -665,9 +643,7 @@ pub fn parse_volumedetect(stderr: &str) -> AudioVolume {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("[Parsed_volumedetect") {
             if let Some(rest) = rest.split("] ").nth(1) {
-                if let Some(val) = rest.strip_prefix("mean_volume: ") {
-                    v.mean_volume_db = val.trim_end_matches(" dB").trim().parse().ok();
-                } else if let Some(val) = rest.strip_prefix("max_volume: ") {
+                if let Some(val) = rest.strip_prefix("max_volume: ") {
                     v.max_volume_db = val.trim_end_matches(" dB").trim().parse().ok();
                 }
             }
@@ -740,9 +716,6 @@ mod tests {
         assert_eq!(p.meta.duration_secs, Some(332.5));
         assert_eq!(p.host.as_deref(), Some("www.youtube.com"));
         assert_eq!(p.site.as_deref(), Some("youtube"));
-        // thumbnail 字段现在只折算为 has_cover（远程 URL 本身已不再随身携带，
-        // 封面由解析阶段的 fetch_thumb_ytdlp 经 yt-dlp --write-thumbnail --skip-download 落盘）
-        assert!(p.meta.has_cover, "thumbnail 字段应折算为 has_cover");
         assert!(!p.is_playlist);
     }
 
@@ -815,19 +788,18 @@ mod tests {
         assert_eq!(m.container.as_deref(), Some("MP4"));
         assert_eq!(m.duration_secs, Some(332.0));
         assert_eq!(m.size_bytes, Some(35651584));
-        assert!(!m.has_cover);
     }
 
     #[test]
     fn parse_ffprobe_json_attached_pic_cover() {
         let json = r#"{"streams":[{"codec_type":"video","codec_name":"mjpeg","disposition":{"attached_pic":1}},{"codec_type":"video","codec_name":"hevc","height":1080},{"codec_type":"audio","codec_name":"aac"}]}"#;
         let m = parse_ffprobe_json(json).unwrap();
-        assert!(m.has_cover);
+        assert_eq!(m.cover_stream_index, Some(0));
         assert_eq!(m.height, Some(1080));
     }
 
     #[test]
-    fn parse_ffprobe_json_stream_index_extradata_rotate() {
+    fn parse_ffprobe_json_stream_index_extradata() {
         let json = r#"{
           "streams": [
             {"index":0,"codec_type":"video","codec_name":"hevc","height":1080,"extradata":"0a0b0c","tags":{"rotate":"90"}},
@@ -839,7 +811,6 @@ mod tests {
         assert_eq!(m.video_stream_index, Some(0));
         assert_eq!(m.cover_stream_index, Some(2));
         assert_eq!(m.extradata.as_deref(), Some("0a0b0c"));
-        assert_eq!(m.rotate_tag, Some(90));
         assert_eq!(m.height, Some(1080));
         assert_eq!(m.vcodec.as_deref(), Some("hevc"));
     }
@@ -860,15 +831,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_ffprobe_json_side_data_rotation_is_degrees() {
-        // ffprobe 输出 rotation 是角度；旧实现按弧度换算，90° 会变成 117°
-        let json = r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"hevc","width":1080,"height":1920,"side_data_list":[{"side_data_type":"Display Matrix","rotation":90}]}]}"#;
-        assert_eq!(parse_ffprobe_json(json).unwrap().rotate_tag, Some(90));
-        let json = r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"hevc","width":1920,"height":1080,"side_data_list":[{"rotation":-90}]}]}"#;
-        assert_eq!(parse_ffprobe_json(json).unwrap().rotate_tag, Some(270));
-    }
-
-    #[test]
     fn parse_ffprobe_json_missing_index_falls_back_to_position() {
         // 不带 index 字段（老样本）时按出现顺序回退，保证映射不丢
         let json = r#"{"streams":[{"codec_type":"video","codec_name":"h264","height":720},{"codec_type":"audio","codec_name":"aac"}]}"#;
@@ -881,11 +843,9 @@ mod tests {
     fn parse_volumedetect_ok() {
         let stderr = "\
 [Parsed_volumedetect_0 @ 0x7f] n_samples: 1000
-[Parsed_volumedetect_0 @ 0x7f] mean_volume: -15.3 dB
 [Parsed_volumedetect_0 @ 0x7f] max_volume: -8.2 dB
 ";
         let v = parse_volumedetect(stderr);
-        assert_eq!(v.mean_volume_db, Some(-15.3));
         assert_eq!(v.max_volume_db, Some(-8.2));
     }
 

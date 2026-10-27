@@ -62,7 +62,7 @@ impl ToolKind {
         }
     }
 
-    /// 激活后的文件名（Windows exe；非 Windows 环境无后缀）。
+    /// 激活后的文件名（下载源均为 Windows 构建，恒带 `.exe`）。
     pub fn exe_name(&self) -> &'static str {
         match self {
             Self::YtDlp => "yt-dlp.exe",

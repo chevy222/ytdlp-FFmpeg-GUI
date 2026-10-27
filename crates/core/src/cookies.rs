@@ -19,8 +19,6 @@ pub struct CookieEntry {
     pub expires: Option<f64>,
     pub http_only: bool,
     pub secure: bool,
-    #[serde(default)]
-    pub same_site: String,
 }
 
 /// 站点 Cookie 存储（按 HOST 分文件，Netscape 格式）。
@@ -273,7 +271,6 @@ fn netscape_parse(s: &str) -> Vec<CookieEntry> {
         };
         let name = parts[5].to_string();
         let value = parts[6].to_string();
-        let same_site = String::new();
         out.push(CookieEntry {
             name,
             value,
@@ -286,7 +283,6 @@ fn netscape_parse(s: &str) -> Vec<CookieEntry> {
             expires,
             http_only,
             secure,
-            same_site,
         });
     }
     out
@@ -347,10 +343,22 @@ pub fn cookie_candidates(host: &str) -> Vec<String> {
             push_unique(&mut out, format!("www.{}", parent));
         }
     }
-    // X ↔ twitter 姊妹域名互退
+    // 裸域名（x.com / bilibili.com / douyin.com …）：登录保存时会被规范化成
+    // `www.<host>.txt`（commands::cookies::normalize_cookie_host），候选列表必须
+    // 补上 www 变体，否则保存成功、下载却永远匹配不到。
+    if !h.starts_with("www.") && h.split('.').count() == 2 {
+        push_unique(&mut out, format!("www.{}", h));
+    }
+    // X ↔ twitter 姊妹域名互退（两个域名都会保存成 www.*，变体必须一并给出）
     match h.as_str() {
-        "x.com" | "www.x.com" => push_unique(&mut out, "twitter.com".into()),
-        "twitter.com" | "www.twitter.com" => push_unique(&mut out, "x.com".into()),
+        "x.com" | "www.x.com" => {
+            push_unique(&mut out, "twitter.com".into());
+            push_unique(&mut out, "www.twitter.com".into());
+        }
+        "twitter.com" | "www.twitter.com" => {
+            push_unique(&mut out, "x.com".into());
+            push_unique(&mut out, "www.x.com".into());
+        }
         _ => {}
     }
     // YouTube ↔ youtu.be 姊妹域名互退
@@ -379,7 +387,6 @@ mod tests {
             expires: None,
             http_only: true,
             secure: true,
-            same_site: "lax".into(),
         }
     }
 
@@ -406,6 +413,26 @@ mod tests {
             c.len(),
             c.iter().collect::<std::collections::HashSet<_>>().len()
         );
+    }
+
+    #[test]
+    fn candidates_bare_domain_includes_www() {
+        // 登录保存时裸域名被规范化成 www.<host>，候选必须能找回它
+        for host in ["x.com", "twitter.com", "bilibili.com", "douyin.com"] {
+            let c = cookie_candidates(host);
+            assert!(
+                c.contains(&format!("www.{}", host)),
+                "{host} 候选缺少 www 变体：{c:?}"
+            );
+        }
+        // 多级子域只补父域的 www，不构造 www.<sub>.<host>
+        let c = cookie_candidates("v.douyin.com");
+        assert!(!c.contains(&"www.v.douyin.com".to_string()), "{c:?}");
+        assert!(c.contains(&"www.douyin.com".to_string()), "{c:?}");
+        // 姊妹域名互退也要覆盖 www 变体（保存统一落 www.x.com）
+        assert!(cookie_candidates("twitter.com")
+            .contains(&"www.x.com".to_string()));
+        assert!(cookie_candidates("x.com").contains(&"www.twitter.com".to_string()));
     }
 
     #[test]

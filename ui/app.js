@@ -5,12 +5,22 @@ const LISTEN = window.__TAURI__.event.listen;
 
 function copyText(text){
   if(!text) return;
+  // execCommand 只能复制"当前选中的内容"：先建临时 textarea 选中再执行，
+  // 否则旧实现会在什么都没选中的情况下提示"已复制"。
+  const fallback=()=>{
+    try{
+      const ta=document.createElement('textarea');
+      ta.value=text; ta.style.position='fixed'; ta.style.opacity='0';
+      document.body.appendChild(ta); ta.select();
+      const ok=document.execCommand('copy');
+      document.body.removeChild(ta);
+      toast(ok?'已复制到剪贴板':'复制失败');
+    }catch(e){toast('复制失败');}
+  };
   if(navigator.clipboard&&navigator.clipboard.writeText){
-    navigator.clipboard.writeText(text).then(()=>toast('已复制到剪贴板')).catch(()=>{
-      try{document.execCommand('copy');toast('已复制到剪贴板');}catch(e){toast('复制失败');}
-    });
+    navigator.clipboard.writeText(text).then(()=>toast('已复制到剪贴板')).catch(fallback);
   } else {
-    toast('当前环境不支持剪贴板');
+    fallback();
   }
 }
 
@@ -62,16 +72,6 @@ function humanSize(b){
   if(b>=1024)return (b/1024).toFixed(0)+'KB';
   return b+'B';
 }
-// 语义化版本比较（缺段按 0；与 Rust 侧 version_greater 同口径）
-function versionGreater(a,b){
-  const pa=String(a||'').trim().replace(/^v/i,'').split('.').map(x=>parseInt(x,10)||0);
-  const pb=String(b||'').trim().replace(/^v/i,'').split('.').map(x=>parseInt(x,10)||0);
-  for(let i=0;i<Math.max(pa.length,pb.length);i++){
-    const x=pa[i]||0,y=pb[i]||0;
-    if(x!==y)return x>y;
-  }
-  return false;
-}
 
 function fmtMeta(it){
   const m = it.meta || {};
@@ -103,17 +103,20 @@ function subline(it){
   return '';
 }
 
-// 支持内置登录的站点。keys 用于在条目上判断站点是否可登录；
+// 支持内置登录的站点。domains 按 host 边界匹配 URL，sites 精确匹配 extractor 名；
 // **须与 Rust 侧 login::login_url_for_host 保持一致**。
 const LOGIN_SITES=[
-  {host:'youtube.com', label:'YouTube',      keys:['youtube','youtu.be']},
-  {host:'bilibili.com',label:'哔哩哔哩',      keys:['bilibili']},
-  {host:'x.com',       label:'X / Twitter',  keys:['x.com','twitter']},
-  {host:'douyin.com',  label:'抖音',          keys:['douyin']}
+  {host:'youtube.com', label:'YouTube',     domains:['youtube.com','youtu.be'], sites:['youtube']},
+  {host:'bilibili.com',label:'哔哩哔哩',     domains:['bilibili.com'],           sites:['bilibili']},
+  {host:'x.com',       label:'X / Twitter', domains:['x.com','twitter.com'],    sites:['x','twitter']},
+  {host:'douyin.com',  label:'抖音',         domains:['douyin.com'],             sites:['douyin']}
 ];
 function canLogin(it){
-  const s=((it.site||'')+' '+(it.url||'')).toLowerCase();
-  return LOGIN_SITES.some(x=>x.keys.some(k=>s.includes(k)));
+  let host='';
+  try{ host=new URL(it.url||'').hostname.toLowerCase(); }catch(_){}
+  const site=(it.site||'').toLowerCase().split(':')[0];
+  return LOGIN_SITES.some(x=>
+    x.domains.some(d=>host===d||host.endsWith('.'+d)) || x.sites.includes(site));
 }
 
 function ops(it){
@@ -398,14 +401,7 @@ document.getElementById('selAll').addEventListener('change', e=>{
 });
 document.getElementById('btnAdd').addEventListener('click', addUrls);
 document.getElementById('urlInput').addEventListener('keydown', e=>{ if(e.key==='Enter')addUrls(); });
-document.getElementById('btnAddFile').addEventListener('click', ()=>{
-  window.__TAURI__.dialog.open({ multiple:true, directory:false,
-    filters:[{name:'视频/音频',extensions:['mp4','mkv','mov','avi','flv','webm','wmv','ts','m4v','mp3','flac','wav','m4a','aac','ogg']}]
-  }).then(sel=>{
-    const files=Array.isArray(sel)?sel:(sel?[sel]:[]);
-    if(files.length)INVOKE('add_local',{paths:files,recursive:false}).catch(err=>toast(err));
-  }).catch(err=>toast(err));
-});
+document.getElementById('btnAddFile').addEventListener('click', pickLocalFiles);
 document.getElementById('btnAddDir').addEventListener('click', ()=>{
   window.__TAURI__.dialog.open({ directory:true, multiple:false })
     .then(sel=>{
@@ -890,8 +886,8 @@ function renderSetPage(){
     INVOKE('get_version_info').then(info=>{
       const el=document.getElementById('versionInfo'); if(!el)return;
       if(!info.latest_version){ el.textContent='当前 v'+info.current_version+'（最新版本查询失败）'; return; }
-      // 本地版本高于 release / 预发布场景都不能只靠 !== 判断
-      const hasNew=versionGreater(info.latest_version,info.current_version);
+      // 版本比较由后端统一给出（本地高于 release / 预发布场景只靠 !== 会误判）
+      const hasNew=!!info.has_new;
       // 点击版本号在系统浏览器打开 Release 页（Tauri webview 内 <a target=_blank> 不生效）
       el.innerHTML='当前 v'+esc(info.current_version)+' / 最新 <span class="ver-link '+ (hasNew?'ver-new':'ver-ok') +'" data-url="'+esc(info.url)+'">v'+esc(info.latest_version)+'</span>'+(hasNew?' ← 有新版本':'');
       el.querySelectorAll('.ver-link').forEach(s=>{
@@ -1040,7 +1036,7 @@ function applyCfgInput(el){
 }
 function refreshDeps(){
   INVOKE('probe_dependencies').then(list=>{
-    const map={yt_dlp:'depYt','yt-dlp':'depYt',ffmpeg:'depFfmpeg',ffprobe:'depFfprobe',deno:'depDeno'};
+    const map={'yt-dlp':'depYt',ffmpeg:'depFfmpeg',ffprobe:'depFfprobe',deno:'depDeno'};
     const elById={depYt:document.getElementById('depYt'),depFfmpeg:document.getElementById('depFfmpeg'),depFfprobe:document.getElementById('depFfprobe'),depDeno:document.getElementById('depDeno')};
     list.forEach(t=>{
       const el=elById[map[t.tool]]; if(!el)return;
@@ -1180,7 +1176,7 @@ async function init(){
       if (!info) return;
       // 用 askConfirm 而不是 window.confirm：后者会阻塞 WebView2 的 JS 线程
       // （下载中弹一下，进度事件就全停摆），启动瞬间恰是列表/依赖刷新的窗口
-      if (await askConfirm('发现新版本 v' + info.latest_version + '\n当前版本 v' + info.current_version + '\n\n是否前往 GitHub 下载？', '前往下载')) {
+      if (await askConfirm('发现新版本 v' + info.latest_version + '\n当前版本 v' + info.current_version + '\n\n是否前往 GitHub 下载？')) {
         // Tauri webview 内 window.open 无效，走 open_url 命令调起系统浏览器
         INVOKE('open_url',{url:info.url}).catch(e=>toast('打开链接失败：'+e));
       }

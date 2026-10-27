@@ -198,12 +198,10 @@ fn transcode_segment(
     on_log: &mut dyn FnMut(String),
 ) -> Result<()> {
     let (enc, mut enc_args) = encoder_args(encoder_mode);
-    // 段中间产物恒为 mp4：任何 H.265 编码器（libx265 / hevc_nvenc / hevc_amf）都要
-    // hvc1 标签（Apple 兼容）。此前只判 libx265，显式 nvenc/amf 时漏标被写成 hev1。
-    if enc == "libx265" || enc.starts_with("hevc_") {
-        enc_args.push("-tag:v:0".into());
-        enc_args.push("hvc1".into());
-    }
+    // 段中间产物恒为 mp4，编码器恒为 H.265（libx265 / hevc_nvenc / hevc_amf），
+    // 一律打 hvc1 标签（Apple 兼容）。此前只判 libx265，显式 nvenc/amf 时漏标被写成 hev1。
+    enc_args.push("-tag:v:0".into());
+    enc_args.push("hvc1".into());
     // 画布尺寸取偶（奇数宽高会让 libx265 报 chroma subsampling 错误）。
     // 宽高都必须固定：只统一高度时，不同画幅的宽度仍不同，concat -c copy
     // 会用第一段的 SPS 解第二段，产物静默损坏（实测）。
@@ -459,10 +457,10 @@ fn merge_unified(
     )
 }
 
-/// panic 兜底守卫：任务线程 panic 时清理任务临时目录与 0 字节占位产物。
+/// 合并清理守卫：函数返回（含取消/失败/panic）时清理任务临时目录与 0 字节占位产物。
 ///
-/// 正常返回仍走 [`run_merge`] 内的显式清理分支；本守卫只保证"异常路径不泄漏"。
-/// 成功时置 `keep_out = true` 保留产物（临时目录仍会在 Drop 时清理）。
+/// 正常路径也依赖它：各分支不再手写 remove，避免"守卫 + 显式清理"两份逻辑漂移。
+/// 成功时置 `keep_out = true` 保留产物（临时目录仍在 Drop 时清理）。
 struct MergeCleanupGuard {
     tmp: PathBuf,
     out: Option<PathBuf>,
@@ -512,9 +510,8 @@ pub fn run_merge(
     // 「清空临时文件」据此精确豁免，而不是"有任务在跑就跳过所有 merge_*"
     let tmp = params.temp_dir.join(&params.temp_subdir);
     std::fs::create_dir_all(&tmp)?;
-    // RAII 兜底：正常返回的清理仍走下面的显式分支，但任务线程一旦 panic
-    // （某个 unwrap/clamp 断言），这里保证临时目录与 0 字节占位产物都被清掉，
-    // 不会在用户输出目录留下"空产物"、也不在 temp/ 残留中间文件。
+    // RAII 兜底：所有返回路径（成功/取消/失败/panic）都由本守卫清理临时目录与
+    // 0 字节占位产物，不会在用户输出目录留下"空产物"、也不在 temp/ 残留中间文件。
     let mut guard = MergeCleanupGuard {
         tmp: tmp.clone(),
         out: None,
@@ -524,10 +521,6 @@ pub fn run_merge(
     // "探测失败"这类早退路径在用户输出目录留下 0 字节垃圾文件
     let out = output_path(params)?;
     guard.out = Some(out.clone());
-    let cleanup = |t: &Path, out: &Path| {
-        let _ = std::fs::remove_dir_all(t);
-        let _ = std::fs::remove_file(out);
-    };
     if params.normalize_audio {
         on_log("合并完成前做音量归一化…".into());
     }
@@ -561,8 +554,6 @@ pub fn run_merge(
                 ) {
                     Ok(n) => o = n,
                     Err(CoreError::Cancelled) => {
-                        let _ = std::fs::remove_dir_all(&tmp);
-                        let _ = std::fs::remove_file(&o);
                         on_log("音量归一化已取消，清理输出".into());
                         return Err(CoreError::Cancelled);
                     }
@@ -571,18 +562,15 @@ pub fn run_merge(
                     }
                 }
             }
-            let _ = std::fs::remove_dir_all(&tmp);
             guard.keep_out = true;
             on_log(format!("合并完成：{}", o.display()));
             Ok(o)
         }
         Err(CoreError::Cancelled) => {
-            cleanup(&tmp, &out);
             on_log("合并已取消，清理临时目录与输出残留".into());
             Err(CoreError::Cancelled)
         }
         Err(e) => {
-            cleanup(&tmp, &out);
             on_log(format!("合并失败，已清理临时目录与半成品：{}", e));
             Err(e)
         }

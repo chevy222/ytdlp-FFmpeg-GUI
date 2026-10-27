@@ -64,6 +64,7 @@ use ytdlp_core::download;
 use ytdlp_core::exec::ToolResolver;
 use ytdlp_core::model::{ItemKind, MediaItem, Status};
 use ytdlp_core::probe::{self, ProbeErrorKind};
+use ytdlp_core::worker::SubmitOutcome;
 use ytdlp_core::{transition, CoreError};
 
 /// 解析（探测）并发上限：粘贴 100 条链接时不能瞬间起 100 个 yt-dlp 子进程
@@ -76,8 +77,8 @@ const PROBE_CONCURRENCY: u64 = 3;
 /// `remote.urls`（登录窗加载的是远程站点，本就不能用 IPC），但为防未来误加 remote / 误建
 /// 可执行窗口，给真正敏感的命令加一层"仅主窗口可调用"的硬校验。
 ///
-/// 只对需要从主窗口触发的命令用；`save_cookies` 等由 login.rs 内部 Rust 直接调用
-/// （不走 IPC）的命令**不加**，避免误伤登录流程。
+/// 只对需要从主窗口触发的命令用；登录流程的 cookie 保存由 login.rs 直接调用
+/// `save_cookies_inner`（不走 IPC），不经过这层守卫。
 fn ensure_main_window(win: &tauri::WebviewWindow) -> Result<(), String> {
     if win.label() == "main" {
         Ok(())
@@ -267,20 +268,18 @@ fn log_item(app: &AppHandle, id: &str, line: impl Into<String>) {
 /// 用 yt-dlp 拉远程缩略图（解析链路取封面的唯一路径）。
 ///
 /// 不走 curl：curl 不走 Windows 系统代理（WinINET），且 schannel + socks5 兼容性差
-/// （经常 server closed abruptly）；yt-dlp 与主下载共用同一套代理/cookies/TLS
-/// （openssl），行为最一致。`--write-thumbnail --skip-download` 只拉封面不下载视频。
+/// （经常 server closed abruptly）；yt-dlp 与主下载共用同一套代理/TLS（openssl），
+/// 行为最一致。`--write-thumbnail --skip-download` 只拉封面不下载视频。
 ///
-/// **`cookies` 参数恒传 `None`**：实测 YouTube 缩略图传 cookies 反而 403（"Sign in
-/// to confirm you're not a bot"），不传则成功；且传 cookies 会让 yt-dlp 退出时
-/// save_cookies 到 temp 文件，若 temp 目录已被清理则 FileNotFoundError（即使封面
-/// 已下载成功）。参数保留是为了未来其它站点可能需要。
+/// **不传 cookies**：实测 YouTube 缩略图传 cookies 反而 403（"Sign in to confirm
+/// you're not a bot"），不传则成功；且传 cookies 会让 yt-dlp 退出时 save_cookies 到
+/// temp 文件，若 temp 目录已被清理则 FileNotFoundError（即使封面已下载成功）。
 fn fetch_thumb_ytdlp(
     resolver: &ToolResolver,
     video_url: &str,
     dest: &Path,
     temp_root: &Path,
     proxy: Option<&str>,
-    cookies: Option<&Path>,
     on_log: &mut dyn FnMut(String),
 ) -> Result<(), String> {
     // 运行时文件必须落 <exe 同级>\temp\（§3.7），禁止系统 temp；
@@ -309,10 +308,6 @@ fn fetch_thumb_ytdlp(
             args.push(p.to_string());
         }
     }
-    if let Some(c) = cookies {
-        args.push("--cookies".into());
-        args.push(c.to_string_lossy().into_owned());
-    }
     if let Ok(deno) = resolver.resolve(ytdlp_core::exec::Tool::Deno) {
         args.push("--js-runtimes".into());
         args.push(format!("deno:{}", deno.to_string_lossy()));
@@ -324,13 +319,7 @@ fn fetch_thumb_ytdlp(
         args.push("--convert-thumbnails".into());
         args.push("jpg".into());
     }
-    args.push("--user-agent".into());
-    args.push(ytdlp_core::config::DEFAULT_USER_AGENT.to_string());
-    args.push("--add-header".into());
-    args.push(format!(
-        "Accept-Language:{}",
-        ytdlp_core::config::DEFAULT_ACCEPT_LANGUAGE
-    ));
+    args.extend(ytdlp_core::exec::browser_headers());
     args.push("-o".into());
     args.push(out_tmpl_str);
     args.push(video_url.to_string());
@@ -339,7 +328,6 @@ fn fetch_thumb_ytdlp(
         .command(ytdlp_core::exec::Tool::YtDlp)
         .map_err(|e| e.to_string())?;
     cmd.args(&args);
-    ytdlp_core::exec::hide_console(&mut cmd);
     // 总超时兜底：--socket-timeout 只管读超时，管不了"连上之后不产数据"的挂起；
     // 与全项目其它子进程调用同口径（60s 量级）。run_capture_deadline 只在退出码
     // 为 0 时返回 Ok，非零退出的 stderr 由它带进错误信息，无需再手动判退出码。
@@ -435,12 +423,15 @@ fn persist(app: &AppHandle) {
     }
 }
 
-/// 产物条目缩略图（转码/合并产物共用）：后台抽帧/内嵌封面，成功后回填并落盘。
+/// 条目缩略图（下载/转码/合并产物共用）：后台抽帧/内嵌封面，成功后回填并落盘。
+///
+/// `log_id`：缩略图命令回显与失败原因写入哪条目的日志。
 pub(super) fn spawn_product_thumb(
     app: &AppHandle,
     product_id: String,
     out: PathBuf,
     cover_idx: Option<u32>,
+    log_id: String,
 ) {
     let app2 = app.clone();
     let state = app.state::<AppState>();
@@ -448,21 +439,68 @@ pub(super) fn spawn_product_thumb(
     let resolver = state.resolver();
     tauri::async_runtime::spawn_blocking(move || {
         let dest = ytdlp_core::thumbs::thumb_path(&cache_dir, &product_id);
+        // 已有缩略图（下载条目在解析阶段生成过）不重复抽帧；也不做无意义的落盘
+        if dest.is_file() {
+            return;
+        }
         if ytdlp_core::thumbs::ensure_thumb(
             &resolver,
             &out,
             &dest,
             cover_idx.map(|i| i as usize),
-            &mut |_| {},
+            &mut |l| log_item(&app2, &log_id, l),
         )
         .is_ok()
         {
             update_item(&app2, &product_id, |it| {
                 it.thumb = Some(dest.to_string_lossy().into_owned());
             });
+            app2.state::<AppState>().persist();
         }
-        app2.state::<AppState>().persist();
     });
+}
+
+/// 产物条目回列表（转码/合并共用）：探测元数据、建条目、抽缩略图、通知前端。
+///
+/// `log_id`：日志归属条目（产物解析命令回显到发起任务的条目日志里）。
+pub(super) fn add_product_item(
+    app: &AppHandle,
+    kind: ItemKind,
+    out: &Path,
+    fallback_title: &str,
+    log_id: &str,
+) {
+    let state = app.state::<AppState>();
+    let meta = match ytdlp_core::download::probe_output(&state.resolver(), out, |l| {
+        log_item(app, log_id, l)
+    }) {
+        Ok(m) => m,
+        Err(e) => {
+            // 探测失败不再静默吞掉：产物元数据（画质列）会空着，必须让用户看到原因
+            log_item(app, log_id, format!("产物解析失败（画质列为空）：{e}"));
+            Default::default()
+        }
+    };
+    let title = out
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| fallback_title.to_string());
+    let mut prod = MediaItem::new(kind, title);
+    prod.path = Some(out.to_string_lossy().into_owned());
+    prod.status = Status::Done;
+    prod.percent = 100.0;
+    prod.meta = meta;
+    prod.updated_at = now_str();
+    state.history.lock().upsert(prod.clone());
+    // 产物缩略图：从最终产物抽帧（与下载完成兜底同链路）
+    spawn_product_thumb(
+        app,
+        prod.id.clone(),
+        out.to_path_buf(),
+        prod.meta.cover_stream_index,
+        prod.id.clone(),
+    );
+    let _ = app.emit("list:changed", ());
 }
 
 /// 批量预检结果：(接受的条目, 跳过的条目(id, 原因))。
@@ -799,7 +837,6 @@ fn run_probe(app: AppHandle, id: String, auto_ready: bool) {
                                     &dest,
                                     &thumb_tmp_root,
                                     thumb_proxy.as_deref(),
-                                    None,
                                     &mut |l| log_item(&app2, &id2, l),
                                 )
                             } else {
@@ -1062,6 +1099,35 @@ fn resolve_cookies(
         // 日志里没有任何线索
         Err(e) => (None, Some(format!("读取站点 {host} 的 Cookie 失败：{e}"))),
     }
+}
+
+/// 任务入队/起线程的统一收口（下载/转码/合并共用）。
+///
+/// `Queued` 与 `AlreadyRunning` 都只记排队日志、不起新线程；真正拿到 slot 时才
+/// 调用 `spawn`（调用方传入具体执行体），避免三处各写一遍 submit/日志/spawn。
+pub(super) fn enqueue_or_spawn(
+    app: &AppHandle,
+    id: &str,
+    queued_log: &str,
+    start_log: &str,
+    spawn: impl FnOnce(AppHandle, String) + Send + 'static,
+) {
+    let state = app.state::<AppState>();
+    let outcome = {
+        let mut q = state.queue.lock();
+        q.submit(id)
+    };
+    if matches!(
+        outcome,
+        SubmitOutcome::Queued | SubmitOutcome::AlreadyRunning
+    ) {
+        log_item(app, id, queued_log);
+        return;
+    }
+    log_item(app, id, start_log);
+    let app2 = app.clone();
+    let id2 = id.to_string();
+    std::thread::spawn(move || spawn(app2, id2));
 }
 
 /// 释放并发 slot 并启动下一个等待任务（下载/转码/合并共用）。

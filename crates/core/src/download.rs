@@ -209,13 +209,7 @@ pub fn build_args(url: &str, p: &DownloadParams, cfg: &DownloadConfig) -> Vec<St
         }
     }
     // 自定义 UA + Accept-Language：让请求更像真实浏览器，减少 bot 检测
-    args.push("--user-agent".into());
-    args.push(crate::config::DEFAULT_USER_AGENT.to_string());
-    args.push("--add-header".into());
-    args.push(format!(
-        "Accept-Language:{}",
-        crate::config::DEFAULT_ACCEPT_LANGUAGE
-    ));
+    args.extend(crate::exec::browser_headers());
     // 其他
     args.push("--no-warnings".into());
     // 注意：不加 `--ignore-errors` —— 它会让"下载/后处理失败"仍以退出码 0 结束，
@@ -399,42 +393,15 @@ pub fn newest_media_since(dir: &Path, since: std::time::SystemTime) -> Option<Pa
     files.into_iter().max_by_key(|(t, _)| *t).map(|(_, p)| p)
 }
 
-/// 取消清理：删除本次运行已经落盘的产物与分片残留（§UL-06）。
+/// 取消/失败共用的残留清理（§UL-06）：
+/// - `delete_completed=true`（取消）：删除本任务时间窗内新写的正式产物；
+/// - `false`（失败）：只删 `.part`/`.ytdl` 半成品，保留已成功落盘的文件。
 ///
 /// 只处理"修改时间不早于本次启动"（`started`）的文件：`--no-overwrites` 下重复
 /// 下载会复用输出目录里的既有文件（yt-dlp 报 "has already been downloaded"），
 /// 那种文件绝不能在取消时被删掉。同理，拿不到 mtime 时按"不是本次产物"处理 ——
-/// 宁可留下一个半成品，也不误删用户文件。
-///
-/// yt-dlp 正常收到终止信号时会自行清理 `.part`/`.ytdl`，但进程被
-/// `taskkill /T /F` 强杀时往往来不及，这里按同名前缀兜底扫一遍。
-///
-/// `.part`/`.ytdl` 与正式产物同样只删**本任务时间窗内新写的**（is_new）：
-/// 输出目录里可能有浏览器或其它工具留下的同名 `.part`（并非本任务产物），
-/// 不能按前缀一概删除。
-fn cleanup_cancelled_outputs(
-    extracted: &[PathBuf],
-    dests: &[PathBuf],
-    merged: &[PathBuf],
-    started: std::time::SystemTime,
-) {
-    cleanup_task_outputs(extracted, dests, merged, started, true);
-}
-
-/// 失败（非取消）时的残留清理：只删**本任务时间窗内**新写的 `.part`/`.ytdl`
-/// 半成品，绝不动已完成产物（播放列表部分成功时不能误删成功项）。
-fn cleanup_partial_files(
-    extracted: &[PathBuf],
-    dests: &[PathBuf],
-    merged: &[PathBuf],
-    started: std::time::SystemTime,
-) {
-    cleanup_task_outputs(extracted, dests, merged, started, false);
-}
-
-/// 取消/失败共用的残留清理：
-/// - `delete_completed=true`（取消）：删除本任务时间窗内新写的正式产物；
-/// - `false`（失败）：只删 `.part`/`.ytdl` 半成品，保留已成功落盘的文件。
+/// 宁可留下一个半成品，也不误删用户文件。`.part`/`.ytdl` 同样受时间窗约束：
+/// 输出目录里可能有浏览器或其它工具留下的同名 `.part`（并非本任务产物）。
 fn cleanup_task_outputs(
     extracted: &[PathBuf],
     dests: &[PathBuf],
@@ -566,13 +533,13 @@ pub fn run_download(
     if outcome.killed || cancel.load(Ordering::Relaxed) {
         // 取消：清掉本次已经落盘的产物与分片残留。否则"取消"之后输出目录里
         // 仍会多出一个视频，与用户对"取消"的预期不符。
-        cleanup_cancelled_outputs(&extracted_paths, &dest_paths, &merged_paths, started);
+        cleanup_task_outputs(&extracted_paths, &dest_paths, &merged_paths, started, true);
         return Err(CoreError::Cancelled);
     }
     if !outcome.status.success() {
         // 失败（非取消）：只清 `.part`/`.ytdl` 半成品残留，**不动**已完成的产物 ——
         // 播放列表可能部分成功，删掉成功项的文件会误伤（与取消语义不同）。
-        cleanup_partial_files(&extracted_paths, &dest_paths, &merged_paths, started);
+        cleanup_task_outputs(&extracted_paths, &dest_paths, &merged_paths, started, false);
         return Err(CoreError::ProcessFailed {
             program: "yt-dlp".into(),
             code: outcome.status.code(),
@@ -635,8 +602,15 @@ pub fn run_download(
             stderr: hint,
         });
     }
-    // 本次没有产生新文件（只有"已下载过"的既有文件）→ 不做后处理，避免覆盖用户既有文件
-    let preexisting = !matched_by_scan && merged_paths.is_empty() && dest_paths.is_empty();
+    // 本次没有产生新文件（只有 yt-dlp 自报"已下载过"的既有文件）→ 不做后处理，
+    // 避免覆盖用户既有文件。判据必须锚在 `already_paths`：仅凭"没有 Merger/
+    // Destination 行"会把 `--print-to-file` 兜底找到的**新产物**误判成已存在，
+    // 从而悄悄跳过后处理。
+    let preexisting = !matched_by_scan
+        && merged_paths.is_empty()
+        && dest_paths.is_empty()
+        && extracted_paths.is_empty()
+        && !already_paths.is_empty();
     Ok(DownloadOutcome {
         output_paths,
         preexisting,
@@ -1251,7 +1225,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_cancelled_outputs_respects_task_time_window() {
+    fn cleanup_task_outputs_respects_task_time_window() {
         // R3 回归：`.part` 分片与正式产物一样只删"本任务时间窗内新写的"。
         // 输出目录里可能有浏览器/其它工具留下的同名 `.part`（并非本任务产物），
         // 按名前缀一概删除会误伤；更早启动的并发任务的分片同样受时间窗保护
@@ -1265,13 +1239,13 @@ mod tests {
 
         // started 取"未来 1 小时"：目录里所有文件都早于它，一律按非本次产物处理
         let started = std::time::SystemTime::now() + Duration::from_secs(3600);
-        cleanup_cancelled_outputs(&[], std::slice::from_ref(&dest), &[], started);
+        cleanup_task_outputs(&[], std::slice::from_ref(&dest), &[], started, true);
         assert!(dest.exists(), "早于任务开始的正式产物不应被删除");
         assert!(part.exists(), "早于任务开始的 .part 不应被删除");
 
         // started 取"过去 1 小时"：目录里的文件都是任务期间新写的，全部清理
         let started = std::time::SystemTime::now() - Duration::from_secs(3600);
-        cleanup_cancelled_outputs(&[], std::slice::from_ref(&dest), &[], started);
+        cleanup_task_outputs(&[], std::slice::from_ref(&dest), &[], started, true);
         assert!(!dest.exists(), "本任务的正式产物应被清理");
         assert!(!part.exists(), "本任务时间窗内的 .part 应被清理");
     }

@@ -33,8 +33,6 @@ pub async fn probe_hw_encoders(
 /// 依赖页「下载 / 更新」结果。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ToolInstallResult {
-    /// 本次是否真的下载并安装了文件（false = 已有托管副本 / 已是最新）
-    pub updated: bool,
     /// 该工具当前生效的路径（「下载」成功后前端写回设置输入框）
     pub path: String,
     /// 安装后（或当前）的版本号；工具不报版本时为 None
@@ -205,7 +203,6 @@ fn install_blocking(
         "已安装到"
     };
     Ok(ToolInstallResult {
-        updated: true,
         path: done.path.to_string_lossy().into_owned(),
         version,
         message: format!("{name}{vs}{verb} {}", done.path.display()),
@@ -232,7 +229,6 @@ fn plan_install(
                 .map(|v| format!("（{v}）"))
                 .unwrap_or_default();
             return Ok(InstallPlan::Done(ToolInstallResult {
-                updated: false,
                 path: dest.to_string_lossy().into_owned(),
                 version,
                 message: format!("{name}{vs}已在 tools\\ 中；如需检查新版本请点\"更新\""),
@@ -268,7 +264,6 @@ fn plan_install(
             .map(|v| format!("（{v}）"))
             .unwrap_or_default();
         return Ok(InstallPlan::Done(ToolInstallResult {
-            updated: false,
             path: target.to_string_lossy().into_owned(),
             version: local,
             message: format!("{name}{vs}已是最新，无需更新"),

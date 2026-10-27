@@ -143,14 +143,16 @@ pub struct UpdateInfo {
     pub current_version: String,
     pub latest_version: String,
     pub url: String,
+    /// 最新版是否高于当前版本（版本比较只在后端做一份，前端不再重复实现）
+    pub has_new: bool,
 }
 
 /// 查询 GitHub 最新 release：返回 (tag, html_url)。
 ///
 /// 用系统 curl 发请求（与 tool_download 一致，避免 TLS 交叉编译问题）；
-/// 调用方负责隐藏控制台窗口（hide_console）与放到阻塞线程（A6）。
-/// `proxy`：应用代理（GitHub 常被墙，与工具链下载同口径）。
-fn fetch_latest_release(proxy: Option<&str>) -> CmdResult<(String, String)> {
+/// 内部已隐藏控制台窗口，调用方只负责放到阻塞线程（A6）。
+/// `proxy`：应用代理（GitHub 常被墙，与工具链下载同口径；空串视为不走代理）。
+fn fetch_latest_release(proxy: &str) -> CmdResult<(String, String)> {
     let api_url = "https://api.github.com/repos/chevy222/ytdlp-FFmpeg-GUI/releases/latest";
     let mut cmd = std::process::Command::new("curl");
     cmd.args([
@@ -163,8 +165,8 @@ fn fetch_latest_release(proxy: Option<&str>) -> CmdResult<(String, String)> {
         "-H",
         "User-Agent: ytdlp-FFmpeg-GUI",
     ]);
-    if let Some(p) = proxy.filter(|p| !p.trim().is_empty()) {
-        cmd.args(["--proxy", p]);
+    if !proxy.trim().is_empty() {
+        cmd.args(["--proxy", proxy]);
     }
     cmd.arg(api_url);
     ytdlp_core::exec::hide_console(&mut cmd);
@@ -216,7 +218,7 @@ pub async fn check_update(
     let current = env!("CARGO_PKG_VERSION").to_string();
     // curl 最长 10s：必须离开 async worker（A6），并带上应用代理
     let (tag, release_url) =
-        tauri::async_runtime::spawn_blocking(move || fetch_latest_release(Some(proxy.as_str())))
+        tauri::async_runtime::spawn_blocking(move || fetch_latest_release(proxy.as_str()))
             .await
             .map_err(|e| format!("检查更新任务异常：{e}"))??;
     if version_greater(&tag, &current) {
@@ -224,6 +226,7 @@ pub async fn check_update(
             current_version: current,
             latest_version: tag,
             url: release_url,
+            has_new: true,
         }))
     } else {
         Ok(None)
@@ -248,19 +251,24 @@ pub async fn get_version_info(
     let current = env!("CARGO_PKG_VERSION").to_string();
     // curl 最长 10s：离开 async worker（A6），并带应用代理
     let fetched =
-        tauri::async_runtime::spawn_blocking(move || fetch_latest_release(Some(proxy.as_str())))
+        tauri::async_runtime::spawn_blocking(move || fetch_latest_release(proxy.as_str()))
             .await
             .unwrap_or_else(|_| Err("查询任务异常".into()));
     match fetched {
-        Ok((tag, url)) => Ok(UpdateInfo {
-            current_version: current,
-            latest_version: tag,
-            url,
-        }),
+        Ok((tag, url)) => {
+            let has_new = version_greater(&tag, &current);
+            Ok(UpdateInfo {
+                current_version: current,
+                latest_version: tag,
+                url,
+                has_new,
+            })
+        }
         Err(_) => Ok(UpdateInfo {
             current_version: current,
             latest_version: String::new(),
             url: "https://github.com/chevy222/ytdlp-FFmpeg-GUI/releases".into(),
+            has_new: false,
         }),
     }
 }

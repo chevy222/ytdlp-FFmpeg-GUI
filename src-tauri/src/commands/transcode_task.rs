@@ -1,17 +1,15 @@
 //! 转码任务线程：批量转码/放大入口、参数组装、执行与收尾（产物回列表）。
 
 use super::{
-    default_output_dir, ensure_main_window, log_error_lines, log_item, now_str, persist,
-    prepare_batch, restore_status, spawn_product_thumb, transition_in, update_item,
-    update_progress, CmdResult, ProgressPayload, SlotGuard,
+    add_product_item, default_output_dir, enqueue_or_spawn, ensure_main_window, log_error_lines,
+    log_item, persist, prepare_batch, restore_status, transition_in, update_item, update_progress,
+    CmdResult, ProgressPayload, SlotGuard,
 };
 use crate::state::AppState;
 use std::collections::HashMap;
 use tauri::{AppHandle, Emitter, Manager};
-use ytdlp_core::download::probe_output;
-use ytdlp_core::model::{ItemKind, MediaItem, MediaMeta, Status};
+use ytdlp_core::model::{ItemKind, MediaMeta, Status};
 use ytdlp_core::transcode::{self, TranscodeParams};
-use ytdlp_core::worker::SubmitOutcome;
 use ytdlp_core::CoreError;
 
 /// 批量转码（TC-05：按 设置-转码/通用 默认参数执行，不弹确认窗）。
@@ -129,20 +127,13 @@ fn begin_transcode(app: AppHandle, ids: Vec<String>, upscale: bool) -> CmdResult
         return Err("没有可转码的条目（需要已解析的本地文件）".into());
     }
     for id in to_run {
-        let outcome = {
-            let mut q = state.queue.lock();
-            q.submit(&id)
-        };
-        if matches!(
-            outcome,
-            SubmitOutcome::Queued | SubmitOutcome::AlreadyRunning
-        ) {
-            log_item(&app, &id, "已排队，等待并发 slot…");
-        } else {
-            log_item(&app, &id, "开始转码…");
-            let app2 = app.clone();
-            std::thread::spawn(move || run_transcode_task(app2, id));
-        }
+        enqueue_or_spawn(
+            &app,
+            &id,
+            "已排队，等待并发 slot…",
+            "开始转码…",
+            run_transcode_task,
+        );
     }
     persist(&app);
     Ok(())
@@ -314,34 +305,15 @@ fn finish_transcode(app: &AppHandle, id: &str, result: Result<std::path::PathBuf
         } else {
             it.percent
         };
-        if let Err(e) = &result {
-            it.error = Some(e.to_string());
-        }
+        // 取消不算错误；成功必须清掉上一次转码失败留下的文案
+        it.error = match &result {
+            Ok(_) | Err(CoreError::Cancelled) => None,
+            Err(e) => Some(e.to_string()),
+        };
     });
     // 成功：产物作为新条目回到列表（TC-11）
     if let Ok(out) = &result {
-        // 探测失败不再静默吞掉：产物元数据（画质列）会空着，必须让用户看到原因
-        let meta = match probe_output(&state.resolver(), out, |l| log_item(app, id, l)) {
-            Ok(m) => m,
-            Err(e) => {
-                log_item(app, id, format!("产物解析失败（画质列为空）：{e}"));
-                Default::default()
-            }
-        };
-        let title = out
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "转码产物".into());
-        let mut prod = MediaItem::new(ItemKind::TranscodeOut, title);
-        prod.path = Some(out.to_string_lossy().into_owned());
-        prod.status = Status::Done;
-        prod.percent = 100.0;
-        prod.meta = meta;
-        prod.updated_at = now_str();
-        state.history.lock().upsert(prod.clone());
-        // 产物缩略图：从最终产物抽帧（与下载完成兜底同链路）
-        spawn_product_thumb(app, prod.id.clone(), out.clone(), prod.meta.cover_stream_index);
-        let _ = app.emit("list:changed", ());
+        add_product_item(app, ItemKind::TranscodeOut, out, "转码产物", id);
     }
     // 清理取消标志（并发 slot 由调用方的 SlotGuard 释放），启动下一个等待任务
     state.cancels.lock().remove(id);

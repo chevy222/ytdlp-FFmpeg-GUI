@@ -11,7 +11,7 @@
 //! 1. 创建窗口不能发生在主线程/同步命令里。Tauri 官方文档（`WebviewWindowBuilder::new`）：
 //!    *On Windows, this function deadlocks when used in a synchronous command and event handlers…
 //!    You should use `async` commands and separate threads when creating windows.*
-//!    所以 `open_login_site` / `relogin_item` 必须带 `#[tauri::command(async)]`。
+//!    所以 `open_login_site` / `relogin_item` 都定义成 `#[tauri::command] pub async fn`。
 //!    一旦死锁，新窗口只创建了 HWND、从没绘制过（= 空白），WM_CLOSE 也无人处理（= 点 × 没用）。
 //! 2. 关闭/保存的嗅探必须走 `on_navigation`（导航**开始**即触发，返回 false 取消导航），
 //!    不能用 `on_page_load` —— 后者要等页面加载成功，而 `http://127.0.0.1/...` 上没有任何
@@ -24,31 +24,32 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
-/// 登录窗使用的 UA：桌面 Chrome。
+/// 登录窗使用的 UA：桌面 Chrome（与下载/解析链路**共用同一个常量**）。
 ///
 /// WebView2 的默认 UA 带 `Edg/` 等标识，部分站点会据此返回空白页或进入重定向
-/// 循环；换成标准桌面 Chrome UA 以提高兼容性。
-///
-/// **必须与 `download.rs` 的 `DEFAULT_USER_AGENT` 保持一致**：登录窗用什么 UA
-/// 登录、下载就用什么 UA 请求，否则站点按 UA 指纹风控时会出现"登录了但下载 403"。
-/// 维护提示：站点风控会按 UA 的版本号判定"浏览器是否过旧"，上调时两处一起改。
-pub const LOGIN_USER_AGENT: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
+/// 循环；换成标准桌面 Chrome UA 以提高兼容性。登录窗与下载必须同 UA，否则站点
+/// 按 UA 指纹风控时会出现"登录了但下载 403"。
+pub const LOGIN_USER_AGENT: &str = ytdlp_core::config::DEFAULT_USER_AGENT;
 
 /// 开窗进行中标志：开窗已被移到 async 命令的线程上，这里再挡一道重复点击
 /// （同 label 建两次会报错，用户看不出为什么）。
 static LOGIN_OPENING: AtomicBool = AtomicBool::new(false);
 
+/// host 是否等于域名本身或其子域（`netflix.com` 不得命中 `x.com`）。
+fn host_matches(host: &str, domain: &str) -> bool {
+    host == domain || host.ends_with(&format!(".{domain}"))
+}
+
 /// 已知支持内置登录的站点 → 登录 URL。
 pub fn login_url_for_host(host: &str) -> Option<String> {
-    let h = host.to_lowercase();
-    if h.contains("youtube") || h.contains("youtu.be") {
+    let h = host.trim().trim_start_matches('.').to_lowercase();
+    if host_matches(&h, "youtube.com") || host_matches(&h, "youtu.be") {
         Some("https://www.youtube.com/".into())
-    } else if h.contains("bilibili") {
+    } else if host_matches(&h, "bilibili.com") {
         Some("https://www.bilibili.com/".into())
-    } else if h.contains("x.com") || h.contains("twitter") {
+    } else if host_matches(&h, "x.com") || host_matches(&h, "twitter.com") {
         Some("https://x.com/".into())
-    } else if h.contains("douyin") {
+    } else if host_matches(&h, "douyin.com") {
         Some("https://www.douyin.com/".into())
     } else {
         None
@@ -57,7 +58,7 @@ pub fn login_url_for_host(host: &str) -> Option<String> {
 
 /// 打开登录窗。
 ///
-/// **调用方必须保证不在主线程**（用 `#[tauri::command(async)]` 的 async 命令，
+/// **调用方必须保证不在主线程**（用 `#[tauri::command] pub async fn` 的 async 命令，
 /// 或自己 `std::thread::spawn`），否则 Windows 上会死锁 —— 见文件头注释。
 pub fn open_login(app: &AppHandle, host: &str, url: &str) -> Result<(), String> {
     // 已存在则聚焦
@@ -112,11 +113,10 @@ fn build_login_window(app: &AppHandle, host: &str, url: &str) -> Result<(), Stri
             Some(MagicNav::Done) => {
                 let app = app_for_nav.clone();
                 let host = host_for_nav.clone();
-                let done = url.to_string();
                 // 回调在主线程：保存流程（with_webview + 泵消息、写 Cookie、关窗）一律下放子线程
                 std::thread::spawn(move || {
                     if let Some(win) = app.get_webview_window("ytdlp-login") {
-                        handle_login_done(&win, &host, &done);
+                        handle_login_done(&win, &host);
                     }
                 });
                 false
@@ -165,7 +165,7 @@ fn classify_magic_url(url: &url::Url) -> Option<MagicNav> {
     }
 }
 
-fn handle_login_done(win: &tauri::WebviewWindow, host: &str, _url: &str) {
+fn handle_login_done(win: &tauri::WebviewWindow, host: &str) {
     let app = win.app_handle().clone();
     // 仅保留 COM 抓取通路：**不接受 URL 携带的 `cookies=` 载荷**。
     // 该回退分支无法区分"是我注入的完成按钮点的"还是"页面任何脚本发起的
@@ -343,6 +343,11 @@ mod tests {
             .unwrap()
             .contains("douyin"));
         assert!(login_url_for_host("example.com").is_none());
+        // 子串匹配会把 netflix.com / box.com 误判成 X；必须按 host 边界匹配
+        assert!(login_url_for_host("netflix.com").is_none());
+        assert!(login_url_for_host("box.com").is_none());
+        assert!(login_url_for_host("m.youtube.com").is_some());
+        assert!(login_url_for_host("youtu.be").is_some());
     }
 
     #[test]

@@ -1,5 +1,5 @@
 //! Windows 专用：经 WebView2 CookieManager（COM）抓取含 HttpOnly 的 Cookie（DL-05）。
-//! 仅 Windows target 编译；任何失败返回 None，调用方回退到注入 URL 携带的 document.cookie。
+//! 仅 Windows target 编译；任何失败返回 None，由调用方明确报错（不再回退 URL 载荷）。
 
 #![cfg(windows)]
 
@@ -9,7 +9,6 @@ use tauri::webview::PlatformWebview;
 use webview2_com::GetCookiesCompletedHandler;
 use webview2_com::Microsoft::Web::WebView2::Win32::{
     ICoreWebView2Cookie, ICoreWebView2CookieList, ICoreWebView2_2,
-    COREWEBVIEW2_COOKIE_SAME_SITE_KIND,
 };
 use windows::core::{Interface, PCWSTR, PWSTR};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -27,7 +26,7 @@ const COOKIE_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// WebView2 的异步回调要靠 STA 消息泵投递，所以不能裸阻塞 `recv()`；但
 /// `wait_with_pump` **没有超时**——回调不来（webview 正在销毁、COM 出问题）就永远泵下去，
 /// 而这段代码跑在**主线程**（`with_webview` 的回调里），一旦卡住就是"窗口空白 + 点 × 没反应"
-/// 的整机冻结。这里自己泵并设上限，超时返回 None，调用方回退到 URL 携带的 cookie。
+/// 的整机冻结。这里自己泵并设上限，超时返回 None，由调用方报错。
 fn wait_with_pump_timeout<T>(rx: &mpsc::Receiver<T>, timeout: std::time::Duration) -> Option<T> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
@@ -131,12 +130,10 @@ fn bool_from(b: windows::core::BOOL) -> bool {
 fn cookie_to_entry(c: &ICoreWebView2Cookie) -> CookieEntry {
     let mut is_http = windows::core::BOOL(0);
     let mut is_secure = windows::core::BOOL(0);
-    let mut same_site = COREWEBVIEW2_COOKIE_SAME_SITE_KIND::default();
     let mut expires = 0.0f64;
     unsafe {
         let _ = c.IsHttpOnly(&mut is_http);
         let _ = c.IsSecure(&mut is_secure);
-        let _ = c.SameSite(&mut same_site);
         let _ = c.Expires(&mut expires);
     }
     CookieEntry {
@@ -147,10 +144,5 @@ fn cookie_to_entry(c: &ICoreWebView2Cookie) -> CookieEntry {
         expires: if expires > 0.0 { Some(expires) } else { None },
         http_only: bool_from(is_http),
         secure: bool_from(is_secure),
-        same_site: match same_site.0 {
-            1 => "lax".into(),
-            2 => "strict".into(),
-            _ => "none".into(),
-        },
     }
 }

@@ -1,16 +1,14 @@
 //! 合并任务线程：合并作业参数、锚点提交、执行与收尾（产物回列表）。
 
 use super::{
-    default_output_dir, ensure_main_window, log_error_lines, log_item, now_str, persist,
-    prepare_batch, restore_status, spawn_product_thumb, today_stamp, transition_in, update_item,
+    add_product_item, default_output_dir, enqueue_or_spawn, ensure_main_window, log_error_lines,
+    log_item, persist, prepare_batch, restore_status, today_stamp, transition_in, update_item,
     update_progress, CmdResult, ProgressPayload, SlotGuard,
 };
 use crate::state::AppState;
 use tauri::{AppHandle, Emitter, Manager};
-use ytdlp_core::download;
 use ytdlp_core::merge::{self, MergeParams};
-use ytdlp_core::model::{ItemKind, MediaItem, Status};
-use ytdlp_core::worker::SubmitOutcome;
+use ytdlp_core::model::{ItemKind, Status};
 use ytdlp_core::CoreError;
 
 /// 合并面板参数（MG-01/04：低频操作，仅面板内配置，不落 config.json）。
@@ -92,26 +90,18 @@ pub fn start_merge(
     for id in &job.ids {
         state.merge_jobs.lock().insert(id.clone(), job.clone());
     }
-    let outcome = {
-        let mut q = state.queue.lock();
-        q.submit(&anchor)
-    };
     for id in &job.ids {
         if id != &anchor {
             log_item(&app, id, "随本批合并作业一起执行…");
         }
     }
-    if matches!(
-        outcome,
-        SubmitOutcome::Queued | SubmitOutcome::AlreadyRunning
-    ) {
-        log_item(&app, &anchor, "已排队，等待并发 slot…");
-    } else {
-        log_item(&app, &anchor, "开始合并…");
-        let app2 = app.clone();
-        let anchor2 = anchor.clone();
-        std::thread::spawn(move || run_merge_task(app2, anchor2));
-    }
+    enqueue_or_spawn(
+        &app,
+        &anchor,
+        "已排队，等待并发 slot…",
+        "开始合并…",
+        run_merge_task,
+    );
     persist(&app);
     Ok(())
 }
@@ -154,7 +144,7 @@ pub(super) fn run_merge_task(app: AppHandle, id: String) {
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     );
-    let (inputs, params) = {
+    let params = {
         let mut inputs = Vec::new();
         let mut anchor = None;
         {
@@ -184,9 +174,9 @@ pub(super) fn run_merge_task(app: AppHandle, id: String) {
             normalize_audio: job.normalize_audio,
             max_gain_db: cfg.general.max_gain_db,
         };
-        (p.inputs.clone(), p)
+        p
     };
-    if inputs.len() < 2 {
+    if params.inputs.len() < 2 {
         log_item(&app, &id, "合并输入不足，已取消");
         {
             let mut jobs = state.merge_jobs.lock();
@@ -262,7 +252,11 @@ fn finish_merge(
             Status::Failed
         }
     };
-    let err_text = result.as_ref().err().map(|e| e.to_string());
+    // 取消不算错误；成功必须清掉上一次合并失败留下的文案
+    let err_text = match &result {
+        Ok(_) | Err(CoreError::Cancelled) => None,
+        Err(e) => Some(e.to_string()),
+    };
     // 全部参与条目一起恢复状态（锚点条目另带进度/错误）
     for jid in ids {
         let orig = restore_status(app, jid);
@@ -283,34 +277,11 @@ fn finish_merge(
             if is_anchor && pct {
                 it.percent = 100.0;
             }
-            if let Some(e) = &err {
-                it.error = Some(e.clone());
-            }
+            it.error = err;
         });
     }
     if let Ok(out) = &result {
-        // 探测失败不再静默吞掉：产物元数据（画质列）会空着，必须让用户看到原因
-        let meta = match download::probe_output(&state.resolver(), out, |l| log_item(app, id, l)) {
-            Ok(m) => m,
-            Err(e) => {
-                log_item(app, id, format!("产物解析失败（画质列为空）：{e}"));
-                Default::default()
-            }
-        };
-        let title = out
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "合并产物".into());
-        let mut prod = MediaItem::new(ItemKind::MergeOut, title);
-        prod.path = Some(out.to_string_lossy().into_owned());
-        prod.status = Status::Done;
-        prod.percent = 100.0;
-        prod.meta = meta;
-        prod.updated_at = now_str();
-        state.history.lock().upsert(prod.clone());
-        // 产物缩略图：从最终产物抽帧（与下载完成兜底同链路）
-        spawn_product_thumb(app, prod.id.clone(), out.clone(), prod.meta.cover_stream_index);
-        let _ = app.emit("list:changed", ());
+        add_product_item(app, ItemKind::MergeOut, out, "合并产物", id);
     }
     {
         let mut jobs = state.merge_jobs.lock();

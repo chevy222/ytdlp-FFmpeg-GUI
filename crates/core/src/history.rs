@@ -167,15 +167,9 @@ impl History {
         self.items.len() != before
     }
 
-    /// 清除全部终态条目（Done/Failed/Canceled）。
-    pub fn clear_terminal(&mut self) {
-        self.items.retain(|i| !i.status.is_terminal());
-    }
-
     /// 清除全部非活跃条目（Ready/Done/Failed/Canceled/NeedLogin），
     /// 保留解析中和处理中的（Probing/Downloading/PostProcessing/Transcoding/Merging）。
-    /// "清空列表"按钮用这个，而不是 clear_terminal——后者只清终态，
-    /// 本地添加的 Ready 条目清不掉，与"清空列表"的用户预期不符。
+    /// "清空列表"按钮用这个（只清终态会留下本地添加的 Ready 条目，与用户预期不符）。
     pub fn clear_idle(&mut self) {
         self.items.retain(|i| i.status.is_active());
     }
@@ -344,7 +338,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_done_keeps_active() {
+    fn clear_idle_keeps_active() {
         let mut h = History::new(10);
         let mut done = item(1);
         done.status = Status::Done;
@@ -355,7 +349,7 @@ mod tests {
         h.upsert(done);
         h.upsert(failed);
         h.upsert(active);
-        h.clear_terminal();
+        h.clear_idle();
         assert_eq!(h.len(), 1);
         assert_eq!(h.items[0].status, Status::Downloading);
     }

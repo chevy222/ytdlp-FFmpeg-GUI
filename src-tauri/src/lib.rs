@@ -141,7 +141,6 @@ pub fn run() {
             commands::settings::get_config,
             commands::settings::save_config,
             commands::cookies::list_cookies,
-            commands::cookies::save_cookies,
             commands::cookies::delete_cookie,
             commands::tools::probe_dependencies,
             commands::tools::download_tool,

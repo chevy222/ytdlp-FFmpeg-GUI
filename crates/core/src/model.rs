@@ -130,7 +130,7 @@ pub enum ItemKind {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AudioVolume {
-    pub mean_volume_db: Option<f32>,
+    /// 峰值电平（增益决策唯一依据）
     pub max_volume_db: Option<f32>,
 }
 
@@ -168,8 +168,6 @@ pub struct MediaMeta {
     pub audio_volume: AudioVolume,
     /// 文件大小字节
     pub size_bytes: Option<u64>,
-    /// 是否含封面
-    pub has_cover: bool,
     /// 视频流 extradata（SPS/PPS 等，hex）——合并直拼硬性条件（MG-02）
     pub extradata: Option<String>,
     /// 首音频流采样率 Hz
@@ -181,10 +179,7 @@ pub struct MediaMeta {
     /// 封面流（attached_pic）绝对索引；`-map` / `-filter_complex` 按此映射。
     /// 注意：ffmpeg 的 `0:t?` 在 MP4 上**选不中** attached_pic（实测），必须用绝对索引。
     pub cover_stream_index: Option<u32>,
-    /// 容器内旋转标记（stream tags `rotate`，MD-02 采集）。
-    /// 仅记录源文件标记；实际转码采用条目 `rot_angle`（TC-04 手动旋转）。
-    pub rotate_tag: Option<i32>,
-    /// 源编码宽度（竖屏源与 rotate_tag 配合判定"短边"分辨率，MD-02/§8）。
+    /// 源编码宽度（竖屏源判定"短边"分辨率用，MD-02/§8）。
     pub width: Option<u32>,
     /// 结构化下载格式列表（DL-02 格式选择；含 format_id 供下载使用）
     pub download_formats: Vec<DownloadFormat>,
@@ -676,20 +671,16 @@ mod tests {
     }
 
     #[test]
-    fn short_edge_respects_rotation() {
-        // 竖屏源 1080x1920：短边 1080，不管 rotate_tag
+    fn short_edge_uses_min_dimension() {
+        // 竖屏源 1080x1920：短边 1080
         let mut m = MediaMeta {
             height: Some(1920),
             width: Some(1080),
-            rotate_tag: Some(90),
             ..Default::default()
         };
         assert_eq!(m.short_edge(), Some(1080));
-        m.rotate_tag = None;
-        assert_eq!(m.short_edge(), Some(1080));
         // width 缺失时退回 height
         m.width = None;
-        m.rotate_tag = Some(90);
         assert_eq!(m.short_edge(), Some(1920));
     }
 
@@ -700,7 +691,6 @@ mod tests {
             audio_tracks: Some(2),
             audio_volume: AudioVolume {
                 max_volume_db: Some(-8.2),
-                ..Default::default()
             },
             ..Default::default()
         };
@@ -835,10 +825,9 @@ mod tests {
 
     #[test]
     fn meta_missing_non_option_fields_use_defaults() {
-        // 旧版 history 缺 has_cover/audio_volume 等非 Option 字段时不得整条失败
+        // 旧版 history 缺 audio_volume 等非 Option 字段时不得整条失败
         let m: MediaMeta = serde_json::from_str(r#"{"height":1080}"#).unwrap();
         assert_eq!(m.height, Some(1080));
-        assert!(!m.has_cover);
         assert_eq!(m.audio_volume, AudioVolume::default());
     }
 
