@@ -399,7 +399,7 @@ pub fn cover_stream_usable(resolver: &ToolResolver, path: &Path, index: u32) -> 
         "stream=width,height",
         "-of",
         "csv=p=0",
-        path_str.as_str(),
+        path_str.as_ref(),
     ];
     let Ok(out) = crate::exec::run_tool_capture(resolver, Tool::Ffprobe, &args) else {
         return false;
