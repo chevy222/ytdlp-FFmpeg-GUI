@@ -8,6 +8,7 @@ mod login_win;
 mod state;
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tauri::Manager;
@@ -252,18 +253,25 @@ pub fn run() {
                 // 也必须被置位。
                 let deadline = Instant::now() + Duration::from_secs(5);
                 loop {
-                    let running = {
-                        let st = app_for_exit.state::<state::AppState>();
-                        st.queue.lock().running_count()
-                    };
-                    let pending = {
-                        let st = app_for_exit.state::<state::AppState>();
-                        let cancels = st.cancels.lock();
-                        for flag in cancels.values() {
-                            flag.store(true, Ordering::Relaxed);
-                        }
-                        !cancels.is_empty()
-                    };
+                    // running_count() 返回 usize 不借用 guard，链式调用即可
+                    let running = app_for_exit
+                        .state::<state::AppState>()
+                        .queue
+                        .lock()
+                        .running_count();
+                    // cancels：在一行内 lock → clone Arc flags → 释放锁，
+                    // 不把 MutexGuard 存到变量（否则临时 State 生命周期不够）
+                    let flags: Vec<Arc<AtomicBool>> = app_for_exit
+                        .state::<state::AppState>()
+                        .cancels
+                        .lock()
+                        .values()
+                        .cloned()
+                        .collect();
+                    for f in &flags {
+                        f.store(true, Ordering::Relaxed);
+                    }
+                    let pending = !flags.is_empty();
                     if (running == 0 && !pending) || Instant::now() >= deadline {
                         break;
                     }
