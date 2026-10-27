@@ -54,11 +54,9 @@ use crate::state::AppState;
 use download_task::run_download_task;
 use merge_task::run_merge_task;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tauri::{AppHandle, Emitter, Manager, State};
 use transcode_task::run_transcode_task;
-use ytdlp_core::config::NetworkConfig;
 use ytdlp_core::cookies::CookieStore;
 use ytdlp_core::download;
 use ytdlp_core::exec::ToolResolver;
@@ -761,27 +759,32 @@ fn run_probe(app: AppHandle, id: String, auto_ready: bool) {
                 site: Some("本地文件".into()),
                 host: None,
                 is_playlist: false,
+                entries: Vec::new(),
+                skipped_entries: 0,
             }
         })
     };
 
     match result {
         Ok(p) => {
+            if p.skipped_entries > 0 {
+                log_item(
+                    &app,
+                    &id,
+                    format!(
+                        "播放列表有 {} 条未提供完整 URL（flat 模式限制），已跳过",
+                        p.skipped_entries
+                    ),
+                );
+            }
             let url_src = item.url.is_some();
             // 播放列表（DL-09）：开启时把合集展开为逐集条目平铺进列表。
             // 父条目保持"解析中"直到展开结束（不触发倒计时、不生成封面），
             // 展开成功后从列表移除；失败则落到 NeedLogin/失败/已取消。
+            // entries 来自本次 flat-playlist 解析结果，不再二次调用 yt-dlp。
             let playlist_task = url_src && playlist_on && p.is_playlist;
             if playlist_task {
-                match expand_playlist(
-                    &app,
-                    &id,
-                    &item,
-                    &resolver,
-                    netscape.as_deref(),
-                    &network,
-                    &cancel,
-                ) {
+                match expand_playlist(&app, &id, p.entries) {
                     Ok(n) => ytdlp_core::log::info(format!("播放列表 {id} 展开为 {n} 集")),
                     Err(f) => handle_probe_failure(&app, &id, &f, "播放列表展开失败"),
                 }
@@ -1220,31 +1223,17 @@ pub fn set_sections(
     Ok(())
 }
 
-/// 播放列表展开（DL-09）：flat-playlist 拿每集 URL，逐条作为独立条目解析平铺。
+/// 播放列表展开（DL-09）：使用解析阶段已拿到的 flat-playlist 条目，
+/// 逐条作为独立条目解析平铺（不再二次请求 yt-dlp）。
 ///
 /// 逐集在单个后台线程里**顺序**解析：大合集（数百集）若每集各开线程，
 /// 会瞬间并发起等量 yt-dlp 子进程，打满系统资源并容易触发站点风控；
 /// 顺序解析每集就绪即回显（item:update），体验可接受。
-#[allow(clippy::too_many_arguments)]
 fn expand_playlist(
     app: &AppHandle,
     id: &str,
-    item: &MediaItem,
-    resolver: &ToolResolver,
-    cookies: Option<&Path>,
-    network: &NetworkConfig,
-    cancel: &Arc<AtomicBool>,
+    entries: Vec<probe::PlaylistEntry>,
 ) -> Result<usize, probe::ProbeFailure> {
-    let url = item.url.clone().unwrap_or_default();
-    if url.is_empty() {
-        return Err(probe::ProbeFailure {
-            kind: ProbeErrorKind::Failed,
-            message: "播放列表 URL 为空".into(),
-        });
-    }
-    let entries = probe::list_playlist_entries(resolver, &url, cookies, network, Some(cancel), |l| {
-        log_item(app, id, l)
-    })?;
     if entries.is_empty() {
         return Err(probe::ProbeFailure {
             kind: ProbeErrorKind::Failed,

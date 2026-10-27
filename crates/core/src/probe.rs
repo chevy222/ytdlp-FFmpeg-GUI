@@ -42,6 +42,11 @@ pub struct UrlProbe {
     pub host: Option<String>,
     /// 是否合集/多 P
     pub is_playlist: bool,
+    /// flat-playlist 解析出的逐集条目（非合集为空）；命令层据此直接展开，
+    /// 不再为同一合集二次调用 yt-dlp。
+    pub entries: Vec<PlaylistEntry>,
+    /// flat 模式下拿不到完整 URL 而跳过的条目数
+    pub skipped_entries: usize,
 }
 
 /// 本地解析结果。
@@ -92,7 +97,7 @@ fn ytdlp_args(
     args
 }
 
-/// yt-dlp JSON 类命令的统一执行结果（`-J` 解析 / 播放列表展开共用）。
+/// yt-dlp JSON 类命令的统一执行结果（`-J` 解析）。
 struct JsonRun {
     text: String,
     stderr: String,
@@ -101,8 +106,8 @@ struct JsonRun {
     cancelled: bool,
 }
 
-/// 执行 `yt-dlp -J` 家族命令：建参、spawn、取消兜底、300s 截止、边下边读、
-/// stderr 收集全部收敛在这一处（此前两个解析入口各抄一份，改动要同步两遍）。
+/// 执行 `yt-dlp -J` 解析：建参、spawn、取消兜底、300s 截止、边下边读、
+/// stderr 收集全部收敛在这一处。
 #[allow(clippy::too_many_arguments)]
 fn run_ytdlp_json(
     resolver: &ToolResolver,
@@ -147,84 +152,6 @@ fn run_ytdlp_json(
     })
 }
 
-/// 展开播放列表（yt-dlp -J --flat-playlist）：快速拿每集 URL 与标题，
-/// 命令层据此逐条平铺进统一列表。
-///
-/// 与 [`probe_url`] 同一套读取方式：边下边读、可由 `cancel` 终止、300 秒兜底。
-/// 大合集的 JSON 可达数十 MB，持续排空 stdout 才不会把自己卡在管道缓冲区上。
-// 参数较多是解析入口的固有形态（与 probe_url 同款），按项目惯例放行该 lint。
-#[allow(clippy::too_many_arguments)]
-pub fn list_playlist_entries(
-    resolver: &ToolResolver,
-    url: &str,
-    cookies_file: Option<&Path>,
-    network: &NetworkConfig,
-    cancel: Option<&Arc<AtomicBool>>,
-    mut on_log: impl FnMut(String),
-) -> std::result::Result<Vec<PlaylistEntry>, ProbeFailure> {
-    let run = run_ytdlp_json(
-        resolver,
-        url,
-        cookies_file,
-        network,
-        &["-J", "--flat-playlist", "--no-warnings"],
-        cancel,
-        &mut on_log,
-    )?;
-    if run.killed {
-        let (kind, message) = if run.cancelled {
-            (ProbeErrorKind::Cancelled, "获取播放列表已取消".to_string())
-        } else {
-            (
-                ProbeErrorKind::Network,
-                "获取播放列表超时（超过 300 秒），可重试或检查网络/代理".to_string(),
-            )
-        };
-        return Err(ProbeFailure { kind, message });
-    }
-    if !run.success {
-        let mut f = classify_ytdlp_error(run.stderr.trim());
-        f.message = format!("获取播放列表失败：{}", run.stderr.trim());
-        return Err(f);
-    }
-    let v: Value = match serde_json::from_str(&run.text) {
-        Ok(v) => v,
-        Err(_) => {
-            return Err(ProbeFailure {
-                kind: ProbeErrorKind::Failed,
-                message: "yt-dlp 返回无法解析的播放列表数据".into(),
-            })
-        }
-    };
-    let mut out = Vec::new();
-    let mut skipped = 0usize;
-    if let Some(entries) = v["entries"].as_array() {
-        for e in entries {
-            // flat 模式下 `webpage_url` 常缺失，`url` 在部分 extractor（如抖音）
-            // 下是**裸视频 ID** 而非完整 URL。优先取完整 URL；拿不到完整 URL 的
-            // 条目无法直接下载，跳过并计数（不再用裸 ID 去构造下载命令）。
-            let raw = e["webpage_url"]
-                .as_str()
-                .filter(|s| !s.is_empty())
-                .or_else(|| e["url"].as_str())
-                .unwrap_or_default();
-            if raw.is_empty() || !raw.contains("://") {
-                skipped += 1;
-                continue;
-            }
-            out.push(PlaylistEntry {
-                url: raw.to_string(),
-            });
-        }
-    }
-    if skipped > 0 {
-        on_log(format!(
-            "播放列表有 {skipped} 条未提供完整 URL（flat 模式限制），已跳过"
-        ));
-    }
-    Ok(out)
-}
-
 /// 解析失败（分类 + 摘要）。
 #[derive(Debug, Clone)]
 pub struct ProbeFailure {
@@ -260,11 +187,14 @@ pub fn probe_url(
     cancel: Option<&Arc<AtomicBool>>,
     mut on_log: impl FnMut(String),
 ) -> std::result::Result<UrlProbe, ProbeFailure> {
+    // 合集必须用 flat-playlist：`--yes-playlist` + `-J` 会把每一集都**完整提取**
+    // 一遍，大型合集动辄几分钟且中途没有任何输出；flat 模式只拉列表页，
+    // 每集条目随 JSON 一并返回，展开时不再二次请求。
     let extra: &[&str] = if playlist {
         &[
             "-J",
             "--no-warnings",
-            "--yes-playlist",
+            "--flat-playlist",
             "--socket-timeout",
             "60",
         ]
@@ -471,7 +401,7 @@ pub fn parse_ytdlp_json(text: &str) -> Result<UrlProbe> {
         .or(v["channel"].as_str())
         .map(str::to_string);
     let duration = v["duration"].as_f64();
-    let is_playlist = v["_type"].as_str() == Some("playlist")
+    let mut is_playlist = v["_type"].as_str() == Some("playlist")
         || v["playlist_count"].as_u64().map(|c| c > 1).unwrap_or(false);
     let webpage_url = v["webpage_url"].as_str().unwrap_or_default();
     let host = crate::cookies::host_from_url(webpage_url);
@@ -481,6 +411,31 @@ pub fn parse_ytdlp_json(text: &str) -> Result<UrlProbe> {
     } else {
         Some(extractor.to_string())
     };
+
+    // flat-playlist 的逐集条目：直接从这里取，命令层展开时不再二次调用 yt-dlp。
+    // YouTube 等站点的 flat `url` 是干净的 watch URL；部分 extractor（如抖音）
+    // 只给裸 ID，此时退回 webpage_url。两者都不是完整 URL 的条目跳过并计数。
+    let mut entries = Vec::new();
+    let mut skipped_entries = 0usize;
+    if let Some(arr) = v["entries"].as_array() {
+        for e in arr {
+            let raw = e["url"]
+                .as_str()
+                .filter(|s| s.contains("://"))
+                .or_else(|| e["webpage_url"].as_str().filter(|s| s.contains("://")))
+                .unwrap_or_default();
+            if raw.is_empty() {
+                skipped_entries += 1;
+                continue;
+            }
+            entries.push(PlaylistEntry {
+                url: raw.to_string(),
+            });
+        }
+    }
+    if !entries.is_empty() {
+        is_playlist = true;
+    }
 
     // 格式列表（fps/tbr/filesize 完整时才进入列表；带协议 video+audio 合并项）
     let mut formats: Vec<DownloadFormat> = Vec::new();
@@ -563,6 +518,8 @@ pub fn parse_ytdlp_json(text: &str) -> Result<UrlProbe> {
         site,
         host,
         is_playlist,
+        entries,
+        skipped_entries,
     })
 }
 
@@ -797,6 +754,25 @@ mod tests {
         let text = r#"{"_type":"playlist","playlist_count":5,"title":"合集","formats":[]}"#;
         let p = parse_ytdlp_json(text).unwrap();
         assert!(p.is_playlist);
+        assert!(p.entries.is_empty());
+    }
+
+    #[test]
+    fn parse_ytdlp_json_flat_playlist_entries() {
+        // flat-playlist：YouTube 的 `url` 是干净的 watch URL；部分 extractor 只给
+        // 裸 ID，此时退回 webpage_url；两者都不是完整 URL 的条目跳过并计数。
+        let text = r#"{"_type":"playlist","playlist_count":3,"entries":[
+          {"url":"https://www.youtube.com/watch?v=a"},
+          {"url":"abc123","webpage_url":"https://www.douyin.com/video/abc123"},
+          {"url":"bc456"},
+          {"webpage_url":""}
+        ]}"#;
+        let p = parse_ytdlp_json(text).unwrap();
+        assert!(p.is_playlist);
+        assert_eq!(p.entries.len(), 2);
+        assert_eq!(p.entries[0].url, "https://www.youtube.com/watch?v=a");
+        assert_eq!(p.entries[1].url, "https://www.douyin.com/video/abc123");
+        assert_eq!(p.skipped_entries, 2);
     }
 
     #[test]
