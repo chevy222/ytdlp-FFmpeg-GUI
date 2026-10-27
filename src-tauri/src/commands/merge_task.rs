@@ -146,22 +146,16 @@ pub(super) fn run_merge_task(app: AppHandle, id: String) {
     );
     let params = {
         let mut inputs = Vec::new();
-        let mut anchor = None;
         {
             let hist = state.history.lock();
             for jid in &job.ids {
-                if let Some(item) = hist.get(jid) {
-                    if anchor.is_none() {
-                        anchor = Some(item.clone());
-                    }
-                    if let Some(p) = &item.path {
-                        inputs.push(std::path::PathBuf::from(p));
-                    }
+                if let Some(p) = hist.get(jid).and_then(|item| item.path.as_ref()) {
+                    inputs.push(std::path::PathBuf::from(p));
                 }
             }
         }
         let cfg = state.config.lock().clone();
-        let p = MergeParams {
+        MergeParams {
             inputs,
             out_dir: default_output_dir(&state),
             // 中间产物一律落在 <exe 同级>\temp\（§3.7），不写进用户输出目录
@@ -173,8 +167,7 @@ pub(super) fn run_merge_task(app: AppHandle, id: String) {
             collision_policy: cfg.general.collision_policy.clone(),
             normalize_audio: job.normalize_audio,
             max_gain_db: cfg.general.max_gain_db,
-        };
-        p
+        }
     };
     if params.inputs.len() < 2 {
         log_item(&app, &id, "合并输入不足，已取消");
