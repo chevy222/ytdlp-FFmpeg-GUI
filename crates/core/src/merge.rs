@@ -233,7 +233,7 @@ fn transcode_segment(
         "-map".into(),
         main_map,
         "-map".into(),
-        if has_audio { "0:a:0" } else { "1:a:0" }.into(),
+        (if has_audio { "0:a:0" } else { "1:a:0" }).into(),
         "-vf".into(),
         // 统一画布 + 统一 SAR/像素格式：concat -c copy 的每段必须参数完全一致。
         // 源小于画布时由 pad 补边（默认黑色），避免为了填满画布而拉伸画面。
@@ -243,7 +243,7 @@ fn transcode_segment(
         ),
         "-c:v:0".into(),
         enc,
-    ];
+    ]);
     args.extend(enc_args);
     if let Some(fps) = target_fps.filter(|f| f.is_finite() && *f > 0.0) {
         // 帧率不统一时同样会导致 SPS/level 不一致；模式 B 显式统一。
