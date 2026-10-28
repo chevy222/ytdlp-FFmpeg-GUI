@@ -110,7 +110,7 @@ impl CookieStore {
             for c in self.load_host(&h)? {
                 if !entries
                     .iter()
-                    .any(|e| e.name == c.name && e.domain == c.domain)
+                    .any(|e| e.name == c.name && e.domain == c.domain && e.path == c.path)
                 {
                     entries.push(c);
                 }
@@ -321,33 +321,30 @@ pub fn cookie_candidates(host: &str) -> Vec<String> {
             out.push(s);
         }
     };
-    // 站点级回退：去掉常见子域前缀取父域
-    let parent = h
-        .rsplit_once('.')
-        .and_then(|(sub, tld)| {
-            if sub.contains('.') {
-                Some(format!(
-                    "{}.{}",
-                    sub.rsplit_once('.').map(|(_, s)| s).unwrap_or(sub),
-                    tld
-                ))
-            } else {
-                None // 已是最短二级域
-            }
-        })
-        .unwrap_or_else(|| h.clone());
-    if parent != h {
-        push_unique(&mut out, parent.clone());
-        // 补充常见子域（www）
-        if !parent.starts_with("www.") {
-            push_unique(&mut out, format!("www.{}", parent));
-        }
-    }
-    // 裸域名（x.com / bilibili.com / douyin.com …）：登录保存时会被规范化成
-    // `www.<host>.txt`（commands::cookies::normalize_cookie_host），候选列表必须
-    // 补上 www 变体，否则保存成功、下载却永远匹配不到。
-    if !h.starts_with("www.") && h.split('.').count() == 2 {
-        push_unique(&mut out, format!("www.{}", h));
+    // 已知站点可安全回到站点主域；任意域名只处理显式 www，避免把 co.uk 等
+    // 公共后缀误当可注册父域。
+    let site_base = [
+        "youtube.com",
+        "youtu.be",
+        "bilibili.com",
+        "x.com",
+        "twitter.com",
+        "douyin.com",
+    ]
+    .into_iter()
+    .find(|base| {
+        h == *base
+            || h.strip_suffix(base)
+                .map(|prefix| prefix.ends_with('.'))
+                .unwrap_or(false)
+    });
+    if let Some(base) = site_base {
+        push_unique(&mut out, base.to_string());
+        push_unique(&mut out, format!("www.{base}"));
+    } else if let Some(parent) = h.strip_prefix("www.") {
+        push_unique(&mut out, parent.to_string());
+    } else if h.split('.').count() == 2 {
+        push_unique(&mut out, format!("www.{h}"));
     }
     // X ↔ twitter 姊妹域名互退（两个域名都会保存成 www.*，变体必须一并给出）
     match h.as_str() {
@@ -436,6 +433,13 @@ mod tests {
     }
 
     #[test]
+    fn candidates_do_not_guess_public_suffixes() {
+        let c = cookie_candidates("cdn.example.co.uk");
+        assert_eq!(c, vec!["cdn.example.co.uk".to_string()]);
+        assert!(!c.contains(&"co.uk".to_string()));
+    }
+
+    #[test]
     fn candidates_x_twitter_cross() {
         let c = cookie_candidates("x.com");
         assert!(c.contains(&"twitter.com".to_string()));
@@ -456,6 +460,21 @@ mod tests {
         assert_eq!(loaded[0].name, "SID");
         store.delete_host("youtube.com").unwrap();
         assert!(store.list_hosts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn merged_entries_keep_distinct_cookie_paths() {
+        let root = tempdir().unwrap();
+        let store = CookieStore::new(root.path().join("cookies"));
+        let mut root_cookie = ck("SID", "root", ".example.com");
+        root_cookie.path = "/".into();
+        let mut api_cookie = ck("SID", "api", ".example.com");
+        api_cookie.path = "/api".into();
+        store
+            .save_host("example.com", vec![root_cookie, api_cookie])
+            .unwrap();
+        let entries = store.merged_entries("example.com").unwrap();
+        assert_eq!(entries.len(), 2);
     }
 
     #[test]

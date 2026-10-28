@@ -43,7 +43,7 @@ impl From<ytdlp_core::cli::CliArgs> for CliOverrides {
 
 pub struct AppState {
     pub paths: Paths,
-    /// history.json 本次未能读取（已尽力备份）：启动时禁止用空列表覆盖原文件。
+    /// history.json 本次未能读取：重启并成功加载前禁止用内存占位覆盖原文件。
     pub history_load_failed: bool,
     pub history: Mutex<History>,
     pub config: Mutex<AppConfig>,
@@ -181,6 +181,9 @@ impl AppState {
     /// P1-5 去抖在 [`crate::commands::persist`] 层做：500ms 内的多次调用合并为
     /// 一次 `persist()`。本函数只负责真正写盘，并更新 `last_persist_ms`。
     pub fn persist(&self) {
+        if self.history_load_failed {
+            return;
+        }
         let my_seq = self.persist_req.fetch_add(1, Ordering::SeqCst) + 1;
         let _writer = self.persist_lock.lock();
         let highest = self.persist_req.load(Ordering::SeqCst);

@@ -2,8 +2,8 @@
 
 use super::{
     add_product_item, default_output_dir, enqueue_or_spawn, ensure_main_window, log_error_lines,
-    log_item, persist, prepare_batch, restore_status, transition_in, update_item, update_progress,
-    CmdResult, ProgressPayload, SlotGuard,
+    log_item, persist, prepare_batch, restore_status, transition_in, unregister_cancel, update_item,
+    update_item_finished, update_progress, CmdResult, ProgressPayload, SlotGuard,
 };
 use crate::state::AppState;
 use std::collections::HashMap;
@@ -77,6 +77,7 @@ fn begin_transcode(app: AppHandle, ids: Vec<String>, upscale: bool) -> CmdResult
             &mut hist,
             &ids,
             Status::Transcoding,
+            true,
             "转码被跳过",
             |item| {
                 let has_file = item
@@ -166,7 +167,7 @@ pub(super) fn run_transcode_task(app: AppHandle, id: String) {
     let (item, path) = match loaded {
         None => {
             // 条目在排队期间被删除：清取消标志即可（slot 由守卫释放）
-            state.cancels.lock().remove(&id);
+            unregister_cancel(state, &id, &cancel);
             return;
         }
         Some((item, Some(p))) => (item, std::path::PathBuf::from(p)),
@@ -174,11 +175,10 @@ pub(super) fn run_transcode_task(app: AppHandle, id: String) {
             // 无本地文件（start_transcode 已校验过，此处为兜底）：判失败并释放，
             // 不能把条目永远留在 Transcoding 状态。此处 history 锁已释放，
             // update_item / persist 可以安全调用。
-            update_item(&app, &id, |it| {
+            update_item_finished(&app, &id, &cancel, |it| {
                 transition_in(it, Status::Failed);
                 it.error = Some("无本地输入文件".into());
             });
-            state.cancels.lock().remove(&id);
             persist(&app);
             return;
         }
@@ -271,12 +271,16 @@ pub(super) fn run_transcode_task(app: AppHandle, id: String) {
         },
         |line| log_item(&app, &id, line),
     );
-    finish_transcode(&app, &id, result);
+    finish_transcode(&app, &id, &cancel, result);
 }
 
 /// 转码收尾：原条目恢复、产物作为新条目回列表、释放队列 slot。
-fn finish_transcode(app: &AppHandle, id: &str, result: Result<std::path::PathBuf, CoreError>) {
-    let state = app.state::<AppState>();
+fn finish_transcode(
+    app: &AppHandle,
+    id: &str,
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    result: Result<std::path::PathBuf, CoreError>,
+) {
     let (orig_status, final_status) = match &result {
         Ok(out) => {
             log_item(app, id, format!("转码完成，产物回列表：{}", out.display()));
@@ -291,7 +295,7 @@ fn finish_transcode(app: &AppHandle, id: &str, result: Result<std::path::PathBuf
             (restore_status(app, id), Status::Failed)
         }
     };
-    update_item(app, id, |it| {
+    update_item_finished(app, id, cancel, |it| {
         // cancel_item 抢先写成 Canceled，但转码实际已完成。状态机已允许
         // Canceled → Ready/Done，这里显式覆盖是为了额外写一条完成日志。
         if it.status == Status::Canceled && final_status == Status::Done {
@@ -315,7 +319,5 @@ fn finish_transcode(app: &AppHandle, id: &str, result: Result<std::path::PathBuf
     if let Ok(out) = &result {
         add_product_item(app, ItemKind::TranscodeOut, out, "转码产物", id);
     }
-    // 清理取消标志（并发 slot 由调用方的 SlotGuard 释放），启动下一个等待任务
-    state.cancels.lock().remove(id);
     persist(app);
 }

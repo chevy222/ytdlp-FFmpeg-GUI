@@ -1,7 +1,13 @@
 // ===== 状态 =====
-const S = { items: [], selected: new Set(), config: null, cdTimer: {}, cdSecs: {}, toolDl: {} };
+const S = { items: [], selected: new Set(), config: null, cdTimer: {}, cdSecs: {}, toolDl: {}, dlPending: new Set() };
 const INVOKE = (cmd, args) => window.__TAURI__.core.invoke(cmd, args || {});
 const LISTEN = window.__TAURI__.event.listen;
+let configWrites=Promise.resolve();
+function queueConfigWrite(write){
+  const pending=configWrites.then(write);
+  configWrites=pending.catch(()=>{});
+  return pending;
+}
 
 function copyText(text){
   if(!text) return;
@@ -119,19 +125,29 @@ function canLogin(it){
     x.domains.some(d=>host===d||host.endsWith('.'+d)) || x.sites.includes(site));
 }
 
+function hasItemFile(it){
+  return it.kind!=='UrlTask'||['PostProcessing','Done','Transcoding'].includes(it.status);
+}
+function canTranscode(it){
+  return !!it.path&&(it.status==='Ready'||it.status==='Done');
+}
+function canRotate(it){
+  return it.status!=='Probing'&&hasItemFile(it);
+}
+
 function ops(it){
   const id=esc(it.id), s=it.status;
   let h='<div class="ops">';
   const cd = (S.cdSecs[it.id] && s==='Ready' && it.kind==='UrlTask') ? '<span class="countdown">'+S.cdSecs[it.id]+'s 后自动下载</span>' : '';
   if (it.kind==='UrlTask' && s==='Ready') h += cd + '<button class="btn sm primary" data-act="dl" data-id="'+id+'">下载</button>';
   if (it.kind==='UrlTask' && s==='Ready') h += '<button class="btn sm" data-act="sec" data-id="'+id+'">剪辑</button>';
-  if ((s==='Ready'||s==='Done') && it.path) h += '<button class="btn sm" data-act="tc" data-id="'+id+'">转码</button>';
+  if (canTranscode(it)) h += '<button class="btn sm" data-act="tc" data-id="'+id+'">转码</button>';
   // 需要登录时必须有入口；**解析完成的 URL 任务也提供** —— 不少站点未登录
   // 同样能解析出受限清晰度（B 站只给低码率、没有 1080P+），此时状态是 Ready
   // 而不是 NeedLogin，用户就完全找不到登录入口。只对支持内置登录的站点显示，
   // 免得点了一片"该站点不支持内置登录"。
   if ((s==='NeedLogin' || (it.kind==='UrlTask' && s==='Ready')) && canLogin(it)) h += '<button class="btn sm" data-act="relogin" data-id="'+id+'">去登录</button>';
-  if (s==='Downloading'||s==='PostProcessing'||s==='Transcoding'||s==='Merging') h += '<button class="btn sm danger" data-act="cancel" data-id="'+id+'">取消</button>';
+  if (BUSY_STATUS.includes(s)) h += '<button class="btn sm danger" data-act="cancel" data-id="'+id+'">取消</button>';
   if (s==='Failed'||s==='Canceled'||s==='NeedLogin') h += '<button class="btn sm" data-act="retry" data-id="'+id+'">重试</button>';
   if (s==='Done') h += '<button class="btn sm" data-act="open" data-id="'+id+'">打开</button>';
   if (s==='Done'||s==='Failed'||s==='Canceled'||s==='Unknown') h += '<button class="btn sm" data-act="del" data-id="'+id+'">删除</button>';
@@ -168,12 +184,12 @@ function rowHtml(it){
   const probing = it.status==='Probing';
   // 旋转只对"文件已存在"的条目有意义（rot_angle 是转码参数）：
   // 本地文件/产物条目解析完即可设；URL 条目要等下载产物落地（后处理中起）
-  const hasFile = it.kind!=='UrlTask' || ['PostProcessing','Done','Transcoding'].includes(it.status);
+  const hasFile = hasItemFile(it);
   const cv = probing
     ? '<div class="cv"><div class="thumb empty"><span class="ph">影</span></div></div>'
     : '<div class="cv"><div class="thumb'+(it.thumb?'':' empty')+(ang?' rot'+(ang%360):'')+'" data-id="'+id+'">'+(it.thumb?('<img src="'+esc(thumbSrc(it.thumb))+'" alt="">'):'<span class="ph">影</span>')+'</div>'+
       '<span class="rotbadge'+(ang?' show':'')+'">'+ang+'°</span></div>';
-  const rots = (probing || !hasFile) ? '' :
+  const rots = !canRotate(it) ? '' :
       '<button class="rotbtn" data-act="rotcw" data-id="'+id+'" title="顺时针">'+rotSvg(true)+'</button>'+
       '<button class="rotbtn" data-act="rotccw" data-id="'+id+'" title="逆时针">'+rotSvg(false)+'</button>';
   // 放大到 1080P：只对有本地文件且非忙碌状态的条目显示（和转码按钮同条件）
@@ -488,14 +504,17 @@ document.getElementById('btnDelSel').addEventListener('click', ()=>{
 });
 document.getElementById('btnRotCW').addEventListener('click',()=>batchRot(90));
 document.getElementById('btnRotCCW').addEventListener('click',()=>batchRot(-90));
+function selectedTranscodable(){
+  return [...S.selected].filter(id=>{const it=S.items.find(x=>x.id===id);return it&&canTranscode(it);});
+}
 document.getElementById('btnTranscode').addEventListener('click',()=>{
-  if(!S.selected.size){toast('请先勾选条目');return;}
-  const ids=[...S.selected];
+  const ids=selectedTranscodable();
+  if(!ids.length){toast('没有可转码的已就绪条目');return;}
   INVOKE('start_transcode',{ids}).then(()=>{S.selected.clear();render();refreshQueue();}).catch(err=>toast(err));
 });
 document.getElementById('btnUpscale').addEventListener('click',()=>{
-  if(!S.selected.size){toast('请先勾选条目');return;}
-  const ids=[...S.selected];
+  const ids=selectedTranscodable();
+  if(!ids.length){toast('没有可放大的已就绪条目');return;}
   INVOKE('start_upscale',{ids}).then(()=>{S.selected.clear();render();refreshQueue();}).catch(err=>toast(err));
 });
 document.getElementById('btnMerge').addEventListener('click',openMerge);
@@ -511,15 +530,18 @@ async function addUrls(){
   INVOKE('add_url',{urls}).then(()=>{document.getElementById('urlInput').value='';}).catch(err=>toast(err));
 }
 function startDownload(id, formatId, audioOnly){
-  // 行内"下载"与 5 秒倒计时自动下载都不带参数：这里补上条目已记住的选择，
-  // 否则用户选过的格式/仅音频会在这一步被丢成 null（后端还会把它们写回条目）
+  if(S.dlPending.has(id))return;
+  stopCountdown(id);
+  S.dlPending.add(id);
   const it=S.items.find(i=>i.id===id);
   if(it){
     if(formatId===undefined)formatId=it.format_id;
     if(audioOnly===undefined)audioOnly=!!it.audio_only;
   }
   INVOKE('start_download',{id,formatId:formatId||null,audioOnly:audioOnly||false})
-    .then(()=>{stopCountdown(id);refreshQueue();}).catch(err=>toast(err));
+    .then(()=>refreshQueue())
+    .catch(err=>{toast(err);render();})
+    .finally(()=>S.dlPending.delete(id));
 }
 function rotItem(id,delta,silent){
   const it=S.items.find(i=>i.id===id); if(!it)return;
@@ -534,9 +556,8 @@ function rotItem(id,delta,silent){
   INVOKE('rot_item',{id,degrees:next}).catch(err=>{ it.rot_angle=prev; render(); toast(err); });
 }
 function batchRot(delta){
-  const ids=[...S.selected];
-  if(!ids.length)return;
-  // silent=true：逐条 render 会把整表重建 N 次（选中 20 条就是 20 次），批量只画最终态
+  const ids=[...S.selected].filter(id=>{const it=S.items.find(x=>x.id===id);return it&&canRotate(it);});
+  if(!ids.length){toast('没有可旋转的条目');return;}
   ids.forEach(id=>rotItem(id,delta,true));
   render();
 }
@@ -544,8 +565,8 @@ function batchRot(delta){
 // ===== 合并面板（MG-01） =====
 let M = { ids: [] };
 function openMerge(){
-  if(S.selected.size<2){toast('合并至少需要勾选 2 个条目');return;}
-  M.ids=[...S.selected];
+  M.ids=selectedTranscodable();
+  if(M.ids.length<2){toast('合并至少需要 2 个已就绪且有本地文件的条目');return;}
   document.getElementById('mergeName').value='合并_'+ts8();
   document.getElementById('mergeNorm').checked = !!(S.config&&S.config.general&&S.config.general.normalize_audio);
   renderMerge();
@@ -632,21 +653,23 @@ function startCountdown(id){
 function stopCountdown(id){
   if(S.cdTimer[id])clearInterval(S.cdTimer[id]);
   delete S.cdTimer[id]; delete S.cdSecs[id];
-  render();
 }
 
 // ===== 格式选择 =====
 let fmtId=null;
+let fmtRequest=0;
 async function openFmt(id){
   const it=S.items.find(i=>i.id===id); if(!it)return;
+  const request=++fmtRequest;
   fmtId=id; stopCountdown(id);
   document.getElementById('fmtTitle').textContent='选择下载格式 - '+(it.title||'');
   const list=document.getElementById('fmtList');
   list.innerHTML='<li>加载格式中…</li>';
   document.getElementById('fmtModal').classList.add('show');
-  // list_items_lite 已清空 download_formats（压缩轮询体积），弹窗打开时按需拉取
   let formats=[];
-  try{ formats=await INVOKE('get_item_formats',{id}); }catch(e){ toast('获取格式失败：'+e); }
+  try{ formats=await INVOKE('get_item_formats',{id}); }
+  catch(e){ if(request===fmtRequest)toast('获取格式失败：'+e); }
+  if(request!==fmtRequest||fmtId!==id)return;
   list.innerHTML=(formats||[]).map(f=>
     '<li data-fid="'+esc(f.format_id)+'" data-aonly="'+(f.audio_only?'1':'0')+'">'+
     '<span>'+esc(f.label)+(f.note?' <span class="s">'+esc(f.note)+'</span>':'')+'</span>'+
@@ -662,7 +685,7 @@ function fmtOk(){
   startDownload(fmtId,on.dataset.fid,on.dataset.aonly==='1');
   closeFmt();
 }
-function closeFmt(){document.getElementById('fmtModal').classList.remove('show');fmtId=null;}
+function closeFmt(){document.getElementById('fmtModal').classList.remove('show');fmtId=null;fmtRequest++;render();}
 
 // ===== 时间范围剪辑（DL-12） =====
 let secId=null;
@@ -675,7 +698,7 @@ function openSec(id){
   document.getElementById('secEnd').value=(it.sections&&it.sections[1])||'';
   document.getElementById('secModal').classList.add('show');
 }
-function closeSec(){document.getElementById('secModal').classList.remove('show');secId=null;}
+function closeSec(){document.getElementById('secModal').classList.remove('show');secId=null;render();}
 document.getElementById('btnSecOk').addEventListener('click',()=>{
   if(!secId)return;
   const start=document.getElementById('secStart').value.trim();
@@ -780,7 +803,9 @@ function closeSettings(){
   const changed=S.configSaved!=null && JSON.stringify(S.config)!==S.configSaved;
   if(!changed){document.getElementById('settingsModal').classList.remove('show');return;}
   askConfirm('设置有未保存的修改，确定关闭（修改将丢失）？').then(ok=>{
-    if(ok)document.getElementById('settingsModal').classList.remove('show');
+    if(!ok)return;
+    S.config=JSON.parse(S.configSaved);
+    document.getElementById('settingsModal').classList.remove('show');
   });
 }
 document.getElementById('setNav').addEventListener('click', e=>{
@@ -966,14 +991,19 @@ function bindSetEvents(){
     b.textContent='取消';
     S.toolDl[tool]={phase:'连接',percent:0};
     INVOKE('download_tool',{tool,update:isUpdate})
-      .then(r=>{
-        // 「下载」= 装到 tools\ 并把该路径写回设置（之后优先用这份）；「更新」只换文件内容，不改路径
+      .then(async r=>{
         if(!isUpdate){
-          S.config=S.config||{}; S.config.dependencies=S.config.dependencies||{};
-          S.config.dependencies[tool]=r.path;
-          // 落盘失败不能吞：界面提示"完成"、重启后路径却没了（工具静默回退 PATH）
-          INVOKE('save_config',{config:S.config})
-            .catch(err=>toast('工具已装好，但路径未保存（'+err+'）：仍会使用 tools\\ 中的副本'));
+          try{
+            await queueConfigWrite(()=>INVOKE('save_dependency_path',{tool,path:r.path}));
+            S.config=S.config||{}; S.config.dependencies=S.config.dependencies||{};
+            S.config.dependencies[tool]=r.path;
+            const baseline=S.configSaved?JSON.parse(S.configSaved):JSON.parse(JSON.stringify(S.config));
+            baseline.dependencies=baseline.dependencies||{};
+            baseline.dependencies[tool]=r.path;
+            S.configSaved=JSON.stringify(baseline);
+          }catch(err){
+            toast('工具已装好，但路径未保存（'+err+'）：仍会使用 tools\\ 中的副本');
+          }
         }
         toast(r.message||('完成：'+r.path));
         delete S.toolDl[tool];
@@ -1060,7 +1090,7 @@ function saveSettings(){
   // 用户在代理地址输入框粘贴后直接点"保存"，最后一次 input 事件可能尚未触发，
   // 导致 S.config 里仍是旧值（空），而输入框里显示的新值没有被保存。
   document.querySelectorAll('#settingsModal [data-cfg]').forEach(el=>applyCfgInput(el));
-  INVOKE('save_config',{config:S.config}).then(()=>{
+  queueConfigWrite(()=>INVOKE('save_config',{config:S.config})).then(()=>{
     // 保存成功后同步基线，否则 closeSettings 会立刻误报"未保存修改"
     S.configSaved=JSON.stringify(S.config);
     toast('设置已保存');

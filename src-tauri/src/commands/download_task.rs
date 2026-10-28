@@ -2,8 +2,8 @@
 
 use super::{
     default_output_dir, enqueue_or_spawn, ensure_main_window, err_string, log_error_lines,
-    log_item, persist, resolve_cookies, spawn_product_thumb, transition_in, update_item,
-    update_progress, CmdResult, ProgressPayload, SlotGuard,
+    log_item, persist, resolve_cookies, spawn_product_thumb, transition_in, unregister_cancel,
+    update_item, update_item_finished, update_progress, CmdResult, ProgressPayload, SlotGuard,
 };
 use crate::state::AppState;
 use tauri::{AppHandle, Emitter, Manager};
@@ -107,6 +107,7 @@ pub(super) fn run_download_task(
 
     let (
         url,
+        previous_path,
         cfg,
         general,
         resolver,
@@ -115,6 +116,7 @@ pub(super) fn run_download_task(
         proxy,
         netscape,
         sections,
+        selected_has_audio,
         js_runtime,
         cookie_warn,
     ) = {
@@ -126,10 +128,11 @@ pub(super) fn run_download_task(
         };
         let Some(item) = item else {
             // 条目在排队期间被删除：清掉取消标志即可（并发 slot 由 _slot 守卫释放）
-            state.cancels.lock().remove(&id);
+            unregister_cancel(state, &id, &cancel);
             return;
         };
         let url = item.url.clone().unwrap_or_default();
+        let previous_path = item.path.clone().map(std::path::PathBuf::from);
         // 一次锁内读齐 download + general + network
         let (cfg, general, proxy) = {
             let c = state.config.lock();
@@ -145,6 +148,20 @@ pub(super) fn run_download_task(
         let task_tmp = state.paths.task_temp_dir(&id);
         let (netscape, cookie_warn) = resolve_cookies(&state, &item, &task_tmp);
         let sections = item.sections.clone();
+        let selected_has_audio = format_id
+            .as_deref()
+            .map(|fid| {
+                fid.contains('+')
+                    || item
+                        .meta
+                        .download_formats
+                        .iter()
+                        .find(|f| f.format_id == fid)
+                        .and_then(|f| f.acodec.as_deref())
+                        .map(|c| !c.eq_ignore_ascii_case("none") && !c.eq_ignore_ascii_case("n/a"))
+                        .unwrap_or(false)
+            })
+            .unwrap_or(false);
         // JS 运行时（§3.6 依赖）：托管/配置的 deno 必须显式传给 yt-dlp，
         // 否则 YouTube 组件会因"没有 JS 运行时"失败（依赖自检却是通过的）
         let js_runtime = resolver
@@ -153,6 +170,7 @@ pub(super) fn run_download_task(
             .map(|p| format!("deno:{}", p.to_string_lossy()));
         (
             url,
+            previous_path,
             cfg,
             general,
             resolver,
@@ -161,6 +179,7 @@ pub(super) fn run_download_task(
             proxy,
             netscape,
             sections,
+            selected_has_audio,
             js_runtime,
             cookie_warn,
         )
@@ -171,6 +190,7 @@ pub(super) fn run_download_task(
 
     let params = DownloadParams {
         format_id: format_id.clone(),
+        selected_has_audio,
         audio_only,
         out_dir: out_dir.clone(),
         filename_template: template,
@@ -228,7 +248,7 @@ pub(super) fn run_download_task(
     let mut outcome = match prog_result {
         Ok(o) => o,
         Err(e) => {
-            finish_download(&app, &id, Err(e));
+            finish_download(&app, &id, &cancel, Err(e));
             return;
         }
     };
@@ -250,8 +270,24 @@ pub(super) fn run_download_task(
             ),
         );
     } else if outcome.preexisting {
-        // 重复下载同一 URL：yt-dlp 未覆盖既有文件（--no-overwrites），
-        // 此时不做后处理，避免原地重编码覆盖用户既有文件
+        let same_item_file = first
+            .as_ref()
+            .zip(previous_path.as_ref())
+            .map(|(current, previous)| current == previous)
+            .unwrap_or(false);
+        if !same_item_file {
+            finish_download(
+                &app,
+                &id,
+                &cancel,
+                Err(CoreError::ProcessFailed {
+                    program: "yt-dlp".into(),
+                    code: None,
+                    stderr: "同名产物已存在，无法确认属于当前视频；请改用带 ID 的文件名模板或移走既有文件".into(),
+                }),
+            );
+            return;
+        }
         log_item(&app, &id, "产物已存在（未覆盖），跳过后处理");
     } else if let Some(path) = &first {
         log_item(&app, &id, "下载完成，开始后处理…");
@@ -265,6 +301,7 @@ pub(super) fn run_download_task(
         let pp = post_process(
             &resolver,
             path,
+            &state.paths.task_temp_dir(&id),
             &cfg2,
             &general2,
             &cancel2,
@@ -299,17 +336,18 @@ pub(super) fn run_download_task(
                 // 每次 persist 都是 clone + 序列化 + fsync 整份 history
             }
             Err(e) => {
-                finish_download(&app, &id, Err(e));
+                finish_download(&app, &id, &cancel, Err(e));
                 return;
             }
         }
     }
-    finish_download(&app, &id, Ok(outcome));
+    finish_download(&app, &id, &cancel, Ok(outcome));
 }
 
 fn finish_download(
     app: &AppHandle,
     id: &str,
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     result: Result<download::DownloadOutcome, CoreError>,
 ) {
     let state = app.state::<AppState>();
@@ -349,7 +387,8 @@ fn finish_download(
         Ok(_) | Err(CoreError::Cancelled) => None,
         Err(e) => Some(e.to_string()),
     };
-    update_item(app, id, |it| {
+    let _ = std::fs::remove_dir_all(state.paths.task_temp_dir(id));
+    update_item_finished(app, id, cancel, |it| {
         // cancel_item 抢先把状态写成 Canceled，但任务线程此时已跑完、实际成功。
         // 状态机已允许 Canceled → Done，这里显式覆盖是为了额外写入
         // "取消请求到达时下载已完成" 这条日志。
@@ -391,10 +430,6 @@ fn finish_download(
     }
     // 任务结束：清理本任务私有临时目录（cookie 导出文件也在这个目录下，一并清理；
     // config/cookies/ 里的站点库文件不受影响）
-    let _ = std::fs::remove_dir_all(state.paths.task_temp_dir(id));
-    // 清理取消标志注册表条目（否则随任务数无限累积；也让后续 cancel_item
-    // 的 cancel_flag 查询能正确区分"运行中"与"已结束"）
-    state.cancels.lock().remove(id);
     // 并发 slot 由调用方（run_download_task）的 SlotGuard 释放：
     // 手写释放 + 守卫释放会重复归还，可能把下一个等待任务"超发"启动
     persist(app);

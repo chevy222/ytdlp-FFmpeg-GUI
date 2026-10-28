@@ -2,8 +2,8 @@
 
 use super::{
     add_product_item, default_output_dir, enqueue_or_spawn, ensure_main_window, log_error_lines,
-    log_item, persist, prepare_batch, restore_status, today_stamp, transition_in, update_item,
-    update_progress, CmdResult, ProgressPayload, SlotGuard,
+    log_item, persist, prepare_batch, restore_status, today_stamp, transition_in, unregister_cancel,
+    update_item, update_item_finished, update_progress, CmdResult, ProgressPayload, SlotGuard,
 };
 use crate::state::AppState;
 use tauri::{AppHandle, Emitter, Manager};
@@ -41,7 +41,7 @@ pub fn start_merge(
     // std::sync::Mutex 不可重入，锁内调用会当场死锁（UI 永久冻结）
     let (accepted, skipped) = {
         let mut hist = state.history.lock();
-        prepare_batch(&mut hist, &ids, Status::Merging, "合并被跳过", |item| {
+        prepare_batch(&mut hist, &ids, Status::Merging, false, "合并被跳过", |item| {
             let has_file = item
                 .path
                 .as_deref()
@@ -124,7 +124,7 @@ pub(super) fn run_merge_task(app: AppHandle, id: String) {
     let Some(job) = job else {
         // job 记录缺失（理论不可达）：清掉上面为 id 注册的 cancel flag，
         // 否则会随每次异常调用在 state.cancels 里累积残留条目。
-        state.cancels.lock().remove(&id);
+        unregister_cancel(state, &id, &cancel);
         return;
     };
     // 取消标志共享给全部参与条目：从任意被勾选条目点"取消"都能取消这次合并
@@ -177,17 +177,8 @@ pub(super) fn run_merge_task(app: AppHandle, id: String) {
                 jobs.remove(jid);
             }
         }
-        // 与正常收尾 finish_merge 同口径：清掉各参与条目的 cancel flag，
-        // 否则这条早退路径会把 cancels 注册表项永久泄漏，并让后续 cancel_item
-        // 命中幽灵 flag、clear_temp_inner 因 active 非空而保守跳过清理。
-        {
-            let mut cancels = state.cancels.lock();
-            for jid in &job.ids {
-                cancels.remove(jid);
-            }
-        }
         for jid in &job.ids {
-            update_item(&app, jid, |it| {
+            update_item_finished(&app, jid, &cancel, |it| {
                 transition_in(it, Status::Failed);
                 it.error = Some("合并输入不足（需要至少 2 个本地文件）".into());
             });
@@ -220,7 +211,7 @@ pub(super) fn run_merge_task(app: AppHandle, id: String) {
     );
     // 解除临时目录豁免登记
     state.merge_tmp.lock().remove(&subdir);
-    finish_merge(&app, &id, &job.ids, result);
+    finish_merge(&app, &id, &job.ids, &cancel, result);
 }
 
 /// 合并收尾：全部参与条目恢复状态、产物作为新条目回列表、释放队列 slot。
@@ -228,6 +219,7 @@ fn finish_merge(
     app: &AppHandle,
     id: &str,
     ids: &[String],
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     result: Result<std::path::PathBuf, CoreError>,
 ) {
     let state = app.state::<AppState>();
@@ -256,7 +248,7 @@ fn finish_merge(
         let is_anchor = jid == id;
         let err = err_text.clone();
         let pct = final_status == Status::Done;
-        update_item(app, jid, |it| {
+        update_item_finished(app, jid, cancel, |it| {
             // cancel_item 抢先写成 Canceled，但合并实际已完成。状态机已允许
             // Canceled → Ready/Done，这里显式覆盖是为了额外写完成日志。
             if it.status == Status::Canceled && final_status == Status::Done {
@@ -280,13 +272,6 @@ fn finish_merge(
         let mut jobs = state.merge_jobs.lock();
         for jid in ids {
             jobs.remove(jid);
-        }
-    }
-    // 合并的取消标志注册在每个参与条目上（run_merge_task），一并清理
-    {
-        let mut cancels = state.cancels.lock();
-        for jid in ids {
-            cancels.remove(jid);
         }
     }
     // 并发 slot 由调用方的 SlotGuard 释放

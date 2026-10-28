@@ -16,7 +16,7 @@ use crate::{CoreError, Result};
 pub struct History {
     #[serde(default)]
     pub items: Vec<MediaItem>,
-    #[serde(default = "default_limit")]
+    #[serde(skip, default = "default_limit")]
     pub limit: usize,
 }
 
@@ -48,15 +48,10 @@ fn recover_partial_history(text: &str) -> Option<PartialRecovery> {
         }
     }
     let kept_count = kept.len();
-    let limit = v
-        .get("limit")
-        .and_then(|l| l.as_u64())
-        .map(|l| l as usize)
-        .unwrap_or(100);
     Some(PartialRecovery {
         history: History {
             items: kept,
-            limit: limit.clamp(1, crate::config::GeneralConfig::HISTORY_LIMIT_MAX),
+            limit: default_limit(),
         },
         kept: kept_count,
         skipped,
@@ -377,16 +372,15 @@ mod tests {
     }
 
     #[test]
-    fn load_clamps_limit_from_file() {
+    fn legacy_limit_is_not_a_second_config_source() {
         let root = tempdir().unwrap();
         let p = root.path().join("history.json");
-        // 手改文件把 limit 拉到天文数字：加载时必须夹回上限，否则列表无界增长
         std::fs::write(&p, r#"{"items":[],"limit":100000000}"#).unwrap();
-        let h = History::load(&p).unwrap();
-        assert_eq!(h.limit, crate::config::GeneralConfig::HISTORY_LIMIT_MAX);
-        std::fs::write(&p, r#"{"items":[],"limit":0}"#).unwrap();
-        let h = History::load(&p).unwrap();
-        assert_eq!(h.limit, 1);
+        assert_eq!(History::load(&p).unwrap().limit, default_limit());
+        let h = History::new(42);
+        h.save(&p).unwrap();
+        let raw = std::fs::read_to_string(&p).unwrap();
+        assert!(!raw.contains("\"limit\""));
     }
 
     #[test]

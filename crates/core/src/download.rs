@@ -29,6 +29,7 @@ pub struct Progress {
 #[derive(Debug, Clone)]
 pub struct DownloadParams {
     pub format_id: Option<String>,
+    pub selected_has_audio: bool,
     pub audio_only: bool,
     pub out_dir: PathBuf,
     pub filename_template: String,
@@ -103,6 +104,8 @@ pub fn build_args(url: &str, p: &DownloadParams, cfg: &DownloadConfig) -> Vec<St
         Some(fid) if !fid.is_empty() => {
             if p.audio_only {
                 format!("{}/bestaudio/best", fid)
+            } else if p.selected_has_audio || fid.contains('+') {
+                fid.clone()
             } else {
                 format!("{}+ba/b", fid)
             }
@@ -621,9 +624,11 @@ pub fn run_download(
 /// 后处理（DL-04 M1 基础版）：超画质上限降分辨率 + 音量归一化。
 /// 返回最终产物路径（处理失败时返回原路径并附告警日志）。
 /// `on_progress`：按探测到的源时长换算的百分比（0~100）。
+#[allow(clippy::too_many_arguments)]
 pub fn post_process(
     resolver: &ToolResolver,
     input: &Path,
+    work_dir: &Path,
     cfg: &DownloadConfig,
     general: &GeneralConfig,
     cancel: &Arc<AtomicBool>,
@@ -659,13 +664,12 @@ pub fn post_process(
         return Ok((input.to_path_buf(), meta.clone()));
     }
 
-    let out = if audio_only {
-        // C4：纯音频产物沿用 .m4a（原 mp3 转成 aac 后不可能再叫 .mp3；用 m4a 承载
-        // aac + 增益，保证"音量归一化"在纯音频下载上真正生效，而不是被视频流校验删掉）
-        input.with_extension("processed.m4a")
-    } else {
-        input.with_extension("processed.mp4")
-    };
+    std::fs::create_dir_all(work_dir)?;
+    let out = work_dir.join(format!(
+        "post-{}.{}",
+        uuid::Uuid::new_v4(),
+        if audio_only { "m4a" } else { "mp4" }
+    ));
     // 宽高各自取偶（trunc */2*2）；短边超上限时等比缩小且不放大
     let vf = if need_downscale {
         Some(format!(
@@ -756,21 +760,15 @@ pub fn post_process(
     // applied_gain 记录实际写入 ffmpeg 的增益值，成功后回写到 meta.audio_volume，
     // 否则用户再点转码时会用旧探测值再放大一次（音量翻倍）。
     let mut applied_gain: f32 = 0.0;
-    if need_gain {
+    if let Some(gain) = meta.audio_gain_db(general.normalize_audio, general.max_gain_db) {
         let max_v = meta.audio_volume.max_volume_db.unwrap_or(0.0);
-        // `max_gain_db` 理论上已被 AppConfig::sanitize 收进 >=0，这里再夹一次下限：
-        // f32::clamp 在 min > max 时直接 panic，而 panic 发生在任务线程里等于
-        // "任务卡死 + 并发额度永久少一格"（GUI 下连报错都看不到）
-        let gain = (-max_v).clamp(0.0, general.max_gain_db.max(0.0));
-        if gain > 0.1 {
-            on_log(format!(
-                "音量归一化：max_volume {:.1}dB → +{:.1}dB 增益",
-                max_v, gain
-            ));
-            args.push("-af".into());
-            args.push(format!("volume={:.2}dB", gain));
-            applied_gain = gain;
-        }
+        on_log(format!(
+            "音量归一化：max_volume {:.1}dB → +{:.1}dB 增益",
+            max_v, gain
+        ));
+        args.push("-af".into());
+        args.push(format!("volume={:.2}dB", gain));
+        applied_gain = gain;
     }
     args.push("-c:a".into());
     // MP4 容器不支持 opus/vorbis/flac 等音频编码，源音轨不兼容（如 webm/opus）时
@@ -844,13 +842,6 @@ pub fn post_process(
             final_meta.audio_volume.max_volume_db = Some((v + applied_gain).min(0.0));
         }
     }
-    // 落地策略按"容器是否变化"分两种：
-    // - 容器不变（mp4→mp4）：rename 覆盖原文件，输出目录不留中间产物。Windows 上
-    //   同目录 rename 才是原子替换（MOVEFILE_REPLACE_EXISTING），不再"先删后改名"
-    //   ——那样中途失败会连原文件一起丢；
-    // - 容器变化（mp3→m4a / webm→mp4）：不能把新容器内容盖回旧扩展名——文件类型
-    //   与扩展名错配，资源管理器/播放器都会误判。改为以正确扩展名落地，并删除本次
-    //   下载的原始产物（preexisting 场景不会进后处理，删的永远是本任务刚下载的文件）。
     let final_ext = if audio_only { "m4a" } else { "mp4" };
     let same_ext = input
         .extension()
@@ -858,27 +849,64 @@ pub fn post_process(
         .map(|e| e.eq_ignore_ascii_case(final_ext))
         .unwrap_or(false);
     if same_ext {
-        if let Err(e) = std::fs::rename(&out, input) {
+        // temp 与输出目录可能跨盘：先复制到同目录的唯一暂存名，再原子替换原文件。
+        let staging = input.with_file_name(format!(".post-{}.tmp", uuid::Uuid::new_v4()));
+        if let Err(e) = copy_cancellable(&out, &staging, cancel) {
+            let _ = std::fs::remove_file(&staging);
+            let _ = std::fs::remove_file(&out);
+            if matches!(e, CoreError::Cancelled) {
+                return Err(CoreError::Cancelled);
+            }
+            on_log(format!("后处理产物复制失败（保留原文件）：{e}"));
+            return Ok((input.to_path_buf(), meta.clone()));
+        }
+        if cancel.load(Ordering::Relaxed) {
+            let _ = std::fs::remove_file(&staging);
+            let _ = std::fs::remove_file(&out);
+            return Err(CoreError::Cancelled);
+        }
+        if let Err(e) = std::fs::rename(&staging, input) {
             on_log(format!("后处理产物替换失败（保留原文件）：{e}"));
+            let _ = std::fs::remove_file(&staging);
             let _ = std::fs::remove_file(&out);
             return Ok((input.to_path_buf(), meta.clone()));
         }
+        let _ = std::fs::remove_file(&out);
         return Ok((input.to_path_buf(), final_meta));
     }
-    // 容器变化：优先落到"同 stem + 正确扩展名"；目标已被占用时保留 processed 中间名
-    let renamed = input.with_extension(final_ext);
-    let final_path = if renamed.exists() {
-        out.clone()
-    } else if let Err(e) = std::fs::rename(&out, &renamed) {
-        on_log(format!(
-            "后处理产物改名失败（保留中间产物 {}）：{e}",
-            out.display()
-        ));
-        return Ok((out.clone(), final_meta));
-    } else {
-        renamed
+    let out_dir = input.parent().unwrap_or_else(|| Path::new("."));
+    let base = input
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "download".into());
+    let final_path = match crate::paths::unique_output_path(
+        out_dir,
+        &base,
+        final_ext,
+        &general.collision_policy,
+    ) {
+        Ok(path) => path,
+        Err(e) => {
+            on_log(format!("后处理产物命名失败（保留原文件）：{e}"));
+            let _ = std::fs::remove_file(&out);
+            return Ok((input.to_path_buf(), meta.clone()));
+        }
     };
-    // 删除本次下载的原始产物（容器已被替换）；失败只告警不阻断
+    if let Err(e) = copy_cancellable(&out, &final_path, cancel) {
+        let _ = std::fs::remove_file(&final_path);
+        let _ = std::fs::remove_file(&out);
+        if matches!(e, CoreError::Cancelled) {
+            return Err(CoreError::Cancelled);
+        }
+        on_log(format!("后处理产物落地失败（保留原文件）：{e}"));
+        return Ok((input.to_path_buf(), meta.clone()));
+    }
+    if cancel.load(Ordering::Relaxed) {
+        let _ = std::fs::remove_file(&final_path);
+        let _ = std::fs::remove_file(&out);
+        return Err(CoreError::Cancelled);
+    }
+    let _ = std::fs::remove_file(&out);
     if let Err(e) = std::fs::remove_file(input) {
         on_log(format!(
             "原始下载产物删除失败（可手动删除 {}）：{e}",
@@ -886,6 +914,25 @@ pub fn post_process(
         ));
     }
     Ok((final_path, final_meta))
+}
+
+fn copy_cancellable(src: &Path, dst: &Path, cancel: &Arc<AtomicBool>) -> Result<u64> {
+    use std::io::{Read, Write};
+    let mut reader = std::fs::File::open(src)?;
+    let mut writer = std::fs::File::create(dst)?;
+    let mut buf = vec![0u8; 1024 * 1024];
+    let mut total = 0u64;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(CoreError::Cancelled);
+        }
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            return Ok(total);
+        }
+        writer.write_all(&buf[..n])?;
+        total += n as u64;
+    }
 }
 
 /// 产物校验：ffprobe 能解析且存在主流（视频产物查 v:0，纯音频产物查 a:0）。
@@ -966,6 +1013,7 @@ mod tests {
     fn params() -> DownloadParams {
         DownloadParams {
             format_id: None,
+            selected_has_audio: false,
             audio_only: false,
             out_dir: PathBuf::from("D:/videos"),
             filename_template: "纯标题".into(),
@@ -1134,12 +1182,38 @@ mod tests {
     }
 
     #[test]
+    fn cancellable_copy_preserves_source_and_honors_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.bin");
+        let dst = dir.path().join("dst.bin");
+        std::fs::write(&src, vec![7u8; 2048]).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        assert_eq!(copy_cancellable(&src, &dst, &cancel).unwrap(), 2048);
+        assert_eq!(std::fs::read(&dst).unwrap(), vec![7u8; 2048]);
+        cancel.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            copy_cancellable(&src, &dst, &cancel),
+            Err(CoreError::Cancelled)
+        ));
+        assert_eq!(std::fs::read(&src).unwrap(), vec![7u8; 2048]);
+    }
+
+    #[test]
     fn build_args_selected_format() {
         let mut p = params();
         p.format_id = Some("137".into());
         let args = build_args("u", &p, &DownloadConfig::default());
         let joined = args.join(" ");
         assert!(joined.contains("137+ba/b"));
+    }
+
+    #[test]
+    fn build_args_selected_progressive_format() {
+        let mut p = params();
+        p.format_id = Some("18".into());
+        p.selected_has_audio = true;
+        let args = build_args("u", &p, &DownloadConfig::default());
+        assert!(args.join(" ").contains("--format 18 "));
     }
 
     #[test]

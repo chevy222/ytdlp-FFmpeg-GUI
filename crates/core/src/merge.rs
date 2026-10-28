@@ -188,6 +188,7 @@ fn transcode_segment(
     input: &Path,
     out: &Path,
     main_idx: Option<u32>,
+    has_audio: bool,
     encoder_mode: &str,
     target_w: u32,
     target_h: u32,
@@ -219,13 +220,20 @@ fn transcode_segment(
         "-noautorotate".into(),
         "-i".into(),
         input.to_string_lossy().into_owned(),
+    ];
+    if !has_audio {
+        args.extend([
+            "-f".into(),
+            "lavfi".into(),
+            "-i".into(),
+            "anullsrc=channel_layout=stereo:sample_rate=48000".into(),
+        ]);
+    }
+    args.extend([
         "-map".into(),
         main_map,
-        // 只保留主音轨：模式 B 的触发条件之一正是各段音轨数不一致（same_parameters），
-        // 若这里 `-map 0:a?` 保留全部音轨，段与段的流布局会不同，随后的 concat
-        // `-c copy` 会因 "parameters do not match" 直接失败。统一为单音轨保证结构一致。
         "-map".into(),
-        "0:a:0?".into(),
+        if has_audio { "0:a:0" } else { "1:a:0" }.into(),
         "-vf".into(),
         // 统一画布 + 统一 SAR/像素格式：concat -c copy 的每段必须参数完全一致。
         // 源小于画布时由 pad 补边（默认黑色），避免为了填满画布而拉伸画面。
@@ -248,6 +256,9 @@ fn transcode_segment(
     args.push("48000".into());
     args.push("-ac".into());
     args.push("2".into());
+    if !has_audio {
+        args.push("-shortest".into());
+    }
     args.push("-map_metadata".into());
     args.push("0".into());
     // 清掉源 rotate 标签（-noautorotate 已禁自动旋转，标签残留会让播放器再转一次）
@@ -431,6 +442,7 @@ fn merge_unified(
             p,
             seg,
             metas[i].video_stream_index,
+            metas[i].audio_tracks.unwrap_or(0) > 0,
             &params.encoder_mode,
             target_w,
             target_h,
@@ -590,16 +602,9 @@ fn post_normalize(
     on_log: &mut dyn FnMut(String),
 ) -> Result<PathBuf> {
     let meta = crate::download::probe_output(resolver, input, &mut *on_log)?;
-    let Some(max_v) = meta.audio_volume.max_volume_db else {
+    let Some(gain) = meta.audio_gain_db(true, max_gain_db) else {
         return Ok(input.to_path_buf());
     };
-    if max_v >= -0.5 || max_v <= -100.0 {
-        return Ok(input.to_path_buf());
-    }
-    let gain = (-max_v).clamp(0.0, max_gain_db.max(0.0));
-    if gain < 0.1 {
-        return Ok(input.to_path_buf());
-    }
     let ext = input.extension().and_then(|e| e.to_str()).unwrap_or("mp4");
     std::fs::create_dir_all(task_tmp)?;
     let tmp = task_tmp.join(format!("norm_{}.{}", uuid::Uuid::new_v4(), ext));

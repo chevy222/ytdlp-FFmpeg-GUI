@@ -140,6 +140,7 @@ pub fn run() {
             commands::open_login_site,
             commands::settings::get_config,
             commands::settings::save_config,
+            commands::settings::save_dependency_path,
             commands::cookies::list_cookies,
             commands::cookies::delete_cookie,
             commands::tools::probe_dependencies,
@@ -203,9 +204,8 @@ pub fn run() {
                 }
             }
             if state.history_load_failed {
-                // 读取失败时 history 只是空占位：此时落盘会把原文件真正覆盖掉。
-                // 备份已由 History::load 尽力生成，等用户产生新数据/显式写盘再覆盖。
-                ytdlp_core::log::warn("history.json 本次未能读取，已跳过启动写盘以保护原文件");
+                // 读取失败时 history 只是空占位；AppState::persist 会在本次运行期间持续禁止写盘。
+                ytdlp_core::log::warn("history.json 本次未能读取，本次运行已禁用历史写盘以保护原文件");
             } else {
                 state.persist();
             }

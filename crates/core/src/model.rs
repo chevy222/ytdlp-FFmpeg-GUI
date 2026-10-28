@@ -185,6 +185,33 @@ pub struct MediaMeta {
     pub download_formats: Vec<DownloadFormat>,
 }
 
+impl MediaMeta {
+    fn to_lite(&self) -> Self {
+        Self {
+            title: self.title.clone(),
+            uploader: self.uploader.clone(),
+            duration_secs: self.duration_secs,
+            container: self.container.clone(),
+            height: self.height,
+            vcodec: self.vcodec.clone(),
+            vbitrate_kbps: self.vbitrate_kbps,
+            fps: self.fps,
+            acodec: self.acodec.clone(),
+            abitrate_kbps: self.abitrate_kbps,
+            audio_tracks: self.audio_tracks,
+            audio_channels: self.audio_channels,
+            audio_volume: self.audio_volume.clone(),
+            size_bytes: self.size_bytes,
+            extradata: self.extradata.clone(),
+            sample_rate: self.sample_rate,
+            video_stream_index: self.video_stream_index,
+            cover_stream_index: self.cover_stream_index,
+            width: self.width,
+            download_formats: Vec::new(),
+        }
+    }
+}
+
 /// 下载格式（DL-02：清晰度/编码/大小/帧率/码率，格式弹窗展示项）。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -288,6 +315,15 @@ impl MediaMeta {
                 .max_volume_db
                 .map(|v| v < -0.5 && v > -100.0)
                 .unwrap_or(false)
+    }
+
+    pub fn audio_gain_db(&self, normalize: bool, max_gain_db: f32) -> Option<f32> {
+        if !self.needs_audio_gain(normalize) {
+            return None;
+        }
+        let max_v = self.audio_volume.max_volume_db.unwrap_or(0.0);
+        let gain = (-max_v).clamp(0.0, max_gain_db.max(0.0));
+        (gain > 0.1).then_some(gain)
     }
 
     /// 音频重编码码率 kbps：跟随源，clamp 64-192（convert_h265.bat 同款：
@@ -408,13 +444,30 @@ impl MediaItem {
     }
 
     /// 列表轮询用的轻量副本：不复制日志（最多 300 行）与下载格式列表。
-    ///
-    /// 先整体 clone 再清空大字段，避免逐字段手抄时新增字段被漏掉。
     pub fn to_lite(&self) -> Self {
-        let mut lite = self.clone();
-        lite.log.clear();
-        lite.meta.download_formats.clear();
-        lite
+        Self {
+            id: self.id.clone(),
+            kind: self.kind,
+            title: self.title.clone(),
+            path: self.path.clone(),
+            url: self.url.clone(),
+            site: self.site.clone(),
+            host: self.host.clone(),
+            status: self.status,
+            percent: self.percent,
+            error: self.error.clone(),
+            speed: self.speed.clone(),
+            eta: self.eta.clone(),
+            file: self.file.clone(),
+            log: VecDeque::new(),
+            meta: self.meta.to_lite(),
+            thumb: self.thumb.clone(),
+            rot_angle: self.rot_angle,
+            format_id: self.format_id.clone(),
+            audio_only: self.audio_only,
+            updated_at: self.updated_at.clone(),
+            sections: self.sections.clone(),
+        }
     }
 
     /// 日志追加，保留最近 `MAX_LOG_LINES` 行（300）。
@@ -702,6 +755,22 @@ mod tests {
         assert!(!m.needs_audio_gain(true));
         m.audio_volume.max_volume_db = None;
         assert!(!m.needs_audio_gain(true));
+    }
+
+    #[test]
+    fn audio_gain_respects_cap_and_threshold() {
+        let mut m = MediaMeta {
+            audio_volume: AudioVolume {
+                max_volume_db: Some(-8.0),
+            },
+            ..Default::default()
+        };
+        assert_eq!(m.audio_gain_db(true, 24.0), Some(8.0));
+        assert_eq!(m.audio_gain_db(true, 3.0), Some(3.0));
+        assert_eq!(m.audio_gain_db(true, 0.0), None);
+        assert_eq!(m.audio_gain_db(false, 24.0), None);
+        m.audio_volume.max_volume_db = Some(-0.05);
+        assert_eq!(m.audio_gain_db(true, 24.0), None);
     }
 
     #[test]

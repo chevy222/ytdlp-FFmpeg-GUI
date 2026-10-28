@@ -445,15 +445,7 @@ pub fn build_args_for_tier(
     // —— 音频增益（normalize_audio + 解析音量；接近满度/无音量不处理）——
     // 只处理主音频：-map 0:a:0? 只保留第一条音轨，其余抛弃，
     // volumedetect 峰值与增益目标始终是同一条流。
-    let need_gain = meta.needs_audio_gain(params.normalize_audio);
-    let gain = if need_gain {
-        let max_v = meta.audio_volume.max_volume_db.unwrap_or(0.0);
-        let g = (-max_v).clamp(0.0, params.max_gain_db.max(0.0));
-        // gain=0（用户把上限设为 0）不该触发音频重编码
-        (g > 0.1).then_some(g)
-    } else {
-        None
-    };
+    let gain = meta.audio_gain_db(params.normalize_audio, params.max_gain_db);
 
     // —— 滤镜链 ——
     // CPU 链：旋转（transpose）→ 分辨率上限（旋转不变量 min(iw,ih)/max(iw,ih)，

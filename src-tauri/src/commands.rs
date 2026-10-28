@@ -54,7 +54,8 @@ use crate::state::AppState;
 use download_task::run_download_task;
 use merge_task::run_merge_task;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
 use transcode_task::run_transcode_task;
 use ytdlp_core::cookies::CookieStore;
@@ -151,13 +152,47 @@ fn err_string(e: impl std::fmt::Display) -> String {
 /// 的轻量事件，避免每秒数十次全量 clone + 序列化整个 MediaItem（含 300 行日志）。
 fn update_item(app: &AppHandle, id: &str, f: impl FnOnce(&mut MediaItem)) -> Option<MediaItem> {
     let state = app.state::<AppState>();
-    let mut hist = state.history.lock();
-    let mut item = hist.get(id)?.clone();
-    f(&mut item);
-    hist.upsert(item.clone());
-    drop(hist);
+    let item = {
+        let mut hist = state.history.lock();
+        let item = hist.get_mut(id)?;
+        f(item);
+        item.clone()
+    };
     let _ = app.emit("item:update", &item);
     Some(item)
+}
+
+pub(super) fn unregister_cancel(state: &AppState, id: &str, cancel: &Arc<AtomicBool>) {
+    let mut cancels = state.cancels.lock();
+    if cancels
+        .get(id)
+        .map(|current| Arc::ptr_eq(current, cancel))
+        .unwrap_or(false)
+    {
+        cancels.remove(id);
+    }
+}
+
+pub(super) fn update_item_finished(
+    app: &AppHandle,
+    id: &str,
+    cancel: &Arc<AtomicBool>,
+    f: impl FnOnce(&mut MediaItem),
+) -> Option<MediaItem> {
+    let state = app.state::<AppState>();
+    let item = {
+        let mut hist = state.history.lock();
+        let item = hist.get_mut(id).map(|item| {
+            f(item);
+            item.clone()
+        });
+        unregister_cancel(state, id, cancel);
+        item
+    };
+    if let Some(item) = &item {
+        let _ = app.emit("item:update", item);
+    }
+    item
 }
 
 /// 高频进度事件 payload：只带变化的字段（Option::None 表示本次不更新该字段），
@@ -222,6 +257,7 @@ fn log_error_lines(app: &AppHandle, id: &str, prefix: &str, e: &CoreError) {
 fn handle_probe_failure(
     app: &AppHandle,
     id: &str,
+    cancel: &Arc<AtomicBool>,
     f: &probe::ProbeFailure,
     log_prefix: &str,
 ) {
@@ -230,7 +266,7 @@ fn handle_probe_failure(
         ProbeErrorKind::Cancelled => Status::Canceled,
         _ => Status::Failed,
     };
-    update_item(app, id, |it| {
+    update_item_finished(app, id, cancel, |it| {
         transition_in(it, status);
         if f.kind != ProbeErrorKind::Cancelled {
             it.error = Some(f.to_string());
@@ -541,6 +577,7 @@ pub(super) fn prepare_batch(
     hist: &mut ytdlp_core::history::History,
     ids: &[String],
     target: Status,
+    reset_progress: bool,
     skip_prefix: &str,
     mut check: impl FnMut(&MediaItem) -> Result<(), String>,
 ) -> BatchOutcome {
@@ -560,10 +597,9 @@ pub(super) fn prepare_batch(
         }
         match transition(item.status, target) {
             Ok(to) => {
-                // 进入新任务前进度归零：否则上一轮下载/转码的 100% 会一直挂在进度列
                 let updated = MediaItem {
                     status: to,
-                    percent: 0.0,
+                    percent: if reset_progress { 0.0 } else { item.percent },
                     ..item
                 };
                 hist.upsert(updated.clone());
@@ -792,8 +828,16 @@ fn run_probe(app: AppHandle, id: String, auto_ready: bool) {
             }
         })
     };
+    // 终态发布前清理任务目录，避免后续同 ID 任务复用时被旧线程误删。
+    let _ = std::fs::remove_dir_all(&task_tmp);
 
     match result {
+        Ok(_) if cancel.load(Ordering::Relaxed) => {
+            update_item_finished(&app, &id, &cancel, |it| {
+                transition_in(it, Status::Canceled);
+                it.push_log("解析已取消".to_string());
+            });
+        }
         Ok(p) => {
             if p.skipped_entries > 0 {
                 log_item(
@@ -812,9 +856,9 @@ fn run_probe(app: AppHandle, id: String, auto_ready: bool) {
             // entries 来自本次 flat-playlist 解析结果，不再二次调用 yt-dlp。
             let playlist_task = url_src && playlist_on && p.is_playlist;
             if playlist_task {
-                match expand_playlist(&app, &id, p.entries) {
+                match expand_playlist(&app, &id, p.entries, &cancel) {
                     Ok(n) => ytdlp_core::log::info(format!("播放列表 {id} 展开为 {n} 集")),
-                    Err(f) => handle_probe_failure(&app, &id, &f, "播放列表展开失败"),
+                    Err(f) => handle_probe_failure(&app, &id, &cancel, &f, "播放列表展开失败"),
                 }
             } else {
                 let cover_idx = p.meta.cover_stream_index;
@@ -829,7 +873,12 @@ fn run_probe(app: AppHandle, id: String, auto_ready: bool) {
                             .as_deref()
                             .and_then(ytdlp_core::cookies::host_from_url)
                     });
-                update_item(&app, &id, |it| {
+                update_item_finished(&app, &id, &cancel, |it| {
+                    if cancel.load(Ordering::Relaxed) {
+                        transition_in(it, Status::Canceled);
+                        it.push_log("解析已取消".to_string());
+                        return;
+                    }
                     // 先取标题再 move meta
                     let meta_title = p.meta.title.clone();
                     it.meta = p.meta;
@@ -846,6 +895,14 @@ fn run_probe(app: AppHandle, id: String, auto_ready: bool) {
                     it.error = None;
                     it.push_log("解析完成，已就绪".to_string());
                 });
+                let ready = !cancel.load(Ordering::Relaxed)
+                    && state
+                        .history
+                        .lock()
+                        .get(&id)
+                        .map(|it| it.status == Status::Ready)
+                        .unwrap_or(false);
+                if ready {
                 // 封面缩略图（异步生成，不阻塞就绪）。
                 // spawn_blocking：里面是 yt-dlp / ffmpeg 子进程（阻塞），
                 // 放在 async 执行器的 worker 上会占住线程（执行器线程数 ≈ CPU 核数）
@@ -922,17 +979,13 @@ fn run_probe(app: AppHandle, id: String, auto_ready: bool) {
                 if url_src && auto_ready {
                     let _ = app.emit("item:ready", serde_json::json!({ "id": id }));
                 }
+                }
             }
         }
         Err(f) => {
-            handle_probe_failure(&app, &id, &f, "解析失败");
+            handle_probe_failure(&app, &id, &cancel, &f, "解析失败");
         }
     }
-    // 解析阶段临时目录清理（cookie 导出在本任务私有目录下，库文件本身不删）
-    let _ = std::fs::remove_dir_all(&task_tmp);
-    // 清掉取消标志注册表条目（否则随条目数累积，也让后续 cancel_item 的
-    // "在不在运行中"判断失真）
-    state.cancels.lock().remove(&id);
     // 落盘只做一次：上面两个分支里的 persist 都与这一次重复（每次都是
     // clone + 序列化 + fsync 整份 history，批量粘贴时按条数线性放大）
     persist(&app);
@@ -1275,6 +1328,7 @@ fn expand_playlist(
     app: &AppHandle,
     id: &str,
     entries: Vec<probe::PlaylistEntry>,
+    cancel: &Arc<AtomicBool>,
 ) -> Result<usize, probe::ProbeFailure> {
     if entries.is_empty() {
         return Err(probe::ProbeFailure {
@@ -1289,6 +1343,12 @@ fn expand_playlist(
         // 展开出的逐集条目继承"仅音频默认"（与 add_url 同口径）
         let default_audio_only = st.config.lock().download.audio_only;
         let mut hist = st.history.lock();
+        if cancel.load(Ordering::Relaxed) {
+            return Err(probe::ProbeFailure {
+                kind: ProbeErrorKind::Cancelled,
+                message: "播放列表展开已取消".into(),
+            });
+        }
         for e in entries {
             let mut entry = MediaItem::from_url(e.url);
             entry.audio_only = default_audio_only;
@@ -1298,6 +1358,7 @@ fn expand_playlist(
         // 父条目只承担"展开播放列表"这一件事：成功后从列表移除，
         // 避免它被当成普通视频再次下载整个列表（双下载）。
         hist.remove(id);
+        unregister_cancel(st, id, cancel);
     }
     ytdlp_core::thumbs::remove_thumb(&app.state::<AppState>().paths.cache_dir(), id);
     // 先移除父条目再发 list:changed：否则前端可能在刷新时把父条目又画回来
@@ -1323,7 +1384,7 @@ fn restore_status(app: &AppHandle, id: &str) -> Status {
         return Status::Ready;
     };
     match item.kind {
-        ItemKind::LocalFile | ItemKind::TranscodeOut => Status::Ready,
+        ItemKind::LocalFile => Status::Ready,
         _ => Status::Done,
     }
 }
@@ -1430,14 +1491,20 @@ pub fn cancel_item(app: AppHandle, win: tauri::WebviewWindow, id: String) -> Cmd
         persist(&app);
         return Ok(());
     }
-    // 运行中（含解析中）：置取消标志，进程树由任务线程/看门狗终止
-    // 用 register_cancel（复用已有 flag / 预建新 flag）：任务线程可能还没执行到
-    // register_cancel（"已排队/刚启动"窗口），此时若只查不建就会丢失取消意图。
-    // 任务线程随后 entry().or_insert_with 复用同一 flag，取消不会因注册顺序蒸发。
+    // 运行中（含解析中）：保持处理中状态直到执行体收尾，避免旧任务未退出就允许重试/删除。
+    let hist = state.history.lock();
+    let active = hist
+        .get(&id)
+        .map(|it| it.status.is_active())
+        .unwrap_or(false);
+    if !active {
+        return Err("当前状态不可取消".into());
+    }
+    // 状态检查与置标志共用 history 锁：任务收尾无法插入两者之间留下幽灵标志。
     let flag = state.register_cancel(&id);
     flag.store(true, Ordering::Relaxed);
+    drop(hist);
     update_item(&app, &id, |it| {
-        transition_in(it, Status::Canceled);
         it.push_log("正在取消…".to_string());
     });
     persist(&app);
@@ -1448,6 +1515,9 @@ pub fn cancel_item(app: AppHandle, win: tauri::WebviewWindow, id: String) -> Cmd
 pub fn remove_item(app: AppHandle, win: tauri::WebviewWindow, id: String) -> CmdResult<()> {
     ensure_main_window(&win)?;
     let state = app.state::<AppState>();
+    if state.cancel_flag(&id).is_some() {
+        return Err("任务仍在收尾，请稍候再删除".into());
+    }
     // 运行中的条目不允许直接删：任务线程还在跑、产物还在往输出目录写，
     // 删掉条目只会让用户以为"已经删干净了"。先取消、等状态落到终态再删。
     {
@@ -1507,6 +1577,9 @@ pub fn clear_done(app: AppHandle, win: tauri::WebviewWindow) -> CmdResult<()> {
 pub fn retry_item(app: AppHandle, win: tauri::WebviewWindow, id: String) -> CmdResult<()> {
     ensure_main_window(&win)?;
     let state = app.state::<AppState>();
+    if state.cancel_flag(&id).is_some() {
+        return Err("任务仍在收尾，请稍候再重试".into());
+    }
     {
         let mut hist = state.history.lock();
         let mut item = hist.get(&id).cloned().ok_or("条目不存在")?;

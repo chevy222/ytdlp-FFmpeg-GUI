@@ -26,23 +26,16 @@ pub fn save_config(
     // 越界值会一路流到任务线程里（例如负的 max_gain_db 会让 f32::clamp 直接 panic，
     // 而 panic 发生在任务线程 → 条目卡死 + 并发额度永久少一格）
     config.sanitize();
-    // 先落盘再替换内存：落盘失败时错误上抛、内存保持旧值。原顺序（先换内存
-    // 再落盘）在写盘失败时会分叉——本次会话已按新配置运行，重启后却丢失，
-    // 用户看到"保存失败"却解释不了当前行为为何已变化。
     let path = state.paths.config_file();
     let _ = std::fs::create_dir_all(state.paths.config_dir());
-    config.save(&path).map_err(err_string)?;
-    // 依赖路径变更即重置转码层级锁定：用户换了一个有无 QSV 不同的 ffmpeg
-    // 构建后，旧的进程级锁定结论要等到重启才失效（保存设置时主动清掉，
-    // 最坏从头试一层；编码器探测有 TTL 缓存兜底）
     let deps_changed = {
-        let cur = state.config.lock();
-        cur.dependencies != config.dependencies
-    };
-    {
+        // 全量保存与单字段更新共用同一临界区，避免磁盘快照和内存状态交错覆盖。
         let mut cur = state.config.lock();
+        let changed = cur.dependencies != config.dependencies;
+        config.save(&path).map_err(err_string)?;
         *cur = config.clone();
-    }
+        changed
+    };
     if deps_changed {
         transcode::reset_locked_tier();
     }
@@ -57,6 +50,33 @@ pub fn save_config(
     // 必须在释放队列锁之后再逐个启动：launch_next 会读 history + queue 的锁
     for id in to_launch {
         launch_next(&app, id);
+    }
+    Ok(())
+}
+
+#[tauri::command(async)]
+pub fn save_dependency_path(
+    app: AppHandle,
+    win: tauri::WebviewWindow,
+    tool: String,
+    path: String,
+) -> CmdResult<()> {
+    ensure_main_window(&win)?;
+    let state = app.state::<AppState>();
+    let mut cur = state.config.lock();
+    let mut next = cur.clone();
+    match tool.as_str() {
+        "yt_dlp_path" => next.dependencies.yt_dlp_path = Some(path),
+        "ffmpeg_path" => next.dependencies.ffmpeg_path = Some(path),
+        "ffprobe_path" => next.dependencies.ffprobe_path = Some(path),
+        "deno_path" => next.dependencies.deno_path = Some(path),
+        _ => return Err("未知工具".into()),
+    }
+    next.save(&state.paths.config_file()).map_err(err_string)?;
+    *cur = next;
+    drop(cur);
+    if tool == "ffmpeg_path" {
+        transcode::reset_locked_tier();
     }
     Ok(())
 }
