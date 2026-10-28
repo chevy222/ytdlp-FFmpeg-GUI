@@ -186,7 +186,7 @@ pub(super) fn update_item_finished(
             f(item);
             item.clone()
         });
-        unregister_cancel(state, id, cancel);
+        unregister_cancel(&state, id, cancel);
         item
     };
     if let Some(item) = &item {
@@ -1358,7 +1358,7 @@ fn expand_playlist(
         // 父条目只承担"展开播放列表"这一件事：成功后从列表移除，
         // 避免它被当成普通视频再次下载整个列表（双下载）。
         hist.remove(id);
-        unregister_cancel(st, id, cancel);
+        unregister_cancel(&st, id, cancel);
     }
     ytdlp_core::thumbs::remove_thumb(&app.state::<AppState>().paths.cache_dir(), id);
     // 先移除父条目再发 list:changed：否则前端可能在刷新时把父条目又画回来

@@ -128,7 +128,7 @@ pub(super) fn run_download_task(
         };
         let Some(item) = item else {
             // 条目在排队期间被删除：清掉取消标志即可（并发 slot 由 _slot 守卫释放）
-            unregister_cancel(state, &id, &cancel);
+            unregister_cancel(&state, &id, &cancel);
             return;
         };
         let url = item.url.clone().unwrap_or_default();

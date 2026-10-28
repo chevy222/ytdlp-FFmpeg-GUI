@@ -2,7 +2,7 @@
 
 use super::{
     add_product_item, default_output_dir, enqueue_or_spawn, ensure_main_window, log_error_lines,
-    log_item, persist, prepare_batch, restore_status, transition_in, unregister_cancel, update_item,
+    log_item, persist, prepare_batch, restore_status, transition_in, unregister_cancel,
     update_item_finished, update_progress, CmdResult, ProgressPayload, SlotGuard,
 };
 use crate::state::AppState;
@@ -167,7 +167,7 @@ pub(super) fn run_transcode_task(app: AppHandle, id: String) {
     let (item, path) = match loaded {
         None => {
             // 条目在排队期间被删除：清取消标志即可（slot 由守卫释放）
-            unregister_cancel(state, &id, &cancel);
+            unregister_cancel(&state, &id, &cancel);
             return;
         }
         Some((item, Some(p))) => (item, std::path::PathBuf::from(p)),

@@ -124,7 +124,7 @@ pub(super) fn run_merge_task(app: AppHandle, id: String) {
     let Some(job) = job else {
         // job 记录缺失（理论不可达）：清掉上面为 id 注册的 cancel flag，
         // 否则会随每次异常调用在 state.cancels 里累积残留条目。
-        unregister_cancel(state, &id, &cancel);
+        unregister_cancel(&state, &id, &cancel);
         return;
     };
     // 取消标志共享给全部参与条目：从任意被勾选条目点"取消"都能取消这次合并
