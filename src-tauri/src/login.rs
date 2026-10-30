@@ -85,6 +85,8 @@ fn build_login_window(app: &AppHandle, host: &str, url: &str) -> Result<(), Stri
     let script = login_inject_script();
     let app_for_nav = app.clone();
     let host_for_nav = host.to_string();
+    // 与主窗口同源：都从 AppState.paths 取，避免各自 current_exe 计算导致路径漂移。
+    let webview_dir = app.state::<crate::state::AppState>().paths.webview_data_dir();
     WebviewWindowBuilder::new(
         app,
         "ytdlp-login",
@@ -97,7 +99,7 @@ fn build_login_window(app: &AppHandle, host: &str, url: &str) -> Result<(), Stri
     .user_agent(LOGIN_USER_AGENT)
     // 与主窗口共享同一 WebView2 用户数据目录（exe 同级 webview/）：WebView2 要求
     // 同进程各 webview 的 data directory 一致；默认会落到 %LOCALAPPDATA%\<identifier>。
-    .data_directory(ytdlp_core::paths::Paths::from_exe().webview_data_dir())
+    .data_directory(webview_dir)
     .initialization_script(&script)
     // close / done 两个"魔法 URL"的嗅探走导航开始事件：即使 127.0.0.1 上没人监听
     // （导航必然失败）也能触发，返回 false 顺手取消这次无意义的导航。
