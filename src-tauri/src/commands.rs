@@ -319,6 +319,7 @@ fn fetch_thumb_ytdlp(
     proxy: Option<&str>,
     cookies_host: Option<&str>,
     cookies_dir: &Path,
+    cache_dir: Option<&Path>,
     on_log: &mut dyn FnMut(String),
 ) -> Result<(), String> {
     // 运行时文件必须落 <exe 同级>\temp\（§3.7），禁止系统 temp；
@@ -355,6 +356,11 @@ fn fetch_thumb_ytdlp(
         "--socket-timeout".into(),
         "30".into(),
     ];
+    // 提取器缓存收口到 EXE 同级（与解析/下载同口径），避免写系统缓存目录
+    if let Some(cd) = cache_dir {
+        args.push("--cache-dir".into());
+        args.push(cd.to_string_lossy().into_owned());
+    }
     if let Some(p) = proxy {
         if !p.is_empty() {
             args.push("--proxy".into());
@@ -797,6 +803,8 @@ fn run_probe(app: AppHandle, id: String, auto_ready: bool) {
     // 任务私有临时目录：cookie 导出落这里，任务结束整体清理
     let task_tmp = state.paths.task_temp_dir(&id);
     let _ = std::fs::create_dir_all(&task_tmp);
+    // yt-dlp 提取器缓存收口到 EXE 同级（便携模式）
+    let ytdlp_cache = state.paths.yt_dlp_cache_dir();
     let (netscape, cookie_warn) = resolve_cookies(&state, &item, &task_tmp);
     if let Some(w) = cookie_warn {
         log_item(&app, &id, w);
@@ -808,6 +816,7 @@ fn run_probe(app: AppHandle, id: String, auto_ready: bool) {
             item.url.as_deref().unwrap_or_default(),
             netscape.as_deref(),
             &network,
+            Some(&ytdlp_cache),
             playlist_on,
             Some(&cancel),
             |l| log_item(&app, &id, l),
@@ -923,6 +932,7 @@ fn run_probe(app: AppHandle, id: String, auto_ready: bool) {
                     // 任务临时目录，随 tmp 清理，不污染站点库。
                     let thumb_tmp_root = state.paths.temp_dir();
                     let cookies_dir = state.paths.cookies_dir();
+                    let ytdlp_cache = state.paths.yt_dlp_cache_dir();
                     tauri::async_runtime::spawn_blocking(move || {
                         let dest = ytdlp_core::thumbs::thumb_path(&cache_dir, &id2);
                         // URL 视频：直接用 yt-dlp --write-thumbnail --skip-download 下载缩略图。
@@ -939,6 +949,7 @@ fn run_probe(app: AppHandle, id: String, auto_ready: bool) {
                                     thumb_proxy.as_deref(),
                                     thumb_host.as_deref(),
                                     &cookies_dir,
+                                    Some(&ytdlp_cache),
                                     &mut |l| log_item(&app2, &id2, l),
                                 )
                             } else {

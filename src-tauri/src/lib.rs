@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tauri::Manager;
+use tauri::{Manager, WebviewWindowBuilder};
 use ytdlp_core::model::Status;
 
 /// 退出流程只允许进入一次：`app.exit(0)` 会再次触发 `ExitRequested`，
@@ -170,6 +170,14 @@ pub fn run() {
                     ),
                 );
             }
+            // 主窗口延迟创建（conf 中 create=false）：显式把 WebView2 用户数据目录
+            // 指到 exe 同级 webview/，避免内核缓存/HTTP 缓存默认落到
+            // %LOCALAPPDATA%\<identifier> 造成 EXE 之外残留（便携模式零外部残留）。
+            // 窗口属性（标题/尺寸/居中/最小尺寸）仍由 tauri.conf.json 维护，这里只补
+            // data_directory；登录窗与主窗口共享同一目录（WebView2 要求同进程一致）。
+            WebviewWindowBuilder::from_config(app, &app.config().app.windows[0])?
+                .data_directory(state.paths.webview_data_dir())
+                .build()?;
             // 启动清理 temp/：上次崩溃/被强杀留下的任务目录、合并中间产物、工具
             // 下载半成品都不该跨实例累积（此时还没有任何任务在跑，豁免表为空，
             // 整目录都是可清的残留；判定与「清空临时文件」按钮共用同一份实现）。

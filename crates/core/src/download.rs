@@ -44,6 +44,9 @@ pub struct DownloadParams {
     /// 合并容器、嵌入封面、时间范围裁剪、音轨提取都依赖 ffmpeg，而 yt-dlp
     /// 默认只在 PATH 与自身目录查找；托管模式（`<exe 同级>\tools\`）必须显式传入。
     pub ffmpeg_path: Option<String>,
+    /// yt-dlp `--cache-dir` 取值（提取器缓存目录）。便携模式指到 EXE 同级，
+    /// 避免默认落到系统缓存目录造成 EXE 之外残留。
+    pub cache_dir: Option<PathBuf>,
 }
 
 /// 文件名模板 → yt-dlp 输出模板（DL-10）。
@@ -99,6 +102,11 @@ pub fn build_args(url: &str, p: &DownloadParams, cfg: &DownloadConfig) -> Vec<St
     // 忽略用户级/便携级 yt-dlp 配置：避免 config.txt 覆盖 -o/--proxy/--paths 等，
     // 使 GUI 下载行为不确定、产物写到意外目录。
     args.push("--ignore-config".into());
+    // 提取器缓存指到 EXE 同级（便携模式），默认会落到系统缓存目录造成外部残留。
+    if let Some(cd) = &p.cache_dir {
+        args.push("--cache-dir".into());
+        args.push(cd.to_string_lossy().into_owned());
+    }
     // 格式
     let format = match &p.format_id {
         Some(fid) if !fid.is_empty() => {
@@ -1023,6 +1031,7 @@ mod tests {
             sections: None,
             js_runtime: None,
             ffmpeg_path: None,
+            cache_dir: None,
         }
     }
 

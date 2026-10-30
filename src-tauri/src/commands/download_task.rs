@@ -206,6 +206,8 @@ pub(super) fn run_download_task(
             .resolve(ytdlp_core::exec::Tool::Ffmpeg)
             .ok()
             .map(|p| p.to_string_lossy().into_owned()),
+        // 提取器缓存收口到 EXE 同级，避免 yt-dlp 默认写到系统缓存目录。
+        cache_dir: Some(state.paths.yt_dlp_cache_dir()),
     };
 
     let app2 = app.clone();

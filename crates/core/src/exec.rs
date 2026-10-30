@@ -72,6 +72,9 @@ pub struct ToolResolver {
     deno: Option<PathBuf>,
     /// `<exe 同级>\tools\` 托管目录；目录或其中某个 exe 缺失都是正常状态
     tools_dir: Option<PathBuf>,
+    /// deno 缓存目录（`DENO_DIR`）；登记后随每个受控子进程注入，yt-dlp 派生的
+    /// deno 会继承该变量，避免默认写到用户系统缓存目录。
+    deno_dir: Option<PathBuf>,
 }
 
 impl ToolResolver {
@@ -83,6 +86,7 @@ impl ToolResolver {
             ffprobe: cfg.ffprobe_path.as_ref().map(PathBuf::from),
             deno: cfg.deno_path.as_ref().map(PathBuf::from),
             tools_dir: None,
+            deno_dir: None,
         }
     }
 
@@ -90,6 +94,12 @@ impl ToolResolver {
     /// 只登记为回退候选，不占用四个显式配置位——用户填写的路径仍最优先。
     pub fn with_tools_dir(mut self, tools_dir: impl Into<PathBuf>) -> Self {
         self.tools_dir = Some(tools_dir.into());
+        self
+    }
+
+    /// 显式指定 deno 缓存目录（DENO_DIR），随子进程环境注入。
+    pub fn with_deno_dir(mut self, deno_dir: impl Into<PathBuf>) -> Self {
+        self.deno_dir = Some(deno_dir.into());
         self
     }
 
@@ -142,6 +152,11 @@ impl ToolResolver {
     pub fn command(&self, tool: Tool) -> crate::Result<Command> {
         let mut cmd = Command::new(self.resolve(tool)?);
         hide_console(&mut cmd);
+        // DENO_DIR 随子进程环境继承：yt-dlp 派生 deno 时沿用同一缓存目录；
+        // ffmpeg/ffprobe 不读该变量，注入无副作用。
+        if let Some(deno_dir) = &self.deno_dir {
+            cmd.env("DENO_DIR", deno_dir);
+        }
         Ok(cmd)
     }
 }

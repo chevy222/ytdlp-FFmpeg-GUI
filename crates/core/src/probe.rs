@@ -73,12 +73,18 @@ fn ytdlp_args(
     url: &str,
     cookies_file: Option<&Path>,
     network: &NetworkConfig,
+    cache_dir: Option<&Path>,
     extra: &[&str],
 ) -> Vec<String> {
     let mut args: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
     // 忽略用户级/便携级 yt-dlp 配置文件：否则 config.txt 可能覆盖 -o/--proxy/--paths
     // 等关键参数，GUI 行为变得不确定（输出写到意外目录）。
     args.push("--ignore-config".into());
+    // 提取器缓存指到 EXE 同级（便携模式），默认会落到系统缓存目录造成外部残留。
+    if let Some(cd) = cache_dir {
+        args.push("--cache-dir".into());
+        args.push(cd.to_string_lossy().into_owned());
+    }
     if let Ok(deno) = resolver.resolve(Tool::Deno) {
         args.push("--js-runtimes".into());
         args.push(format!("deno:{}", deno.to_string_lossy()));
@@ -114,11 +120,12 @@ fn run_ytdlp_json(
     url: &str,
     cookies_file: Option<&Path>,
     network: &NetworkConfig,
+    cache_dir: Option<&Path>,
     extra: &[&str],
     cancel: Option<&Arc<AtomicBool>>,
     on_log: &mut dyn FnMut(String),
 ) -> std::result::Result<JsonRun, ProbeFailure> {
-    let args = ytdlp_args(resolver, url, cookies_file, network, extra);
+    let args = ytdlp_args(resolver, url, cookies_file, network, cache_dir, extra);
     on_log(crate::exec::display_command("yt-dlp", &args));
     let mut cmd = resolver.command(Tool::YtDlp).map_err(|e| ProbeFailure {
         kind: ProbeErrorKind::Failed,
@@ -183,6 +190,7 @@ pub fn probe_url(
     url: &str,
     cookies_file: Option<&Path>,
     network: &NetworkConfig,
+    cache_dir: Option<&Path>,
     playlist: bool,
     cancel: Option<&Arc<AtomicBool>>,
     mut on_log: impl FnMut(String),
@@ -212,6 +220,7 @@ pub fn probe_url(
         url,
         cookies_file,
         network,
+        cache_dir,
         extra,
         cancel,
         &mut on_log,

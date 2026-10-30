@@ -58,6 +58,25 @@ impl Paths {
         self.config_dir().join(DIR_CACHE)
     }
 
+    /// yt-dlp 提取器缓存目录（`<exe 同级>\config\cache\yt-dlp\`）。
+    /// 默认 yt-dlp 会写到系统缓存目录（Windows `%LOCALAPPDATA%\yt-dlp`），
+    /// 便携模式必须显式 `--cache-dir` 指到这里，避免在 EXE 之外残留。
+    pub fn yt_dlp_cache_dir(&self) -> PathBuf {
+        self.cache_dir().join("yt-dlp")
+    }
+
+    /// deno 缓存目录（`<exe 同级>\config\cache\deno\`）。通过 `DENO_DIR` 环境变量
+    /// 传给子进程，避免 deno 默认写到用户缓存目录造成 EXE 之外残留。
+    pub fn deno_cache_dir(&self) -> PathBuf {
+        self.cache_dir().join("deno")
+    }
+
+    /// WebView2 用户数据目录（`<exe 同级>\webview\`）。主窗口与登录窗共享同一目录，
+    /// 避免内核缓存/HTTP 缓存默认落到 `%LOCALAPPDATA%\<identifier>` 造成 EXE 之外残留。
+    pub fn webview_data_dir(&self) -> PathBuf {
+        self.root.join("webview")
+    }
+
     /// 运行日志目录（exe 同级 `logs/`，见 core::log）。
     pub fn logs_dir(&self) -> PathBuf {
         self.root.join(DIR_LOGS)
@@ -79,6 +98,9 @@ impl Paths {
             self.tools_dir(),
             self.cookies_dir(),
             self.cache_dir(),
+            self.yt_dlp_cache_dir(),
+            self.deno_cache_dir(),
+            self.webview_data_dir(),
             self.logs_dir(),
         ] {
             std::fs::create_dir_all(d)?;
