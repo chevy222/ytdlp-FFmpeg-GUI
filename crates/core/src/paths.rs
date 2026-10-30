@@ -59,8 +59,9 @@ impl Paths {
     }
 
     /// yt-dlp 提取器缓存目录（`<exe 同级>\config\cache\yt-dlp\`）。
-    /// 默认 yt-dlp 会写到系统缓存目录（Windows `%LOCALAPPDATA%\yt-dlp`），
-    /// 便携模式必须显式 `--cache-dir` 指到这里，避免在 EXE 之外残留。
+    /// 默认 yt-dlp 取 `$XDG_CACHE_HOME/yt-dlp`，未设置时回退 `~/.cache/yt-dlp`
+    /// （Windows 即 `%USERPROFILE%\.cache\yt-dlp`）；便携模式必须显式 `--cache-dir`
+    /// 指到这里，避免在 EXE 之外残留。
     pub fn yt_dlp_cache_dir(&self) -> PathBuf {
         self.cache_dir().join("yt-dlp")
     }
