@@ -864,11 +864,23 @@ fn run_probe(app: AppHandle, id: String, auto_ready: bool) {
             // 展开成功后从列表移除；失败则落到 NeedLogin/失败/已取消。
             // entries 来自本次 flat-playlist 解析结果，不再二次调用 yt-dlp。
             let playlist_task = url_src && playlist_on && p.is_playlist;
+            // 开关关闭时，纯列表/合集链接仍会被 yt-dlp 识别为列表
+            //（--no-playlist 只对"视频+列表"混合链接生效）。不能落 Ready：
+            // 否则 5 秒后自动下载会把整个列表塞进一个条目，且只有第一个文件
+            // 会被跟踪/后处理。这里改为失败并提示开启开关。
+            let playlist_blocked = url_src && !playlist_on && p.is_playlist;
             if playlist_task {
                 match expand_playlist(&app, &id, p.entries, &cancel) {
                     Ok(n) => ytdlp_core::log::info(format!("播放列表 {id} 展开为 {n} 集")),
                     Err(f) => handle_probe_failure(&app, &id, &cancel, &f, "播放列表展开失败"),
                 }
+            } else if playlist_blocked {
+                let f = probe::ProbeFailure {
+                    kind: ProbeErrorKind::Failed,
+                    message: "检测到播放列表/合集链接：请在 设置-下载 勾选『播放列表默认』后重试"
+                        .into(),
+                };
+                handle_probe_failure(&app, &id, &cancel, &f, "无法按单集下载");
             } else {
                 let cover_idx = p.meta.cover_stream_index;
                 // 缩略图 Cookie 的 host：优先本次解析出的页面 host，其次条目旧值，

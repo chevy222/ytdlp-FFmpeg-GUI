@@ -172,6 +172,35 @@ impl std::fmt::Display for ProbeFailure {
     }
 }
 
+/// `-J` 解析参数（纯函数，便于单测）。
+///
+/// 两种模式都带 `--flat-playlist`：`--no-playlist` 只对"视频+列表"混合链接生效，
+/// 对纯列表 URL 无效；若不带 flat，yt-dlp 会按默认（`--no-flat-playlist`）把整个
+/// 列表逐集**完整提取**一遍（大列表可达几分钟、JSON 几十 MB）。带 flat 后纯列表
+/// 只返回 `_type: playlist` + 条目，命令层可据此拒绝下载并提示开启开关。
+///
+/// 关闭播放列表开关时额外带 `--no-playlist`：混合链接仍按单集处理。
+fn probe_extra_args(playlist: bool) -> &'static [&'static str] {
+    if playlist {
+        &[
+            "-J",
+            "--no-warnings",
+            "--flat-playlist",
+            "--socket-timeout",
+            "60",
+        ]
+    } else {
+        &[
+            "-J",
+            "--no-warnings",
+            "--no-playlist",
+            "--flat-playlist",
+            "--socket-timeout",
+            "60",
+        ]
+    }
+}
+
 /// URL 解析（yt-dlp -J）。
 ///
 /// 输出用 [`crate::exec::stream_lines`] **边下边读**（不再落 temp 临时文件）：
@@ -195,26 +224,7 @@ pub fn probe_url(
     cancel: Option<&Arc<AtomicBool>>,
     mut on_log: impl FnMut(String),
 ) -> std::result::Result<UrlProbe, ProbeFailure> {
-    // 合集必须用 flat-playlist：`--yes-playlist` + `-J` 会把每一集都**完整提取**
-    // 一遍，大型合集动辄几分钟且中途没有任何输出；flat 模式只拉列表页，
-    // 每集条目随 JSON 一并返回，展开时不再二次请求。
-    let extra: &[&str] = if playlist {
-        &[
-            "-J",
-            "--no-warnings",
-            "--flat-playlist",
-            "--socket-timeout",
-            "60",
-        ]
-    } else {
-        &[
-            "-J",
-            "--no-warnings",
-            "--no-playlist",
-            "--socket-timeout",
-            "60",
-        ]
-    };
+    let extra = probe_extra_args(playlist);
     let run = run_ytdlp_json(
         resolver,
         url,
@@ -756,6 +766,17 @@ mod tests {
         assert!(video.acodec.is_none(), "none 不应保留为 acodec");
         assert_eq!(video.filesize_bytes, Some(12345));
         assert_eq!(p.meta.download_formats[1].filesize_bytes, Some(999));
+    }
+
+    #[test]
+    fn probe_extra_args_always_flat() {
+        // 关闭开关也必须 flat：--no-playlist 管不了纯列表 URL，非 flat 会逐集完整提取。
+        let on = probe_extra_args(true);
+        assert!(on.contains(&"--flat-playlist"));
+        assert!(!on.contains(&"--no-playlist"));
+        let off = probe_extra_args(false);
+        assert!(off.contains(&"--flat-playlist"));
+        assert!(off.contains(&"--no-playlist"));
     }
 
     #[test]
